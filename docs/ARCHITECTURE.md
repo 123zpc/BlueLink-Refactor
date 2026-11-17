@@ -67,3 +67,26 @@
 3. 窗口与系统集成细节（标题栏、托盘、通知样式、快捷键修饰键）
 
 其余代码三平台完全共用；CI 在三平台并行构建与测试，任何平台分支都必须有对应 CI 覆盖。
+
+## 附录 A、核心数据字段（概要级，详细设计阶段定稿为表结构）
+
+| 实体 | 关键字段 |
+|---|---|
+| Message | id（UUID）、conversation_id、direction、type、body、file_ref（文件消息）、reply_to_id（引用）、created_at（毫秒）、status |
+| Conversation | id、kind（设备会话/AI 会话）、peer_device_id、title、last_read_message_id（阅读位置）、draft（草稿）、created_at、updated_at |
+| Tag | id、name（唯一判定不区分大小写）、color、created_at、last_used_at |
+| MessageMark | id、message_id、kind（标签/收藏/置顶）、tag_id（标签类必填）、created_at；唯一约束：同一消息 + 同一标签不重复 |
+| TransferTask | id、message_id、file_name、total_bytes、done_chunks（分片位图）、sha256、state（状态机）、part_path |
+
+## 附录 B、统一消息定位链路（E 组功能共用，只实现一次）
+
+1. 调用方给出目标 message_id（来自标签、收藏、搜索、引用、置顶、目录或阅读位置）。
+2. 标记服务按 message_id 查出 conversation_id 与该消息在会话内的序号（依赖 storage 的序号索引）。
+3. 接口层通知前端切换会话并下发目标序号；前端虚拟列表滚动到该序号（未加载段按序号直接定位，不逐页翻）。
+4. 目标消息渲染完成后，前端回执，后端/前端触发高亮（闪烁 2 次，约 1.6 秒，与 REQUIREMENTS 的 E1-09 一致）。
+5. 任一步失败（消息已删等）返回明确错误码，前端按错误规范提示，不静默无反应。
+
+## 附录 C、IPC 接口清单（草案，详细设计阶段定稿）
+
+命令（前端→后端）：连接/断开、发送消息、发送文件、取消/续传传输、AI 提问/停止/重新生成、打标签/去标签、收藏/取消、置顶/取消、搜索、取历史分页、读写设置、按 ID 定位消息。
+事件（后端→前端）：新消息、消息状态变化、传输进度、连接状态变化、AI 流式片段、AI 完成/出错。
