@@ -1,0 +1,182 @@
+//! 端到端测试：两个真实节点经环回连接互通，覆盖聊天、文件传输、断点续传、AI 代理。
+
+use bluelink_ai::AiConfig;
+use bluelink_domain::*;
+use bluelink_services::{derive_transfer_id, sha256_file, Node};
+use bluelink_transport::loopback_pair;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+fn 临时目录(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("bluelink-e2e-{tag}-{}", new_id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+async fn 连接两节点(a: &Arc<Node>, b: &Arc<Node>) {
+    let (ca, cb) = loopback_pair();
+    let code = a.my_code();
+    let (ra, rb) = tokio::join!(a.attach(ca, true, ""), b.attach(cb, false, &code),);
+    ra.unwrap();
+    rb.unwrap();
+}
+
+async fn 等消息(node: &Arc<Node>, 关键词: &str) -> Message {
+    for _ in 0..100 {
+        for c in node.storage.list_conversations().unwrap() {
+            for m in node.storage.list_messages(&c.id, None, 50).unwrap() {
+                if m.body.contains(关键词) {
+                    return m;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("等待消息超时：{关键词}");
+}
+
+#[tokio::test]
+async fn 聊天互通与送达回执() {
+    let a = Node::new(&临时目录("a"), "甲").unwrap();
+    let b = Node::new(&临时目录("b"), "乙").unwrap();
+    连接两节点(&a, &b).await;
+
+    let sent = a.send_text("你好，乙", None).await.unwrap();
+    let got = 等消息(&b, "你好，乙").await;
+    assert_eq!(got.sender, Sender::Peer);
+
+    // 甲侧应收到送达回执
+    let mut delivered = false;
+    for _ in 0..40 {
+        if let Some(m) = a.storage.get_message(&sent.id).unwrap() {
+            if m.status == MessageStatus::Delivered {
+                delivered = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(delivered, "未收到送达回执");
+
+    b.send_text("你好，甲", None).await.unwrap();
+    等消息(&a, "你好，甲").await;
+}
+
+fn 写测试文件(dir: &Path, name: &str, size: usize) -> PathBuf {
+    let p = dir.join(name);
+    let mut f = std::fs::File::create(&p).unwrap();
+    // 确定性伪随机内容（便于校验）
+    let mut x: u64 = 0x12345678;
+    let mut buf = vec![0u8; size];
+    for b in buf.iter_mut() {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *b = (x >> 33) as u8;
+    }
+    f.write_all(&buf).unwrap();
+    p
+}
+
+#[tokio::test]
+async fn 文件传输完整且哈希一致() {
+    let a = Node::new(&临时目录("fa"), "甲").unwrap();
+    let b = Node::new(&临时目录("fb"), "乙").unwrap();
+    连接两节点(&a, &b).await;
+
+    let src_dir = 临时目录("src");
+    let file = 写测试文件(&src_dir, "数据.bin", 3 * 1024 * 1024 + 123);
+    let sha = sha256_file(&file).unwrap();
+    a.send_file(&file).await.unwrap();
+
+    let landed = b.download_dir().join("数据.bin");
+    assert!(landed.exists(), "文件未落地");
+    assert_eq!(sha256_file(&landed).unwrap(), sha);
+}
+
+#[tokio::test]
+async fn 断点续传只补缺失部分() {
+    let a = Node::new(&临时目录("ra"), "甲").unwrap();
+    let bdir = 临时目录("rb");
+    let b = Node::new(&bdir, "乙").unwrap();
+    连接两节点(&a, &b).await;
+
+    let src_dir = 临时目录("rsrc");
+    let file = 写测试文件(&src_dir, "大文件.dat", 2 * 1024 * 1024);
+    let sha = sha256_file(&file).unwrap();
+    let tid = derive_transfer_id(&sha, &b.device_id);
+
+    // 在乙侧预置：已收前 1MiB（.part 前段 + 传输记录）
+    let part = b.download_dir().join(format!("{tid}.part"));
+    {
+        let data = std::fs::read(&file).unwrap();
+        let mut f = std::fs::File::create(&part).unwrap();
+        f.write_all(&data[..1024 * 1024]).unwrap();
+    }
+    b.storage
+        .save_transfer(
+            &tid,
+            "",
+            "in",
+            &a.device_id,
+            2 * 1024 * 1024,
+            &vec![(0, 1024 * 1024)],
+            "receiving",
+        )
+        .unwrap();
+
+    // 订阅进度：首个进度事件的已收字节应 >= 1MiB（证明走了续传而非重传）
+    let mut rx = a.subscribe();
+    a.send_file(&file).await.unwrap();
+    let mut saw_resume = false;
+    while let Ok(e) = rx.try_recv() {
+        if let bluelink_services::Event::TransferProgress { received, .. } = e {
+            if received >= 1024 * 1024 {
+                saw_resume = true;
+            }
+        }
+    }
+    assert!(saw_resume, "未观察到续传进度");
+    let landed = b.download_dir().join("大文件.dat");
+    assert_eq!(sha256_file(&landed).unwrap(), sha);
+}
+
+/// 极简 SSE 模拟服务器：回一段固定流式文本。
+async fn 模拟ai服务器() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                let _ = sock.read(&mut buf).await;
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"你好世界\"}}]}\n\ndata: [DONE]\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/v1")
+}
+
+#[tokio::test]
+async fn ai代理无网方经有网方提问() {
+    let base = 模拟ai服务器().await;
+    let a = Node::new(&临时目录("pa"), "无网方").unwrap();
+    let b = Node::new(&临时目录("pb"), "有网方").unwrap();
+    b.set_ai_config(Some(AiConfig {
+        base_url: base,
+        api_key: "sk-test".into(),
+        model: "mock".into(),
+    }))
+    .await;
+    连接两节点(&a, &b).await;
+
+    let reply = a.ai_send("报个到").await.unwrap();
+    assert_eq!(reply.body, "你好世界");
+    assert_eq!(reply.sender, Sender::Ai);
+}

@@ -4,6 +4,10 @@ members = [
     "crates/domain",
     "crates/protocol",
     "crates/storage",
+    "crates/transport",
+    "crates/ai",
+    "crates/services",
+    "tools/node-cli",
     "app",
 ]
 

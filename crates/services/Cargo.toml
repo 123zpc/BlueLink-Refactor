@@ -1,0 +1,18 @@
+[package]
+name = "bluelink-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+bluelink-domain = { path = "../domain" }
+bluelink-protocol = { path = "../protocol" }
+bluelink-storage = { path = "../storage" }
+bluelink-transport = { path = "../transport" }
+bluelink-ai = { path = "../ai" }
