@@ -25,7 +25,12 @@ BlueLink 是一款无网环境下基于蓝牙的即时聊天与文件传输工�
 - **传输：双通道** — BLE 负责发现/聊天/信令，文件走平台高速通道，流式分片、可续传
 - **代码注释一律中文**
 
-详细的现状测量数据与分阶段方案见 [docs/REFACTOR_PLAN.md](docs/REFACTOR_PLAN.md)，选型与产品标准见 [docs/DECISIONS.md](docs/DECISIONS.md)。
+项目文档（按开发流程逐阶段评审确认）：
+- 现状测量与分阶段方案：[docs/REFACTOR_PLAN.md](docs/REFACTOR_PLAN.md)
+- 选型与产品标准：[docs/DECISIONS.md](docs/DECISIONS.md)
+- 产品需求（PRD）：[docs/PRD.md](docs/PRD.md)
+- 整体架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- 开发流程与评审关口：[docs/PROCESS.md](docs/PROCESS.md)
 
 ## 基线
 
