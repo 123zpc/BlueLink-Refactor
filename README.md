@@ -31,6 +31,8 @@ BlueLink 是一款无网环境下基于蓝牙的即时聊天与文件传输工�
 - 产品需求（PRD）：[docs/PRD.md](docs/PRD.md)
 - 整体架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - 开发流程与评审关口：[docs/PROCESS.md](docs/PROCESS.md)
+- 每版本的完整流程：[docs/VERSION_PROCESS.md](docs/VERSION_PROCESS.md)
+- 交互与视觉设计：[docs/DESIGN.md](docs/DESIGN.md)
 
 ## 基线
 
