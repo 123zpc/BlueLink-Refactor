@@ -122,3 +122,16 @@ section { display: flex; flex-direction: column; height: 100%; }
 .field input { display: block; width: 100%; margin-top: 4px; padding: 8px 10px; border: 1px solid var(--border);
   border-radius: 6px; background: var(--panel); color: var(--text); font-size: 14px; }
 .placeholder-inner { margin: auto; font-size: 13px; }
+
+/* 命令面板 */
+#palette { position: absolute; inset: 0; background: rgba(0,0,0,0.25); z-index: 40; display: flex; justify-content: center; align-items: flex-start; padding-top: 12vh; }
+.palette-box { width: 480px; max-width: 92%; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.12); overflow: hidden; }
+#palette-input { width: 100%; padding: 12px 14px; border: none; border-bottom: 1px solid var(--border); font-size: 14px; background: var(--panel); color: var(--text); outline: none; }
+#palette-list { max-height: 320px; overflow-y: auto; }
+.palette-item { padding: 9px 14px; cursor: pointer; font-size: 13px; display: flex; justify-content: space-between; }
+.palette-item.sel { background: var(--bg); color: var(--accent); }
+/* 日期锚点栏 */
+#date-rail { position: absolute; right: 6px; top: 120px; display: flex; flex-direction: column; gap: 4px; z-index: 5; }
+#date-rail button { border: 1px solid var(--border); background: var(--panel); color: var(--muted); border-radius: 6px; font-size: 11px; padding: 2px 6px; cursor: pointer; }
+#date-rail button:hover { color: var(--accent); border-color: var(--accent); }
+#chat-view { position: relative; }

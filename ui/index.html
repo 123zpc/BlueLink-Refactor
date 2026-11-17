@@ -60,10 +60,11 @@
           <div id="peer-name" class="chat-title">未连接</div>
           <div id="peer-state" class="muted small">离线</div>
         </div>
-        <button id="btn-disconnect" class="btn small-btn">断开</button>
+        <div class="row-gap"><button id="btn-export" class="btn small-btn">导出</button><button id="btn-disconnect" class="btn small-btn">断开</button></div>
       </header>
       <div id="pin-bar" class="hidden"></div>
       <div id="messages"></div>
+      <div id="date-rail"></div>
       <div id="typing-hint" class="muted small hidden">对方正在输入…</div>
       <div id="composer">
         <div id="reply-bar" class="hidden"></div>
@@ -120,6 +121,14 @@
       </div>
     </section>
   </main>
+
+  <!-- 命令面板（Ctrl+K） -->
+  <div id="palette" class="hidden">
+    <div class="palette-box">
+      <input id="palette-input" type="text" placeholder="输入命令或搜索标签…">
+      <div id="palette-list"></div>
+    </div>
+  </div>
 
   <!-- 标签消息抽屉 -->
   <div id="drawer" class="hidden">

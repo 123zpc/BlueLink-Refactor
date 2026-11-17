@@ -450,6 +450,58 @@ mod tests {
         }
     }
 
+    /// 性能基线（v1.1.0 实测用）：1 万条消息下分页/搜索/按标签列取的耗时，
+    /// 对照需求 N 类预算（定位与搜索 ≤500ms）。断言用宽松上限防 CI 抖动，实际数值以打印为准。
+    #[test]
+    fn 万条消息性能基线() {
+        use std::time::Instant;
+        let (s, c) = 准备();
+        for i in 0..10_000 {
+            let body = if i % 100 == 0 {
+                format!("第{i}条 关键事项 记录")
+            } else {
+                format!("第{i}条 普通聊天内容")
+            };
+            s.insert_message(&消息(
+                &format!("p{i}"),
+                &c.id,
+                &body,
+                1_700_000_000_000 + i as i64,
+            ))
+            .unwrap();
+            if i % 100 == 0 {
+                s.set_message_tags(&format!("p{i}"), &["基线".to_string()])
+                    .unwrap();
+            }
+        }
+        let t0 = Instant::now();
+        let page = s.list_messages(&c.id, None, 200).unwrap();
+        let d_page = t0.elapsed();
+        assert_eq!(page.len(), 200);
+
+        let t0 = Instant::now();
+        let hits = s.search_messages("关键事项").unwrap();
+        let d_search = t0.elapsed();
+        assert_eq!(hits.len(), 100);
+
+        let t0 = Instant::now();
+        let tagged = s.list_messages_by_tag("基线").unwrap();
+        let d_tag = t0.elapsed();
+        assert_eq!(tagged.len(), 100);
+
+        eprintln!(
+            "性能基线（1 万条）：分页 200 条 {:?}，全文搜索 {:?}（命中 {}），按标签列取 {:?}（{} 条）",
+            d_page,
+            d_search,
+            hits.len(),
+            d_tag,
+            tagged.len()
+        );
+        for (name, d) in [("分页", d_page), ("搜索", d_search), ("标签", d_tag)] {
+            assert!(d.as_millis() < 500, "{name} 耗时 {:?} 超过 500ms 预算", d);
+        }
+    }
+
     #[test]
     fn 消息分页与搜索() {
         let (s, c) = 准备();

@@ -48,6 +48,7 @@ pub enum Event {
     },
     TransferProgress {
         transfer_id: String,
+        msg_id: String,
         received: u64,
         total: u64,
     },
@@ -580,6 +581,7 @@ impl Node {
         let missing = missing_ranges(&received, size);
         self.emit(Event::TransferProgress {
             transfer_id: transfer_id.clone(),
+            msg_id: msg.id.clone(),
             received: covered_bytes(&received),
             total: size,
         });
@@ -611,6 +613,7 @@ impl Node {
                 sent_total += want as u64;
                 self.emit(Event::TransferProgress {
                     transfer_id: transfer_id.clone(),
+                    msg_id: msg.id.clone(),
                     received: sent_total,
                     total: size,
                 });
@@ -757,17 +760,19 @@ impl Node {
             .concat(),
         );
         st.written = covered_bytes(&st.ranges);
-        let (tid, written, total, ranges) = (
+        let (tid, written, total, ranges, mid) = (
             chunk.transfer_id.clone(),
             st.written,
             st.total,
             st.ranges.clone(),
+            st.msg_id.clone(),
         );
         drop(guard);
         self.storage
             .save_transfer(&tid, "", "in", "", total, &ranges, "receiving")?;
         self.emit(Event::TransferProgress {
             transfer_id: tid,
+            msg_id: mid,
             received: written,
             total,
         });

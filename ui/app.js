@@ -201,6 +201,31 @@ async function loadChatMessages() {
   const conv = convs.find((c) => c.id === state.peerConvId);
   if (conv && conv.draft) $("input").value = conv.draft;
   refreshPinBar();
+  rebuildDateRail();
+}
+
+/** 日期锚点栏：列出当前会话出现过的日期，点击滚到当天第一条消息。 */
+function rebuildDateRail() {
+  const rail = $("date-rail");
+  if (!rail) return;
+  const seen = new Map();
+  for (const row of document.querySelectorAll("#messages .msg-row")) {
+    const ts = Number(row.dataset.ts || 0);
+    if (!ts) continue;
+    const key = new Date(ts).toDateString();
+    if (!seen.has(key)) seen.set(key, { ts, mid: row.dataset.mid });
+  }
+  rail.innerHTML = "";
+  if (seen.size < 2) return;
+  for (const { ts, mid } of seen.values()) {
+    const b = document.createElement("button");
+    b.textContent = fmtDay(ts);
+    b.addEventListener("click", () => {
+      const el = document.querySelector(`#messages [data-mid="${mid}"]`);
+      if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+    rail.appendChild(b);
+  }
 }
 
 async function refreshPinBar() {
@@ -487,6 +512,69 @@ $("btn-ai-test").addEventListener("click", async () => {
   } catch (e) { $("ai-test-result").textContent = String(e); }
 });
 
+
+// ---------- 导出 ----------
+/** 导出当前设备会话为 Markdown 文本文件（路径由保存对话框选定）。 */
+async function exportCurrentConv() {
+  if (!state.peerConvId) { alert("还没有可导出的会话"); return; }
+  const msgs = await invoke("list_messages", { conversationId: state.peerConvId, limit: 1000 });
+  const lines = ["# BlueLink 聊天记录", "", `导出时间：${new Date().toLocaleString("zh-CN")}`, ""];
+  for (const m of msgs) {
+    const who = m.sender === "me" ? "我" : "对方";
+    lines.push(`- [${fmtDay(m.created_at)} ${fmtTime(m.created_at)}] ${who}：${m.body}`);
+  }
+  const path = await window.__TAURI__.dialog.save({ defaultPath: "bluelink-chat.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
+  if (!path) return;
+  await invoke("save_text_file", { path, content: lines.join("\n") });
+}
+$("btn-export").addEventListener("click", () => exportCurrentConv().catch((e) => alert("导出失败：" + e)));
+
+// ---------- 命令面板（Ctrl+K） ----------
+const paletteState = { items: [], sel: 0 };
+async function refreshPalette(q) {
+  const items = [];
+  for (const [v, label] of [["chat", "聊天"], ["ai", "AI 对话"], ["tags", "标签总览"], ["favorites", "收藏"], ["settings", "设置"]])
+    items.push({ label: `打开：${label}`, run: () => switchView(v) });
+  if (state.connected) items.push({ label: "断开连接", run: () => $("btn-disconnect").click() });
+  if (state.peerConvId) items.push({ label: "导出当前会话", run: () => exportCurrentConv() });
+  try {
+    for (const t of await invoke("list_tags"))
+      items.push({ label: `标签：${t.name}（${t.count} 条）`, run: () => { switchView("tags"); openTagDrawer(t.name); } });
+  } catch (_) { /* 忽略 */ }
+  paletteState.items = items.filter((it) => !q || it.label.includes(q));
+  paletteState.sel = 0;
+  renderPalette();
+}
+function renderPalette() {
+  const list = $("palette-list");
+  list.innerHTML = "";
+  paletteState.items.forEach((it, i) => {
+    const d = document.createElement("div");
+    d.className = "palette-item" + (i === paletteState.sel ? " sel" : "");
+    d.textContent = it.label;
+    d.addEventListener("click", () => { closePalette(); it.run(); });
+    list.appendChild(d);
+  });
+}
+function openPalette() {
+  $("palette").classList.remove("hidden");
+  $("palette-input").value = "";
+  refreshPalette("");
+  $("palette-input").focus();
+}
+function closePalette() { $("palette").classList.add("hidden"); }
+$("palette-input").addEventListener("input", (e) => refreshPalette(e.target.value.trim()));
+$("palette-input").addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") { e.preventDefault(); paletteState.sel = Math.min(paletteState.sel + 1, paletteState.items.length - 1); renderPalette(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); paletteState.sel = Math.max(paletteState.sel - 1, 0); renderPalette(); }
+  else if (e.key === "Enter") { const it = paletteState.items[paletteState.sel]; if (it) { closePalette(); it.run(); } }
+  else if (e.key === "Escape") closePalette();
+});
+$("palette").addEventListener("click", (e) => { if (e.target === $("palette")) closePalette(); });
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
+});
+
 // ---------- 后端事件 ----------
 async function wireEvents() {
   await listen("connection_state", async (e) => {
@@ -502,7 +590,7 @@ async function wireEvents() {
   await listen("message_new", (e) => {
     const m = e.payload;
     if (m.conversation_id === state.aiConvId) appendMessage($("ai-messages"), m, state.renderedAi, { ai: true });
-    else appendMessage($("messages"), m, state.renderedChat, {});
+    else { appendMessage($("messages"), m, state.renderedChat, {}); rebuildDateRail(); }
   });
   await listen("message_status", (e) => {
     const row = document.querySelector(`[data-mid="${e.payload.id}"] .msg-status`);
@@ -512,7 +600,12 @@ async function wireEvents() {
     $("typing-hint").classList.toggle("hidden", !e.payload);
   });
   await listen("transfer_progress", (e) => {
-    const b = state.lastFileBubble;
+    let b = null;
+    if (e.payload.msg_id) {
+      const row = document.querySelector(`[data-mid="${e.payload.msg_id}"]`);
+      if (row) b = row.querySelector(".bubble");
+    }
+    if (!b) b = state.lastFileBubble;
     if (!b) return;
     const bar = b.querySelector(".progress");
     const fill = b.querySelector(".progress > div");

@@ -225,6 +225,12 @@ fn save_draft(
         .map_err(|e| e.to_string())
 }
 
+/// 把文本写入指定路径（聊天记录导出用，路径由保存对话框选定）。
+#[tauri::command]
+fn save_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| format!("写入失败：{e}"))
+}
+
 #[tauri::command]
 async fn ai_send(state: State<'_, AppState>, text: String) -> Result<Message, String> {
     let (tx, rx) = oneshot::channel::<()>();
@@ -373,10 +379,11 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
                 }
                 Ok(Event::TransferProgress {
                     transfer_id,
+                    msg_id,
                     received,
                     total,
                 }) => {
-                    let _ = app.emit("transfer_progress", serde_json::json!({"transfer_id": transfer_id, "received": received, "total": total}));
+                    let _ = app.emit("transfer_progress", serde_json::json!({"transfer_id": transfer_id, "msg_id": msg_id, "received": received, "total": total}));
                 }
                 Ok(Event::TransferState { transfer_id, state }) => {
                     let _ = app.emit(
@@ -473,6 +480,7 @@ fn main() {
             toggle_mark,
             list_marked,
             save_draft,
+            save_text_file,
             ai_send,
             ai_regenerate,
             ai_stop,
