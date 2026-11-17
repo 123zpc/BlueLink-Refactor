@@ -8,3 +8,11 @@ license.workspace = true
 tokio = { workspace = true }
 thiserror = { workspace = true }
 bluelink-protocol = { path = "../protocol" }
+btleplug = "0.11"
+futures-util = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+
+# GATT 服务端（广播 + 被连接）：btleplug 只有中心端 API，服务端用 ble-peripheral-rust
+# （含 Linux/BlueZ、Windows/WinRT、macOS/CoreBluetooth 三个后端）。
+ble-peripheral-rust = "0.2"

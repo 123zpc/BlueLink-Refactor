@@ -1,6 +1,8 @@
 //! 传输层：把协议帧跑在某种字节流上。
-//! 当前实现：TCP（局域网/调试通道）与进程内环回（测试）。
-//! BLE/RFCOMM 平台后端在 app 层按同一接口装配（见架构文档的双通道设计）。
+//! 产品通道：BLE（见 ble 模块，广播/扫描/GATT 字节流）。
+//! TCP 与进程内环回仅供开发测试（node-cli 与自动化测试），不进入产品界面。
+
+pub mod ble;
 
 use bluelink_protocol::{read_frame, write_frame, Frame, ProtocolError};
 use std::sync::Arc;
@@ -17,6 +19,8 @@ pub enum TransportError {
     Io(#[from] std::io::Error),
     #[error("连接已关闭")]
     Closed,
+    #[error("蓝牙错误：{0}")]
+    Ble(String),
 }
 
 /// 一条已建立的连接：内部对写端加锁，允许多个任务并发发送。

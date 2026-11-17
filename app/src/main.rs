@@ -10,10 +10,14 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Mutex};
 
-/// 应用状态：持有节点与正在进行的 AI 任务取消通道、监听任务。
+/// 应用状态：持有节点、AI 任务取消通道与蓝牙运行时（中心端 + 服务端）。
+/// 蓝牙不可用（无适配器/未开启）时对应字段为 None，界面据 bt_state 如实展示。
 struct AppState {
     node: Arc<Node>,
     ai_cancel: Mutex<Option<oneshot::Sender<()>>>,
+    central: Option<Arc<bluelink_transport::ble::BleCentral>>,
+    server: Option<Arc<bluelink_transport::ble::BleServer>>,
+    scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     listening: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -44,9 +48,110 @@ async fn get_identity(state: State<'_, AppState>) -> Result<Identity, String> {
     Ok(identity_of(&state.node).await)
 }
 
-/// 开始监听（宿主模式）：在局域网 TCP 端口等待对方连接。
+/// 蓝牙状态（连接页展示）：适配器是否可用、广播（可被发现）是否已开启。
+#[derive(Serialize)]
+struct BtState {
+    available: bool,
+    advertising: bool,
+    message: String,
+}
+
+#[tauri::command]
+async fn bt_state(state: State<'_, AppState>) -> Result<BtState, String> {
+    let available = state.central.is_some();
+    let advertising = match &state.server {
+        Some(s) => s.is_powered().await,
+        None => false,
+    };
+    let message = if !available {
+        "未检测到蓝牙适配器或蓝牙未开启".to_string()
+    } else if advertising {
+        "蓝牙已开启，本机可被附近设备发现".to_string()
+    } else {
+        "蓝牙已开启，但本机广播未启动（系统限制）".to_string()
+    };
+    Ok(BtState {
+        available,
+        advertising,
+        message,
+    })
+}
+
+/// 开始扫描附近的 BlueLink 设备：结果经 bt_devices 事件每秒推送快照。
+#[tauri::command]
+async fn bt_start_scan(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    let central = state
+        .central
+        .clone()
+        .ok_or_else(|| "蓝牙不可用".to_string())?;
+    central.start_scan().await.map_err(|e| e.to_string())?;
+    if let Some(h) = state.scan_task.lock().await.take() {
+        h.abort();
+    }
+    let handle = tokio::spawn(async move {
+        loop {
+            match central.list_found().await {
+                Ok(devices) => {
+                    let _ = app.emit("bt_devices", devices);
+                }
+                Err(_) => break,
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    *state.scan_task.lock().await = Some(handle);
+    Ok(())
+}
+
+/// 停止扫描。
+#[tauri::command]
+async fn bt_stop_scan(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(h) = state.scan_task.lock().await.take() {
+        h.abort();
+    }
+    if let Some(c) = &state.central {
+        let _ = c.stop_scan().await;
+    }
+    Ok(())
+}
+
+/// 开发者模式开关（持久化在设置里，默认关）。
+/// 局域网通道只供开发测试：正式版默认关闭，命令层也会拒绝未开启时的局域网调用。
+fn dev_mode_on(state: &AppState) -> bool {
+    state
+        .node
+        .storage
+        .get_setting("dev_mode")
+        .map(|v| v.as_deref() == Some("1"))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn get_dev_mode(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(dev_mode_on(&state))
+}
+
+#[tauri::command]
+fn set_dev_mode(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    state
+        .node
+        .storage
+        .set_setting("dev_mode", if on { "1" } else { "0" })
+        .map_err(|e| e.to_string())
+}
+
+fn require_dev_mode(state: &AppState) -> Result<(), String> {
+    if dev_mode_on(state) {
+        Ok(())
+    } else {
+        Err("局域网通道仅在开发者模式下可用（设置中开启）".into())
+    }
+}
+
+/// 【开发者模式】开始监听：局域网 TCP 等待连接（仅开发测试，正式版默认不可见）。
 #[tauri::command]
 async fn start_listening(state: State<'_, AppState>, port: Option<u16>) -> Result<String, String> {
+    require_dev_mode(&state)?;
     let port = port.unwrap_or(7800);
     let addr = format!("0.0.0.0:{port}");
     let listener = bluelink_transport::listen_tcp(&addr)
@@ -62,16 +167,41 @@ async fn start_listening(state: State<'_, AppState>, port: Option<u16>) -> Resul
     Ok(addr)
 }
 
-/// 发起连接（访客模式）：addr 形如 192.168.1.10:7800，code 为对方连接码。
+/// 【开发者模式】发起局域网连接：addr 形如 192.168.1.10:7800（仅开发测试）。
 #[tauri::command]
 async fn connect_to(
     state: State<'_, AppState>,
     addr: String,
     code: String,
 ) -> Result<String, String> {
+    require_dev_mode(&state)?;
     let conn = bluelink_transport::connect_tcp(addr.trim())
         .await
         .map_err(|e| format!("连接失败：{e}"))?;
+    let code_clean: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+    let peer = state
+        .node
+        .attach(conn, false, &code_clean)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(peer.name)
+}
+
+/// 连接扫描到的设备（访客模式）：code 为对方屏幕上显示的连接码，握手时校验。
+#[tauri::command]
+async fn bt_connect(
+    state: State<'_, AppState>,
+    device_id: String,
+    code: String,
+) -> Result<String, String> {
+    let central = state
+        .central
+        .clone()
+        .ok_or_else(|| "蓝牙不可用".to_string())?;
+    let conn = central
+        .connect(&device_id)
+        .await
+        .map_err(|e| format!("蓝牙连接失败：{e}"))?;
     let code_clean: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
     let peer = state
         .node
@@ -455,15 +585,55 @@ fn main() {
                 }
             }
             forward_events(app.handle().clone(), node.clone());
+            // 蓝牙运行时：中心端（扫描/连出）+ 服务端（广播/被连入）。
+            // 无适配器或未开启时为 None，应用照常启动，界面如实提示（bt_state）。
+            let (central, server) = tauri::async_runtime::block_on(async {
+                let central = bluelink_transport::ble::ble_central()
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| {
+                        eprintln!("蓝牙中心端不可用：{e}");
+                        e
+                    })
+                    .ok();
+                let server = match bluelink_transport::ble::start_ble_server(&name).await {
+                    Ok((srv, mut inbound)) => {
+                        let node_in = node.clone();
+                        tauri::async_runtime::spawn(async move {
+                            while let Some(conn) = inbound.recv().await {
+                                // 宿主侧握手：校验对方给出的连接码是否为本机连接码
+                                if let Err(e) = node_in.attach(conn, true, "").await {
+                                    eprintln!("蓝牙入站连接握手失败：{e}");
+                                }
+                            }
+                        });
+                        Some(Arc::new(srv))
+                    }
+                    Err(e) => {
+                        eprintln!("蓝牙服务端不可用：{e}");
+                        None
+                    }
+                };
+                (central, server)
+            });
             app.manage(AppState {
                 node,
                 ai_cancel: Mutex::new(None),
+                central,
+                server,
+                scan_task: Mutex::new(None),
                 listening: Mutex::new(None),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_identity,
+            bt_state,
+            bt_start_scan,
+            bt_stop_scan,
+            bt_connect,
+            get_dev_mode,
+            set_dev_mode,
             start_listening,
             connect_to,
             disconnect,
