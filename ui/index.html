@@ -7,21 +7,52 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<!-- SVG 图标集（线性图标，24 视图框，描边风格，全应用统一） -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-bot" viewBox="0 0 24 24"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></symbol>
+    <symbol id="i-tag" viewBox="0 0 24 24"><path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42l-8.704-8.704Z"/><circle cx="7.5" cy="7.5" r="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h10"/><path d="M18 6h2"/><circle cx="16" cy="6" r="2"/><path d="M4 12h4"/><path d="M12 12h8"/><circle cx="10" cy="12" r="2"/><path d="M4 18h12"/><path d="M20 18h0"/><circle cx="18" cy="18" r="2"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+    <symbol id="i-clip" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M9 13h6"/><path d="M9 17h6"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-bt" viewBox="0 0 24 24"><path d="m7 7 10 10-5 5V2l5 5L7 17"/></symbol>
+    <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.859a10 10 0 0 1 14 0"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 3h6l1 7 2.5 2.5a1 1 0 0 1-.7 1.5H6.2a1 1 0 0 1-.7-1.5L8 10l1-7Z"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect width="13" height="13" x="9" y="9" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect width="12" height="12" x="6" y="6" rx="2"/></symbol>
+    <symbol id="i-quote" viewBox="0 0 24 24"><path d="M3 21c3 0 7-1 7-8V5c0-1.25-.756-2.017-2-2H4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2 1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1z"/><path d="M15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h.75c0 2.25.25 4-2.75 4v3c0 1 0 1 1 1z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+  </defs>
+</svg>
+
 <div id="app">
   <!-- 一级导航 -->
   <nav id="nav">
-    <button class="nav-item active" data-view="chat" title="聊天"><span class="nav-ico">💬</span><span>聊天</span></button>
-    <button class="nav-item" data-view="ai" title="AI 助手"><span class="nav-ico">🤖</span><span>AI</span></button>
-    <button class="nav-item" data-view="tags" title="标签"><span class="nav-ico">🏷️</span><span>标签</span></button>
-    <button class="nav-item" data-view="favorites" title="收藏"><span class="nav-ico">⭐</span><span>收藏</span></button>
+    <div class="nav-logo" title="BlueLink"><svg viewBox="0 0 24 24" class="logo-mark"><circle cx="12" cy="12" r="7.5"/></svg></div>
+    <button class="nav-item active" data-view="chat" title="聊天"><svg class="ico"><use href="#i-chat"/></svg><span>聊天</span></button>
+    <button class="nav-item" data-view="ai" title="AI 助手"><svg class="ico"><use href="#i-bot"/></svg><span>AI</span></button>
+    <button class="nav-item" data-view="tags" title="标签"><svg class="ico"><use href="#i-tag"/></svg><span>标签</span></button>
+    <button class="nav-item" data-view="favorites" title="收藏"><svg class="ico"><use href="#i-star"/></svg><span>收藏</span></button>
     <div class="nav-spacer"></div>
-    <button class="nav-item" data-view="settings" title="设置"><span class="nav-ico">⚙️</span><span>设置</span></button>
+    <button class="nav-item" data-view="settings" title="设置"><svg class="ico"><use href="#i-sliders"/></svg><span>设置</span></button>
   </nav>
 
   <!-- 列表区 -->
   <aside id="aside">
     <div class="aside-head">
-      <input id="search-input" type="text" placeholder="搜索消息…">
+      <div class="search-box">
+        <svg class="ico ico-16"><use href="#i-search"/></svg>
+        <input id="search-input" type="text" placeholder="搜索消息">
+      </div>
     </div>
     <div id="search-results" class="hidden"></div>
     <div id="conv-list"></div>
@@ -31,36 +62,77 @@
 
   <!-- 内容区 -->
   <main id="main">
-    <!-- 连接页（未连接时显示） -->
+    <!-- 连接页（未连接时显示）：蓝牙扫描与配对 -->
     <section id="connect-view">
       <div class="connect-card">
-        <h1>BlueLink</h1>
-        <p class="muted">无需网络，输入对方的连接码即可聊天、传文件。</p>
-        <div class="my-code-label">我的连接码</div>
-        <div id="my-code" class="my-code">--- ---</div>
-        <div class="connect-actions">
-          <button id="btn-listen" class="btn primary">等待连接</button>
-          <span class="muted small">或</span>
+        <div class="brand">
+          <svg viewBox="0 0 24 24" class="brand-mark"><circle cx="12" cy="12" r="7.5"/></svg>
+          <h1>BlueLink</h1>
         </div>
-        <div class="connect-form">
-          <input id="peer-addr" type="text" placeholder="对方地址，如 192.168.1.10:7800">
-          <input id="peer-code" type="text" placeholder="对方连接码（6 位）" maxlength="7">
-          <button id="btn-connect" class="btn">发起连接</button>
+        <p class="muted brand-sub">通过蓝牙与附近设备聊天、传文件，无需网络</p>
+
+        <div class="bt-status">
+          <span id="bt-status-dot" class="status-dot"></span>
+          <svg class="ico ico-16"><use href="#i-bt"/></svg>
+          <span id="bt-status-text">正在检测蓝牙…</span>
+        </div>
+
+        <div class="my-device">
+          <div class="my-device-main">
+            <div class="muted small">本机设备</div>
+            <div id="my-name" class="my-name">-</div>
+          </div>
+          <div class="my-device-code">
+            <div class="muted small">我的连接码</div>
+            <div id="my-code" class="my-code">--- ---</div>
+          </div>
+        </div>
+        <p class="muted small">对方连接本机时需要输入这个连接码。把连接码告诉对方即可。</p>
+
+        <div class="bt-scan-head">
+          <b>附近的设备</b>
+          <button id="btn-scan" class="btn small-btn"><svg class="ico ico-14"><use href="#i-search"/></svg>扫描</button>
+        </div>
+        <div id="bt-device-list"></div>
+        <p id="bt-empty" class="muted small">点「扫描」查找附近打开了 BlueLink 的设备。</p>
+
+        <div id="bt-code-row" class="hidden">
+          <input id="bt-peer-code" type="text" placeholder="输入对方连接码（6 位）" maxlength="7" inputmode="numeric">
+          <button id="btn-bt-connect" class="btn primary">连接</button>
         </div>
         <p id="connect-status" class="muted"></p>
         <p id="connect-error" class="error-text"></p>
-        <p class="muted small">等待连接时，把本机地址（同一局域网 IP）与连接码告诉对方。蓝牙通道即将推出，当前为局域网通道。</p>
+
+        <!-- 局域网测试区：仅开发者模式开启时显示 -->
+        <div id="dev-lan-section" class="hidden">
+          <div class="dev-divider"><span>局域网 · 开发者模式</span></div>
+          <div class="connect-actions">
+            <button id="btn-listen" class="btn">等待连接（TCP）</button>
+            <span class="muted small">或输入对方地址发起连接</span>
+          </div>
+          <div class="connect-form">
+            <input id="peer-addr" type="text" placeholder="对方地址，如 192.168.1.10:7800">
+            <input id="peer-code" type="text" placeholder="对方连接码（6 位）" maxlength="7">
+            <button id="btn-connect" class="btn">发起连接</button>
+          </div>
+        </div>
       </div>
     </section>
 
     <!-- 聊天页 -->
     <section id="chat-view" class="hidden">
       <header class="chat-head">
-        <div>
-          <div id="peer-name" class="chat-title">未连接</div>
-          <div id="peer-state" class="muted small">离线</div>
+        <div class="head-peer">
+          <div id="peer-avatar" class="avatar avatar-36">?</div>
+          <div>
+            <div id="peer-name" class="chat-title">未连接</div>
+            <div id="peer-state" class="muted small">离线</div>
+          </div>
         </div>
-        <div class="row-gap"><button id="btn-export" class="btn small-btn">导出</button><button id="btn-disconnect" class="btn small-btn">断开</button></div>
+        <div class="head-actions">
+          <button id="btn-export" class="btn small-btn"><svg class="ico ico-14"><use href="#i-download"/></svg>导出</button>
+          <button id="btn-disconnect" class="btn small-btn">断开</button>
+        </div>
       </header>
       <div id="pin-bar" class="hidden"></div>
       <div id="messages"></div>
@@ -69,9 +141,9 @@
       <div id="composer">
         <div id="reply-bar" class="hidden"></div>
         <div class="composer-row">
-          <button id="btn-file" class="btn small-btn" title="发送文件">＋ 文件</button>
+          <button id="btn-file" class="icon-btn" title="发送文件"><svg class="ico"><use href="#i-clip"/></svg></button>
           <textarea id="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-          <button id="btn-send" class="btn primary">发送</button>
+          <button id="btn-send" class="btn primary send-btn"><svg class="ico ico-16"><use href="#i-send"/></svg>发送</button>
         </div>
       </div>
     </section>
@@ -79,30 +151,45 @@
     <!-- AI 页 -->
     <section id="ai-view" class="hidden">
       <header class="chat-head">
-        <div>
-          <div class="chat-title">AI 助手</div>
-          <div id="ai-state" class="muted small">本机配置优先，未配置时经对方电脑代理</div>
+        <div class="head-peer">
+          <div class="avatar avatar-36 avatar-ai"><svg class="ico ico-20"><use href="#i-bot"/></svg></div>
+          <div>
+            <div class="chat-title">AI 助手</div>
+            <div id="ai-state" class="muted small">本机配置优先，未配置时经对方电脑代理</div>
+          </div>
         </div>
-        <button id="btn-ai-stop" class="btn small-btn hidden">停止</button>
+        <button id="btn-ai-stop" class="btn small-btn hidden"><svg class="ico ico-14"><use href="#i-stop"/></svg>停止</button>
       </header>
       <div id="ai-messages"></div>
       <div id="ai-composer">
         <div class="composer-row">
           <textarea id="ai-input" rows="2" placeholder="向 AI 提问，Enter 发送"></textarea>
-          <button id="btn-ai-send" class="btn primary">发送</button>
+          <button id="btn-ai-send" class="btn primary send-btn"><svg class="ico ico-16"><use href="#i-send"/></svg>发送</button>
         </div>
       </div>
     </section>
 
-    <!-- 占位页（标签/收藏/设置在列表区与抽屉呈现，内容区给提示） -->
+    <!-- 占位页（标签/收藏在列表区与抽屉呈现） -->
     <section id="placeholder-view" class="hidden">
-      <div class="placeholder-inner muted">从左侧列表选择一项查看；点任意一条可定位到原消息。</div>
+      <div class="placeholder-inner">
+        <svg class="ico ico-28"><use href="#i-chat"/></svg>
+        <p class="muted">从左侧列表选择一项查看，点任意一条可定位到原消息。</p>
+      </div>
     </section>
 
     <!-- 设置页 -->
     <section id="settings-view" class="hidden">
       <header class="chat-head"><div class="chat-title">设置</div></header>
       <div class="settings-body">
+        <h3>外观</h3>
+        <div class="setting-row">
+          <span>主题</span>
+          <div class="seg" id="theme-seg">
+            <button type="button" data-theme-set="light"><svg class="ico ico-14"><use href="#i-sun"/></svg>浅色</button>
+            <button type="button" data-theme-set="dark"><svg class="ico ico-14"><use href="#i-moon"/></svg>深色</button>
+            <button type="button" data-theme-set="system">跟随系统</button>
+          </div>
+        </div>
         <h3>本机</h3>
         <div class="setting-row"><span>设备名称</span><b id="set-name">-</b></div>
         <div class="setting-row"><span>连接码</span><b id="set-code">-</b></div>
@@ -116,8 +203,14 @@
           <button id="btn-ai-test" class="btn">测试连接</button>
           <span id="ai-test-result" class="muted small"></span>
         </div>
+        <h3>开发者</h3>
+        <div class="setting-row">
+          <span>开发者模式</span>
+          <label class="switch"><input type="checkbox" id="dev-mode-toggle"><span class="switch-track"></span></label>
+        </div>
+        <p class="muted small">开启后，连接页会多出局域网测试通道（仅供开发调试）。正式使用请用蓝牙。</p>
         <h3>关于</h3>
-        <p class="muted small">BlueLink <span id="set-version">1.0.0</span> — 蓝牙离线聊天与文件传输（重构版）。</p>
+        <p class="muted small">BlueLink <span id="set-version">2.0.0</span> — 离线聊天与文件传输（重构版）。</p>
       </div>
     </section>
   </main>
@@ -125,7 +218,11 @@
   <!-- 命令面板（Ctrl+K） -->
   <div id="palette" class="hidden">
     <div class="palette-box">
-      <input id="palette-input" type="text" placeholder="输入命令或搜索标签…">
+      <div class="palette-head">
+        <svg class="ico ico-16"><use href="#i-search"/></svg>
+        <input id="palette-input" type="text" placeholder="输入命令或搜索标签…">
+        <kbd>Esc</kbd>
+      </div>
       <div id="palette-list"></div>
     </div>
   </div>
@@ -134,7 +231,7 @@
   <div id="drawer" class="hidden">
     <div class="drawer-head">
       <b id="drawer-title">标签</b>
-      <button id="drawer-close" class="btn small-btn">关闭</button>
+      <button id="drawer-close" class="icon-btn" title="关闭"><svg class="ico"><use href="#i-x"/></svg></button>
     </div>
     <div id="drawer-list"></div>
   </div>

@@ -19,6 +19,9 @@ const state = {
   tagEditId: null,
   tagEditList: [],
   lastFileBubble: null,
+  btDevice: null,
+  btDeviceName: null,
+  devMode: false,
 };
 
 function esc(s) {
@@ -54,17 +57,46 @@ function fmtSize(n) {
 }
 const STATUS_CN = { sending: "发送中", sent: "已发送", delivered: "已送达", received: "", failed: "发送失败" };
 
+const AVATAR_COLORS = ["#2563EB", "#0E7490", "#047857", "#B45309", "#BE123C", "#475569"];
+function avatarColor(key) {
+  let h = 0;
+  for (const ch of String(key || "?")) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+function iconUse(name, cls = "ico ico-16") {
+  return `<svg class="${cls}"><use href="#${name}"/></svg>`;
+}
+/** 头像：AI 用机器人图标，本机用“我”，对端用名称首字 + 按名称派生的底色。 */
+function buildAvatarEl(m, opts = {}) {
+  const av = document.createElement("div");
+  if (opts.ai && m.sender === "ai") {
+    av.className = "avatar avatar-32 avatar-ai";
+    av.innerHTML = iconUse("i-bot", "ico ico-18");
+  } else if (m.sender === "me") {
+    av.className = "avatar avatar-32 avatar-me";
+    av.textContent = "我";
+  } else {
+    const name = state.peerName || "对方";
+    av.className = "avatar avatar-32";
+    av.style.background = avatarColor(name);
+    av.textContent = name.slice(0, 1);
+  }
+  return av;
+}
+
 /** 构建一条消息的 DOM。opts.ai 表示 AI 会话样式。 */
 function buildMessageEl(m, opts = {}) {
   const row = document.createElement("div");
   row.className = "msg-row" + (m.sender === "me" ? " me" : "");
   row.dataset.mid = m.id;
+  row.dataset.sender = m.sender;
+  row.appendChild(buildAvatarEl(m, opts));
   const wrap = document.createElement("div");
   wrap.className = "msg";
   const bubble = document.createElement("div");
   bubble.className = "bubble" + (m.kind === "file" ? " file-card" : "");
   if (m.kind === "file") {
-    bubble.innerHTML = `📄 ${esc(m.body)}<div class="progress hidden"><div></div></div>`;
+    bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div><div class="progress hidden"><div></div></div>`;
     state.lastFileBubble = bubble;
   } else if (opts.ai && m.sender === "ai") {
     bubble.innerHTML = md(m.body);
@@ -117,15 +149,21 @@ function appendMessage(container, m, renderedSet, opts) {
   if (renderedSet.has(m.id)) return;
   // 日期分隔
   const rows = container.querySelectorAll(".msg-row");
-  const lastTs = rows.length ? Number(rows[rows.length - 1].dataset.ts || 0) : 0;
-  if (!lastTs || fmtDay(lastTs) !== fmtDay(m.created_at)) {
+  const last = rows.length ? rows[rows.length - 1] : null;
+  const lastTs = last ? Number(last.dataset.ts || 0) : 0;
+  const newDay = !lastTs || fmtDay(lastTs) !== fmtDay(m.created_at);
+  if (newDay) {
     const sep = document.createElement("div");
     sep.className = "date-sep";
-    sep.textContent = fmtDay(m.created_at);
+    sep.innerHTML = `<span>${fmtDay(m.created_at)}</span>`;
     container.appendChild(sep);
   }
   const el = buildMessageEl(m, opts);
   el.dataset.ts = m.created_at;
+  // 消息分组：同日、同发送者、间隔 < 5 分钟时收起头像并压缩间距
+  if (!newDay && last && last.dataset.sender === m.sender && m.created_at - lastTs < 5 * 60 * 1000) {
+    el.classList.add("grouped");
+  }
   container.appendChild(el);
   renderedSet.add(m.id);
   container.scrollTop = container.scrollHeight;
@@ -181,8 +219,11 @@ async function loadConversations() {
   for (const c of convs) {
     if (c.kind === "peer") state.peerConvId = c.id;
     const item = document.createElement("div");
-    item.className = "list-item";
-    item.innerHTML = `<div class="li-title"><span>${esc(c.title)}</span></div><div class="li-sub">${c.kind === "ai" ? "AI 会话" : "设备会话"}</div>`;
+    item.className = "list-item conv-item";
+    const avatar = c.kind === "ai"
+      ? `<span class="avatar avatar-40 avatar-ai">${iconUse("i-bot", "ico ico-20")}</span>`
+      : `<span class="avatar avatar-40" style="background:${avatarColor(c.title)}">${esc(c.title.slice(0, 1))}</span>`;
+    item.innerHTML = `${avatar}<span class="li-main"><span class="li-title"><span>${esc(c.title)}</span></span><span class="li-sub">${c.kind === "ai" ? "AI 会话" : "设备会话"}</span></span>`;
     item.addEventListener("click", () => switchView(c.kind === "ai" ? "ai" : "chat"));
     list.appendChild(item);
   }
@@ -235,7 +276,7 @@ async function refreshPinBar() {
     const bar = $("pin-bar");
     if (!mine.length) { bar.classList.add("hidden"); return; }
     bar.classList.remove("hidden");
-    bar.textContent = `📌 置顶：${mine[0].body.slice(0, 40)}${mine.length > 1 ? `（共 ${mine.length} 条）` : ""}`;
+    bar.innerHTML = `${iconUse("i-pin", "ico ico-14")}<span>置顶：${esc(mine[0].body.slice(0, 40))}${mine.length > 1 ? `（共 ${mine.length} 条）` : ""}</span>`;
     bar.onclick = () => locateMessage(mine[0].conversation_id, mine[0].id);
   } catch (_) { /* 忽略 */ }
 }
@@ -292,12 +333,78 @@ $("btn-file").addEventListener("click", async () => {
 
 $("btn-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
 
-// ---------- 连接 ----------
+// ---------- 连接（蓝牙） ----------
+async function refreshBtState() {
+  try {
+    const s = await invoke("bt_state");
+    $("bt-status-text").textContent = s.message;
+    $("bt-status-dot").className = "status-dot" + (s.advertising ? " on" : s.available ? " warn" : " off");
+    if (!s.available) {
+      $("btn-scan").disabled = true;
+      $("bt-empty").textContent = "未检测到可用的蓝牙：请确认设备有蓝牙并已在系统中开启。";
+    }
+  } catch (_) { /* 忽略 */ }
+}
+
+let scanning = false;
+$("btn-scan").addEventListener("click", async () => {
+  $("connect-error").textContent = "";
+  try {
+    if (scanning) {
+      await invoke("bt_stop_scan");
+      scanning = false;
+      $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`;
+      $("bt-empty").textContent = "点「扫描」查找附近打开了 BlueLink 的设备。";
+    } else {
+      await invoke("bt_start_scan");
+      scanning = true;
+      $("btn-scan").innerHTML = "停止";
+      $("bt-empty").textContent = "正在扫描附近的设备…";
+    }
+  } catch (e) { $("connect-error").textContent = String(e); }
+});
+
+/** 渲染扫描到的设备列表（bt_devices 事件推送快照）。 */
+function renderBtDevices(devices) {
+  const list = $("bt-device-list");
+  list.innerHTML = "";
+  if (devices.length) $("bt-empty").textContent = "";
+  else if (scanning) $("bt-empty").textContent = "正在扫描附近的设备…";
+  for (const d of devices) {
+    const row = document.createElement("div");
+    row.className = "bt-device" + (state.btDevice === d.id ? " selected" : "");
+    row.innerHTML = `<span class="bt-device-ico">${iconUse("i-bt", "ico ico-18")}</span>
+      <span class="bt-device-main"><span class="bt-device-name">${esc(d.name)}</span>
+      <span class="bt-device-sub">${d.rssi != null ? `信号 ${d.rssi} dBm` : "蓝牙设备"}</span></span>
+      <button class="btn small-btn">连接</button>`;
+    row.querySelector("button").addEventListener("click", () => {
+      state.btDevice = d.id;
+      state.btDeviceName = d.name;
+      renderBtDevices(devices);
+      $("bt-code-row").classList.remove("hidden");
+      $("bt-peer-code").focus();
+      $("connect-status").textContent = `已选择「${d.name}」，输入对方屏幕上的连接码后点连接。`;
+    });
+    list.appendChild(row);
+  }
+}
+
+// ---------- 开发者模式（局域网测试通道，正式版默认隐藏） ----------
+function applyDevMode(on) {
+  state.devMode = on;
+  $("dev-lan-section").classList.toggle("hidden", !on);
+  const t = $("dev-mode-toggle");
+  if (t) t.checked = on;
+}
+$("dev-mode-toggle").addEventListener("change", async (e) => {
+  await invoke("set_dev_mode", { on: e.target.checked });
+  applyDevMode(e.target.checked);
+});
 $("btn-listen").addEventListener("click", async () => {
   $("connect-error").textContent = "";
   try {
     const addr = await invoke("start_listening", { port: 7800 });
-    $("connect-status").textContent = `正在等待连接（${addr}）…把本机局域网 IP 与连接码告诉对方。`;
+    $("connect-status").textContent = `正在等待局域网连接（${addr}）…`;
   } catch (e) { $("connect-error").textContent = String(e); }
 });
 $("btn-connect").addEventListener("click", async () => {
@@ -308,6 +415,21 @@ $("btn-connect").addEventListener("click", async () => {
   $("connect-status").textContent = "正在连接…";
   try {
     await invoke("connect_to", { addr, code });
+  } catch (e) {
+    $("connect-error").textContent = String(e);
+    $("connect-status").textContent = "";
+  }
+});
+
+$("btn-bt-connect").addEventListener("click", async () => {
+  $("connect-error").textContent = "";
+  const code = $("bt-peer-code").value.trim();
+  if (!state.btDevice) { $("connect-error").textContent = "请先在列表中选择一台设备"; return; }
+  if (!code) { $("connect-error").textContent = "请输入对方的连接码"; return; }
+  $("connect-status").textContent = `正在通过蓝牙连接「${state.btDeviceName || "对方设备"}」…`;
+  try {
+    await invoke("bt_connect", { deviceId: state.btDevice, code });
+    if (scanning) { await invoke("bt_stop_scan").catch(() => {}); scanning = false; }
   } catch (e) {
     $("connect-error").textContent = String(e);
     $("connect-status").textContent = "";
@@ -577,11 +699,17 @@ document.addEventListener("keydown", (e) => {
 
 // ---------- 后端事件 ----------
 async function wireEvents() {
+  await listen("bt_devices", (e) => renderBtDevices(e.payload || []));
   await listen("connection_state", async (e) => {
     state.connected = e.payload.connected;
     state.peerName = e.payload.peer_name;
     $("peer-name").textContent = state.peerName || "未连接";
-    $("peer-state").textContent = state.connected ? "已连接" : "离线";
+    $("peer-state").textContent = state.connected ? "蓝牙已连接" : "离线";
+    const pav = $("peer-avatar");
+    if (state.peerName) {
+      pav.textContent = state.peerName.slice(0, 1);
+      pav.style.background = avatarColor(state.peerName);
+    }
     $("connect-status").textContent = state.connected ? "" : $("connect-status").textContent;
     await loadConversations();
     if (state.connected) { switchView("chat"); loadChatMessages(); }
@@ -626,7 +754,7 @@ async function wireEvents() {
     if (!state.streamEl) {
       const row = document.createElement("div");
       row.className = "msg-row";
-      row.innerHTML = `<div class="msg"><div class="bubble"></div></div>`;
+      row.innerHTML = `<div class="avatar avatar-32 avatar-ai">${iconUse("i-bot", "ico ico-18")}</div><div class="msg"><div class="bubble"></div></div>`;
       container.appendChild(row);
       state.streamEl = row.querySelector(".bubble");
     }
@@ -640,10 +768,27 @@ async function wireEvents() {
   await listen("ai_error", (e) => alert("AI 错误：" + e.payload.error));
 }
 
+// ---------- 主题 ----------
+function applyTheme(mode) {
+  if (mode === "system") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", mode);
+  document.querySelectorAll("#theme-seg button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.themeSet === mode));
+}
+document.querySelectorAll("#theme-seg button").forEach((b) =>
+  b.addEventListener("click", () => {
+    localStorage.setItem("bl-theme", b.dataset.themeSet);
+    applyTheme(b.dataset.themeSet);
+  }));
+
 // ---------- 启动 ----------
 (async function init() {
+  applyTheme(localStorage.getItem("bl-theme") || "system");
   state.identity = await invoke("get_identity");
   $("my-code").textContent = state.identity.code_display;
+  $("my-name").textContent = state.identity.name;
+  refreshBtState();
+  invoke("get_dev_mode").then(applyDevMode).catch(() => {});
   await wireEvents();
   await loadConversations();
   if (state.identity.connected) {
