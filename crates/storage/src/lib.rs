@@ -157,6 +157,24 @@ impl Storage {
         Ok(())
     }
 
+    /// 删除一条消息（供 AI 重新生成替换旧回复用），连带清理全文索引与标记。
+    pub fn delete_message(&self, id: &str) -> Result<(), StorageError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if let Ok(rowid) =
+            tx.query_row("SELECT rowid FROM messages WHERE id=?1", params![id], |r| {
+                r.get::<_, i64>(0)
+            })
+        {
+            tx.execute("DELETE FROM messages_fts WHERE rowid=?1", params![rowid])?;
+        }
+        tx.execute("DELETE FROM message_tags WHERE message_id=?1", params![id])?;
+        tx.execute("DELETE FROM message_marks WHERE message_id=?1", params![id])?;
+        tx.execute("DELETE FROM messages WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn update_message_status(
         &self,
         id: &str,

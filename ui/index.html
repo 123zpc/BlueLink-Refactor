@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BlueLink</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <!-- 一级导航 -->
+  <nav id="nav">
+    <button class="nav-item active" data-view="chat" title="聊天"><span class="nav-ico">💬</span><span>聊天</span></button>
+    <button class="nav-item" data-view="ai" title="AI 助手"><span class="nav-ico">🤖</span><span>AI</span></button>
+    <button class="nav-item" data-view="tags" title="标签"><span class="nav-ico">🏷️</span><span>标签</span></button>
+    <button class="nav-item" data-view="favorites" title="收藏"><span class="nav-ico">⭐</span><span>收藏</span></button>
+    <div class="nav-spacer"></div>
+    <button class="nav-item" data-view="settings" title="设置"><span class="nav-ico">⚙️</span><span>设置</span></button>
+  </nav>
+
+  <!-- 列表区 -->
+  <aside id="aside">
+    <div class="aside-head">
+      <input id="search-input" type="text" placeholder="搜索消息…">
+    </div>
+    <div id="search-results" class="hidden"></div>
+    <div id="conv-list"></div>
+    <div id="tag-list" class="hidden"></div>
+    <div id="fav-list" class="hidden"></div>
+  </aside>
+
+  <!-- 内容区 -->
+  <main id="main">
+    <!-- 连接页（未连接时显示） -->
+    <section id="connect-view">
+      <div class="connect-card">
+        <h1>BlueLink</h1>
+        <p class="muted">无需网络，输入对方的连接码即可聊天、传文件。</p>
+        <div class="my-code-label">我的连接码</div>
+        <div id="my-code" class="my-code">--- ---</div>
+        <div class="connect-actions">
+          <button id="btn-listen" class="btn primary">等待连接</button>
+          <span class="muted small">或</span>
+        </div>
+        <div class="connect-form">
+          <input id="peer-addr" type="text" placeholder="对方地址，如 192.168.1.10:7800">
+          <input id="peer-code" type="text" placeholder="对方连接码（6 位）" maxlength="7">
+          <button id="btn-connect" class="btn">发起连接</button>
+        </div>
+        <p id="connect-status" class="muted"></p>
+        <p id="connect-error" class="error-text"></p>
+        <p class="muted small">等待连接时，把本机地址（同一局域网 IP）与连接码告诉对方。蓝牙通道即将推出，当前为局域网通道。</p>
+      </div>
+    </section>
+
+    <!-- 聊天页 -->
+    <section id="chat-view" class="hidden">
+      <header class="chat-head">
+        <div>
+          <div id="peer-name" class="chat-title">未连接</div>
+          <div id="peer-state" class="muted small">离线</div>
+        </div>
+        <button id="btn-disconnect" class="btn small-btn">断开</button>
+      </header>
+      <div id="pin-bar" class="hidden"></div>
+      <div id="messages"></div>
+      <div id="typing-hint" class="muted small hidden">对方正在输入…</div>
+      <div id="composer">
+        <div id="reply-bar" class="hidden"></div>
+        <div class="composer-row">
+          <button id="btn-file" class="btn small-btn" title="发送文件">＋ 文件</button>
+          <textarea id="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+          <button id="btn-send" class="btn primary">发送</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- AI 页 -->
+    <section id="ai-view" class="hidden">
+      <header class="chat-head">
+        <div>
+          <div class="chat-title">AI 助手</div>
+          <div id="ai-state" class="muted small">本机配置优先，未配置时经对方电脑代理</div>
+        </div>
+        <button id="btn-ai-stop" class="btn small-btn hidden">停止</button>
+      </header>
+      <div id="ai-messages"></div>
+      <div id="ai-composer">
+        <div class="composer-row">
+          <textarea id="ai-input" rows="2" placeholder="向 AI 提问，Enter 发送"></textarea>
+          <button id="btn-ai-send" class="btn primary">发送</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 占位页（标签/收藏/设置在列表区与抽屉呈现，内容区给提示） -->
+    <section id="placeholder-view" class="hidden">
+      <div class="placeholder-inner muted">从左侧列表选择一项查看；点任意一条可定位到原消息。</div>
+    </section>
+
+    <!-- 设置页 -->
+    <section id="settings-view" class="hidden">
+      <header class="chat-head"><div class="chat-title">设置</div></header>
+      <div class="settings-body">
+        <h3>本机</h3>
+        <div class="setting-row"><span>设备名称</span><b id="set-name">-</b></div>
+        <div class="setting-row"><span>连接码</span><b id="set-code">-</b></div>
+        <div class="setting-row"><span>下载目录</span><span id="set-dl" class="muted small">-</span></div>
+        <h3>AI 接口（OpenAI 兼容）</h3>
+        <label class="field">接口地址<input id="ai-base" type="text" placeholder="https://api.openai.com/v1"></label>
+        <label class="field">密钥<input id="ai-key" type="password" placeholder="留空表示不修改"></label>
+        <label class="field">模型<input id="ai-model" type="text" placeholder="如 gpt-4o-mini"></label>
+        <div class="row-gap">
+          <button id="btn-ai-save" class="btn primary">保存</button>
+          <button id="btn-ai-test" class="btn">测试连接</button>
+          <span id="ai-test-result" class="muted small"></span>
+        </div>
+        <h3>关于</h3>
+        <p class="muted small">BlueLink <span id="set-version">1.0.0</span> — 蓝牙离线聊天与文件传输（重构版）。</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- 标签消息抽屉 -->
+  <div id="drawer" class="hidden">
+    <div class="drawer-head">
+      <b id="drawer-title">标签</b>
+      <button id="drawer-close" class="btn small-btn">关闭</button>
+    </div>
+    <div id="drawer-list"></div>
+  </div>
+
+  <!-- 标签编辑浮层 -->
+  <div id="tag-pop" class="hidden">
+    <div class="tag-pop-head">标签（回车添加，点 × 移除）</div>
+    <div id="tag-chips"></div>
+    <input id="tag-input" type="text" placeholder="新标签名，1–20 字" maxlength="20">
+    <div class="row-gap">
+      <button id="tag-save" class="btn primary small-btn">保存</button>
+      <button id="tag-cancel" class="btn small-btn">取消</button>
+    </div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

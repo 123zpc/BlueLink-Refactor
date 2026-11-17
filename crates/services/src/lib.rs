@@ -905,6 +905,66 @@ impl Node {
         Ok(ai_msg)
     }
 
+    /// 重新生成最后一条 AI 回复：删掉旧回复，用同一上下文再生成一条。
+    pub async fn ai_regenerate(self: &Arc<Self>) -> Result<Message, ServiceError> {
+        let conv_id = self.ensure_ai_conversation()?;
+        let history = self.storage.list_messages(&conv_id, None, 50)?;
+        // 找到并删除最后一条 AI 回复
+        if let Some(last_ai) = history.iter().rev().find(|m| m.sender == Sender::Ai) {
+            self.storage.delete_message(&last_ai.id)?;
+        }
+        let history = self.storage.list_messages(&conv_id, None, 20)?;
+        if !history.iter().any(|m| m.sender == Sender::Me) {
+            return Err(ServiceError::Other("还没有提问过，无法重新生成".into()));
+        }
+        let msgs: Vec<ChatMessage> = history
+            .iter()
+            .map(|m| ChatMessage {
+                role: if m.sender == Sender::Ai {
+                    "assistant".into()
+                } else {
+                    "user".into()
+                },
+                content: m.body.clone(),
+            })
+            .collect();
+        let cfg = self.ai_cfg.lock().await.clone();
+        let full = if let Some(cfg) = cfg.filter(|c| c.is_ready()) {
+            let client = AiClient::new(cfg);
+            let node = self.clone();
+            let cid = conv_id.clone();
+            client
+                .chat_stream(&msgs, |delta| {
+                    node.emit(Event::AiChunk {
+                        conversation_id: cid.clone(),
+                        delta: delta.to_string(),
+                    });
+                })
+                .await?
+        } else if self.is_connected().await {
+            self.ai_via_peer(&msgs).await?
+        } else {
+            return Err(bluelink_ai::AiError::NotConfigured.into());
+        };
+        let ai_msg = Message {
+            id: new_id(),
+            conversation_id: conv_id.clone(),
+            sender: Sender::Ai,
+            kind: MessageKind::Text,
+            body: full,
+            file_id: None,
+            reply_to: None,
+            status: MessageStatus::Received,
+            created_at: now_ms(),
+        };
+        self.storage.insert_message(&ai_msg)?;
+        self.emit(Event::AiDone {
+            conversation_id: conv_id,
+            message: ai_msg.clone(),
+        });
+        Ok(ai_msg)
+    }
+
     /// 经对端代理提问：响应帧由 handle_ai_proxy_frame 转入等待通道。
     async fn ai_via_peer(&self, msgs: &[ChatMessage]) -> Result<String, ServiceError> {
         let session = self.session().await?;
