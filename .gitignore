@@ -1,0 +1,31 @@
+# Build
+target/
+build/
+out/
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# Runtime data — never commit databases or local state
+data/
+*.mv.db
+*.trace.db
+dump.rdb
+appendonly.aof
+redis-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config / secrets
+config.properties
+*.local.properties
+.env
