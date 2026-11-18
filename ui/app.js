@@ -789,7 +789,8 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
   $("my-name").textContent = state.identity.name;
   refreshBtState();
   invoke("get_dev_mode").then(applyDevMode).catch(() => {});
-  await wireEvents();
+  // 事件订阅失败不能拖垮其余启动流程（v2.0.0 曾因缺权限配置导致实时事件全灭）。
+  try { await wireEvents(); } catch (e) { console.error("事件订阅失败", e); }
   await loadConversations();
   if (state.identity.connected) {
     state.connected = true;

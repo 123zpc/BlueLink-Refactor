@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"BlueLink 主窗口权限：核心事件订阅（连接状态/新消息实时推送）与文件对话框","local":true,"windows":["main"],"permissions":["core:default","dialog:default"]}}
