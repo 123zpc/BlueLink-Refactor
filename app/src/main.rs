@@ -2,8 +2,12 @@
 // 事件层把节点事件转发给前端。命令清单与详细设计第三章对应。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod local_api;
+
 use bluelink_ai::{AiClient, AiConfig, ChatMessage};
-use bluelink_domain::{Conversation, MarkKind, Message, Tag};
+use bluelink_domain::{
+    CategorizedMessage, Category, Conversation, MarkKind, Message, MessageCategory, Tag,
+};
 use bluelink_services::{Event, Node};
 use serde::Serialize;
 use std::sync::Arc;
@@ -20,6 +24,7 @@ struct AppState {
     server: Option<Arc<bluelink_transport::ble::BleServer>>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     listening: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    local_api: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// 本机身份信息（连接页与设置页用）。
@@ -434,31 +439,46 @@ async fn ai_stop(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// 从设置里组装完整 AI 配置（全字段唯一出处：命令层与启动恢复共用）。
+fn load_ai_config(s: &bluelink_storage::Storage) -> AiConfig {
+    let get = |k: &str| s.get_setting(k).ok().flatten().unwrap_or_default();
+    AiConfig {
+        base_url: get("ai_base"),
+        api_key: get("ai_key"),
+        model: get("ai_model"),
+        stream: get("ai_stream") != "0",
+        temperature: get("ai_temp")
+            .parse::<f32>()
+            .ok()
+            .filter(|t| (0.0..=2.0).contains(t)),
+        max_tokens: get("ai_max_tokens").parse::<u32>().ok().filter(|n| *n > 0),
+        system_prompt: get("ai_prompt"),
+    }
+}
+
 /// AI 配置回显（不回传密钥明文，只报是否已配置）。
 #[derive(Serialize)]
 struct AiConfigView {
     base_url: String,
     model: String,
     has_key: bool,
+    stream: bool,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    system_prompt: String,
 }
 
 #[tauri::command]
 fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfigView, String> {
-    let s = &state.node.storage;
+    let cfg = load_ai_config(&state.node.storage);
     Ok(AiConfigView {
-        base_url: s
-            .get_setting("ai_base")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default(),
-        model: s
-            .get_setting("ai_model")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default(),
-        has_key: s
-            .get_setting("ai_key")
-            .map_err(|e| e.to_string())?
-            .map(|k| !k.is_empty())
-            .unwrap_or(false),
+        has_key: !cfg.api_key.is_empty(),
+        base_url: cfg.base_url,
+        model: cfg.model,
+        stream: cfg.stream,
+        temperature: cfg.temperature,
+        max_tokens: cfg.max_tokens,
+        system_prompt: cfg.system_prompt,
     })
 }
 
@@ -468,26 +488,30 @@ async fn set_ai_config(
     base_url: String,
     api_key: String,
     model: String,
+    stream: bool,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    system_prompt: String,
 ) -> Result<(), String> {
     let s = &state.node.storage;
-    s.set_setting("ai_base", &base_url)
-        .map_err(|e| e.to_string())?;
+    let set = |k: &str, v: &str| s.set_setting(k, v).map_err(|e| e.to_string());
+    set("ai_base", &base_url)?;
     // 密钥留空表示不修改
     if !api_key.is_empty() {
-        s.set_setting("ai_key", &api_key)
-            .map_err(|e| e.to_string())?;
+        set("ai_key", &api_key)?;
     }
-    s.set_setting("ai_model", &model)
-        .map_err(|e| e.to_string())?;
-    let key = s
-        .get_setting("ai_key")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let cfg = AiConfig {
-        base_url,
-        api_key: key,
-        model,
-    };
+    set("ai_model", &model)?;
+    set("ai_stream", if stream { "1" } else { "0" })?;
+    set(
+        "ai_temp",
+        &temperature.map(|t| t.to_string()).unwrap_or_default(),
+    )?;
+    set(
+        "ai_max_tokens",
+        &max_tokens.map(|n| n.to_string()).unwrap_or_default(),
+    )?;
+    set("ai_prompt", &system_prompt)?;
+    let cfg = load_ai_config(s);
     state
         .node
         .set_ai_config(if cfg.is_ready() { Some(cfg) } else { None })
@@ -497,22 +521,9 @@ async fn set_ai_config(
 
 #[tauri::command]
 async fn test_ai_connection(state: State<'_, AppState>) -> Result<String, String> {
-    let s = &state.node.storage;
-    let cfg = AiConfig {
-        base_url: s
-            .get_setting("ai_base")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default(),
-        api_key: s
-            .get_setting("ai_key")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default(),
-        model: s
-            .get_setting("ai_model")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default(),
-    };
+    let cfg = load_ai_config(&state.node.storage);
     let client = AiClient::new(cfg);
+    let t0 = std::time::Instant::now();
     let reply = client
         .chat_once(&[ChatMessage {
             role: "user".into(),
@@ -521,9 +532,323 @@ async fn test_ai_connection(state: State<'_, AppState>) -> Result<String, String
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!(
-        "连接成功，接口回复：{}",
+        "连接成功（延迟约 {} ms），接口回复：{}",
+        t0.elapsed().as_millis(),
         reply.chars().take(50).collect::<String>()
     ))
+}
+
+// ---------- 彩签分类（v2.2：颜色即分类） ----------
+#[tauri::command]
+fn list_categories(state: State<'_, AppState>) -> Result<Vec<Category>, String> {
+    state
+        .node
+        .storage
+        .list_categories()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_category(state: State<'_, AppState>, color: i64, name: String) -> Result<(), String> {
+    let name = name.trim();
+    if !(0..=8).contains(&color) {
+        return Err("颜色序号无效".into());
+    }
+    if name.is_empty() || name.chars().count() > 20 {
+        return Err("分类名需为 1–20 字".into());
+    }
+    state
+        .node
+        .storage
+        .rename_category(color, name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_message_category(
+    state: State<'_, AppState>,
+    message_id: String,
+    color: Option<i64>,
+    note: Option<String>,
+) -> Result<(), String> {
+    if let Some(c) = color {
+        if !(0..=8).contains(&c) {
+            return Err("颜色序号无效".into());
+        }
+    }
+    state
+        .node
+        .storage
+        .set_message_category(&message_id, color.map(|c| (c, note)))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_message_category(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<Option<MessageCategory>, String> {
+    state
+        .node
+        .storage
+        .get_message_category(&message_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_messages_by_category(
+    state: State<'_, AppState>,
+    color: i64,
+) -> Result<Vec<CategorizedMessage>, String> {
+    state
+        .node
+        .storage
+        .list_messages_by_category(color)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_message(state: State<'_, AppState>, message_id: String) -> Result<Option<Message>, String> {
+    state
+        .node
+        .storage
+        .get_message(&message_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 删除一条消息记录（文件菜单「删除」；只删记录与本地索引，不动已落地的文件本体）。
+#[tauri::command]
+fn delete_message(state: State<'_, AppState>, message_id: String) -> Result<(), String> {
+    state
+        .node
+        .storage
+        .delete_message(&message_id)
+        .map_err(|e| e.to_string())
+}
+
+// ---------- 传输控制 / 存储 / 文件 ----------
+#[tauri::command]
+async fn cancel_transfer(state: State<'_, AppState>, transfer_id: String) -> Result<(), String> {
+    state.node.cancel_transfer(&transfer_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn resend_message(state: State<'_, AppState>, message_id: String) -> Result<(), String> {
+    state
+        .node
+        .resend_message(&message_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct StorageStatsView {
+    chat_count: i64,
+    chat_bytes: i64,
+    files_bytes: u64,
+    files_count: u64,
+    cache_bytes: u64,
+}
+
+#[tauri::command]
+fn storage_stats(state: State<'_, AppState>) -> Result<StorageStatsView, String> {
+    let s = state.node.storage_stats();
+    Ok(StorageStatsView {
+        chat_count: s.chat_count,
+        chat_bytes: s.chat_bytes,
+        files_bytes: s.files_bytes,
+        files_count: s.files_count,
+        cache_bytes: s.cache_bytes,
+    })
+}
+
+#[tauri::command]
+async fn clean_cache(state: State<'_, AppState>) -> Result<u64, String> {
+    Ok(state.node.clean_cache().await)
+}
+
+#[tauri::command]
+fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String> {
+    state.node.clear_chat_history().map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct FileInfoView {
+    name: String,
+    size: u64,
+    path: Option<String>,
+    exists: bool,
+}
+
+#[tauri::command]
+fn file_info(state: State<'_, AppState>, message_id: String) -> Result<Option<FileInfoView>, String> {
+    Ok(state
+        .node
+        .file_info(&message_id)
+        .map_err(|e| e.to_string())?
+        .map(|f| FileInfoView {
+            name: f.name,
+            size: f.size,
+            path: f.path,
+            exists: f.exists,
+        }))
+}
+
+#[tauri::command]
+fn open_file(path: String) -> Result<(), String> {
+    bluelink_services::open_file(std::path::Path::new(&path)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reveal_file(path: String) -> Result<(), String> {
+    bluelink_services::reveal_file(std::path::Path::new(&path)).map_err(|e| e.to_string())
+}
+
+/// 复制文件到目标路径（文件菜单「另存为」，目标由保存对话框选定）。
+#[tauri::command]
+fn copy_file_as(src: String, dst: String) -> Result<(), String> {
+    std::fs::copy(&src, &dst)
+        .map(|_| ())
+        .map_err(|e| format!("复制失败：{e}"))
+}
+
+/// 把粘贴的图片落盘暂存，返回路径（前端在点发送时按文件发送；剪贴板图片只在无文字时走这里）。
+#[tauri::command]
+fn stage_pasted_image(state: State<'_, AppState>, data_base64: String, ext: String) -> Result<String, String> {
+    let ext = match ext.to_lowercase().as_str() {
+        "jpg" | "jpeg" => "jpg",
+        "gif" => "gif",
+        "webp" => "webp",
+        _ => "png",
+    };
+    let bytes = base64_decode(&data_base64).ok_or("图片数据无效")?;
+    if bytes.is_empty() || bytes.len() > 32 * 1024 * 1024 {
+        return Err("图片数据无效或过大".into());
+    }
+    let dir = state.data_dir.join("pasted");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let name = format!("粘贴的图片-{}.{}", bluelink_domain::now_ms(), ext);
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 极简 Base64 解码（标准字母表，容忍空白与缺省填充）。
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut vals = [0u8; 4];
+        let mut n = 0;
+        let mut pad = 0;
+        for (i, c) in chunk.iter().enumerate() {
+            if *c == b'=' {
+                pad += 1;
+                vals[i] = 0;
+            } else {
+                vals[i] = val(*c)?;
+                n += 1;
+            }
+        }
+        if n + pad != 4 && chunk.len() == 4 {
+            return None;
+        }
+        out.push((vals[0] << 2) | (vals[1] >> 4));
+        if pad < 2 && chunk.len() > 2 {
+            out.push((vals[1] << 4) | (vals[2] >> 2));
+        }
+        if pad < 1 && chunk.len() > 3 {
+            out.push((vals[2] << 6) | vals[3]);
+        }
+        if chunk.len() < 4 {
+            break;
+        }
+    }
+    Some(out)
+}
+
+// ---------- AI 网关（转发许可 + 本地 API 服务） ----------
+#[derive(Serialize)]
+struct GatewaySettingsView {
+    proxy_allow: bool,
+    proxy_count: u64,
+    proxy_tokens: u64,
+    local_enabled: bool,
+    local_running: bool,
+    local_addr: String,
+    local_has_key: bool,
+}
+
+fn gateway_view(state: &AppState) -> GatewaySettingsView {
+    let s = &state.node.storage;
+    let get = |k: &str| s.get_setting(k).ok().flatten().unwrap_or_default();
+    let (count, tokens) = state.node.proxy_today_stats();
+    GatewaySettingsView {
+        proxy_allow: get("ai_proxy_allow") == "1",
+        proxy_count: count,
+        proxy_tokens: tokens,
+        local_enabled: get("local_api_enabled") == "1",
+        local_running: false, // 由命令层按任务句柄补齐
+        local_addr: format!("http://127.0.0.1:{}/v1", local_api::PORT),
+        local_has_key: !get("local_api_key").is_empty(),
+    }
+}
+
+#[tauri::command]
+async fn get_gateway_settings(state: State<'_, AppState>) -> Result<GatewaySettingsView, String> {
+    let mut v = gateway_view(&state);
+    v.local_running = state
+        .local_api
+        .lock()
+        .await
+        .as_ref()
+        .map(|h| !h.is_finished())
+        .unwrap_or(false);
+    Ok(v)
+}
+
+#[tauri::command]
+fn set_proxy_allow(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    state
+        .node
+        .storage
+        .set_setting("ai_proxy_allow", if on { "1" } else { "0" })
+        .map_err(|e| e.to_string())
+}
+
+/// 开关本地 API 服务；key 为 Some 时更新本机访问密钥（空串 = 清除，None = 不修改）。
+#[tauri::command]
+async fn set_local_api(
+    state: State<'_, AppState>,
+    enabled: bool,
+    key: Option<String>,
+) -> Result<(), String> {
+    let s = &state.node.storage;
+    s.set_setting("local_api_enabled", if enabled { "1" } else { "0" })
+        .map_err(|e| e.to_string())?;
+    if let Some(k) = key {
+        s.set_setting("local_api_key", k.trim())
+            .map_err(|e| e.to_string())?;
+    }
+    let mut slot = state.local_api.lock().await;
+    if let Some(h) = slot.take() {
+        h.abort();
+    }
+    if enabled {
+        *slot = Some(local_api::spawn(state.node.clone()));
+    }
+    Ok(())
 }
 
 /// 把节点事件转发给前端（事件名与详细设计第三章一致）。
@@ -610,23 +935,25 @@ fn main() {
                 .or_else(|_| std::env::var("HOSTNAME"))
                 .unwrap_or_else(|_| "我的电脑".to_string());
             let node = Node::new(&data_dir, &name).map_err(|e| e.to_string())?;
-            // 恢复已保存的 AI 配置
-            let s = &node.storage;
-            if let (Ok(Some(base)), Ok(Some(key)), Ok(Some(model))) = (
-                s.get_setting("ai_base"),
-                s.get_setting("ai_key"),
-                s.get_setting("ai_model"),
-            ) {
-                let cfg = AiConfig {
-                    base_url: base,
-                    api_key: key,
-                    model,
-                };
+            // 恢复已保存的 AI 配置（全字段）
+            {
+                let cfg = load_ai_config(&node.storage);
                 if cfg.is_ready() {
                     let n = node.clone();
                     tauri::async_runtime::block_on(async move { n.set_ai_config(Some(cfg)).await });
                 }
             }
+            // 本地 API 服务按设置自启
+            let local_handle = if node
+                .storage
+                .get_setting("local_api_enabled")
+                .map(|v| v.as_deref() == Some("1"))
+                .unwrap_or(false)
+            {
+                Some(local_api::spawn(node.clone()))
+            } else {
+                None
+            };
             forward_events(app.handle().clone(), node.clone());
             // 蓝牙运行时：中心端（扫描/连出）+ 服务端（广播/被连入）。
             // 无适配器或未开启时为 None，应用照常启动，界面如实提示（bt_state）。
@@ -667,6 +994,7 @@ fn main() {
                 server,
                 scan_task: Mutex::new(None),
                 listening: Mutex::new(None),
+                local_api: Mutex::new(local_handle),
             });
             Ok(())
         })
@@ -703,6 +1031,26 @@ fn main() {
             get_ai_config,
             set_ai_config,
             test_ai_connection,
+            list_categories,
+            rename_category,
+            set_message_category,
+            get_message_category,
+            list_messages_by_category,
+            get_message,
+            delete_message,
+            cancel_transfer,
+            resend_message,
+            storage_stats,
+            clean_cache,
+            clear_chat_history,
+            file_info,
+            open_file,
+            reveal_file,
+            copy_file_as,
+            stage_pasted_image,
+            get_gateway_settings,
+            set_proxy_allow,
+            set_local_api,
         ])
         .run(tauri::generate_context!())
         .expect("启动 BlueLink 失败");
