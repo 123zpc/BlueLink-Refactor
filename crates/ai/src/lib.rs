@@ -29,12 +29,43 @@ pub enum AiError {
     BadResponse,
 }
 
-/// AI 配置。
+/// AI 配置（v2.2 起补全字段：流式开关、温度、最大回复长度、系统提示词）。
+/// 新字段都带默认值，旧的三字段构造与旧数据不受影响。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// 是否流式输出（默认开；关时整段返回）。
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    /// 温度（0–2），None 表示不传给接口、用接口默认。
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// 最大回复长度（tokens），None 表示不限。
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// 系统提示词（为空则不附加）。由实际调用上游的一侧自动加在消息列表最前。
+    #[serde(default)]
+    pub system_prompt: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            stream: true,
+            temperature: None,
+            max_tokens: None,
+            system_prompt: String::new(),
+        }
+    }
 }
 
 impl AiConfig {
@@ -42,6 +73,32 @@ impl AiConfig {
         !self.base_url.trim().is_empty()
             && !self.api_key.trim().is_empty()
             && !self.model.trim().is_empty()
+    }
+
+    /// 组装请求体：带上已设置的温度/最大长度；系统提示词自动置顶（调用方已带 system 时不重复加）。
+    fn build_body(&self, messages: &[ChatMessage], stream: bool) -> serde_json::Value {
+        let mut msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len() + 1);
+        let prompt = self.system_prompt.trim();
+        if !prompt.is_empty() && messages.first().map(|m| m.role.as_str()) != Some("system") {
+            msgs.push(serde_json::json!({"role": "system", "content": prompt}));
+        }
+        msgs.extend(
+            messages
+                .iter()
+                .map(|m| serde_json::json!({"role": m.role, "content": m.content})),
+        );
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": msgs,
+            "stream": stream,
+        });
+        if let Some(t) = self.temperature {
+            body["temperature"] = t.into();
+        }
+        if let Some(m) = self.max_tokens {
+            body["max_tokens"] = m.into();
+        }
+        body
     }
 }
 
@@ -94,11 +151,7 @@ impl AiClient {
         mut on_delta: F,
     ) -> Result<String, AiError> {
         self.check_ready()?;
-        let body = serde_json::json!({
-            "model": self.cfg.model,
-            "messages": messages,
-            "stream": true,
-        });
+        let body = self.cfg.build_body(messages, true);
         let resp = self
             .http
             .post(self.endpoint())
@@ -138,11 +191,7 @@ impl AiClient {
     /// 非流式对话（代理模式与连通性测试用）。
     pub async fn chat_once(&self, messages: &[ChatMessage]) -> Result<String, AiError> {
         self.check_ready()?;
-        let body = serde_json::json!({
-            "model": self.cfg.model,
-            "messages": messages,
-            "stream": false,
-        });
+        let body = self.cfg.build_body(messages, false);
         let resp = self
             .http
             .post(self.endpoint())
@@ -181,11 +230,39 @@ mod tests {
     }
 
     #[test]
+    fn 请求体带可选参数与系统提示词() {
+        let cfg = AiConfig {
+            base_url: "http://x/v1".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            temperature: Some(0.7),
+            max_tokens: Some(512),
+            system_prompt: "你是助手".into(),
+            ..Default::default()
+        };
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let body = cfg.build_body(&msgs, true);
+        assert!((body["temperature"].as_f64().unwrap() - 0.7).abs() < 0.001);
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "hi");
+        // 未设置的可选参数不出现在请求体里
+        let plain = AiConfig::default().build_body(&msgs, false);
+        assert!(plain.get("temperature").is_none());
+        assert!(plain.get("max_tokens").is_none());
+        assert_eq!(plain["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
     fn 未配置时报错文案() {
         let c = AiClient::new(AiConfig {
             base_url: String::new(),
             api_key: String::new(),
             model: String::new(),
+            ..Default::default()
         });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let err = rt.block_on(c.chat_once(&[])).unwrap_err();

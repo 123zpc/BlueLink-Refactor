@@ -7,7 +7,7 @@ use bluelink_protocol::{Control, FileChunk, Frame, CHUNK_SIZE};
 use bluelink_storage::Storage;
 use bluelink_transport::Conn;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,6 +69,72 @@ pub enum Event {
         error: String,
     },
     PeerTyping(bool),
+}
+
+/// 设置页存储区数据（聊天记录/接收文件/缓存占用）。
+#[derive(Debug, Clone, Copy)]
+pub struct StorageStats {
+    pub chat_count: i64,
+    pub chat_bytes: i64,
+    pub files_bytes: u64,
+    pub files_count: u64,
+    pub cache_bytes: u64,
+}
+
+/// 一条文件消息对应的本地文件信息。
+#[derive(Debug, Clone)]
+pub struct MessageFileInfo {
+    pub name: String,
+    pub size: u64,
+    pub path: Option<String>,
+    pub exists: bool,
+}
+
+/// 用系统默认程序打开文件（文件菜单「打开」）。
+pub fn open_file(path: &Path) -> Result<(), ServiceError> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(path);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    cmd.spawn()?;
+    Ok(())
+}
+
+/// 在系统文件管理器中定位文件（文件菜单「打开文件位置」）。
+pub fn reveal_file(path: &Path) -> Result<(), ServiceError> {
+    #[cfg(target_os = "windows")]
+    {
+        // explorer 对 /select 的成功返回码也不稳定，只负责拉起进程
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg("-R").arg(path).spawn()?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = path.parent().unwrap_or(path);
+        std::process::Command::new("xdg-open").arg(dir).spawn()?;
+        Ok(())
+    }
 }
 
 /// 已知压缩格式（这些扩展名的分片直传，不再压缩）。
@@ -133,6 +199,7 @@ struct RecvState {
     total: u64,
     sha256: String,
     msg_id: String,
+    file_id: String,
     part_path: PathBuf,
     ranges: Ranges,
     written: u64,
@@ -158,6 +225,8 @@ pub struct Node {
     verify_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     recv_files: Mutex<HashMap<String, RecvState>>,
     proxy_waiters: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<String, String>>>>,
+    /// 被用户取消的发送中传输 ID（发送循环逐片检查）。
+    cancelled: Mutex<HashSet<String>>,
 }
 
 impl Node {
@@ -193,6 +262,7 @@ impl Node {
             verify_waiters: Mutex::new(HashMap::new()),
             recv_files: Mutex::new(HashMap::new()),
             proxy_waiters: Mutex::new(HashMap::new()),
+            cancelled: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -446,6 +516,23 @@ impl Node {
                 }
             }
             Frame::Control(Control::FileCancel { transfer_id }) => {
+                // 若本机正在发送这条传输：置取消标记，发送循环下一片即停
+                self.cancelled
+                    .lock()
+                    .await
+                    .insert(transfer_id.clone());
+                // 对方取消了发送：清掉接收中的半成品（.part 与内存状态）
+                if let Some(st) = self.recv_files.lock().await.remove(&transfer_id) {
+                    let _ = std::fs::remove_file(&st.part_path);
+                    let _ = self.storage.update_message_status(
+                        &st.msg_id,
+                        MessageStatus::Failed,
+                    );
+                    self.emit(Event::MessageStatus {
+                        id: st.msg_id,
+                        status: MessageStatus::Failed,
+                    });
+                }
                 self.emit(Event::TransferState {
                     transfer_id,
                     state: "cancelled".into(),
@@ -494,7 +581,7 @@ impl Node {
             created_at: now_ms(),
         };
         self.storage.insert_message(&m)?;
-        session
+        if let Err(e) = session
             .conn
             .send(&Frame::Control(Control::ChatText {
                 msg_id: m.id.clone(),
@@ -502,7 +589,18 @@ impl Node {
                 reply_to,
                 ts: m.created_at,
             }))
-            .await?;
+            .await
+        {
+            // 发送失败要如实落状态，前端据此显示「发送失败 · 点击重试」
+            let _ = self
+                .storage
+                .update_message_status(&m.id, MessageStatus::Failed);
+            self.emit(Event::MessageStatus {
+                id: m.id.clone(),
+                status: MessageStatus::Failed,
+            });
+            return Err(e.into());
+        }
         self.storage
             .update_message_status(&m.id, MessageStatus::Sent)?;
         self.emit(Event::MessageStatus {
@@ -510,6 +608,112 @@ impl Node {
             status: MessageStatus::Sent,
         });
         Ok(self.storage.get_message(&m.id)?.unwrap_or(m))
+    }
+
+    /// 取走传输的取消标记（发送循环逐片调用）。
+    async fn take_cancelled(&self, transfer_id: &str) -> bool {
+        self.cancelled.lock().await.remove(transfer_id)
+    }
+
+    /// 取消收尾：消息标失败、通知前端传输已取消。
+    async fn finish_cancelled(&self, transfer_id: &str, msg_id: &str) {
+        let _ = self
+            .storage
+            .update_message_status(msg_id, MessageStatus::Failed);
+        self.emit(Event::MessageStatus {
+            id: msg_id.to_string(),
+            status: MessageStatus::Failed,
+        });
+        self.emit(Event::TransferState {
+            transfer_id: transfer_id.to_string(),
+            state: "cancelled".into(),
+        });
+    }
+
+    /// 取消一条进行中的传输（本机发送或接收都可发起）：置标记并通知对方。
+    pub async fn cancel_transfer(&self, transfer_id: &str) {
+        self.cancelled
+            .lock()
+            .await
+            .insert(transfer_id.to_string());
+        if let Ok(s) = self.session().await {
+            let _ = s
+                .conn
+                .send(&Frame::Control(Control::FileCancel {
+                    transfer_id: transfer_id.to_string(),
+                }))
+                .await;
+        }
+    }
+
+    /// 重发一条失败的消息：文本按原 ID 重新走发送；文件按原路径重新发起传输
+    ///（会产生一条新的文件消息，前端负责移除旧的失败气泡）。
+    pub async fn resend_message(self: &Arc<Self>, message_id: &str) -> Result<(), ServiceError> {
+        let m = self
+            .storage
+            .get_message(message_id)?
+            .ok_or_else(|| ServiceError::Other("消息不存在".into()))?;
+        match m.kind {
+            MessageKind::Text => {
+                let session = self.session().await?;
+                self.storage
+                    .update_message_status(&m.id, MessageStatus::Sending)?;
+                self.emit(Event::MessageStatus {
+                    id: m.id.clone(),
+                    status: MessageStatus::Sending,
+                });
+                match session
+                    .conn
+                    .send(&Frame::Control(Control::ChatText {
+                        msg_id: m.id.clone(),
+                        text: m.body.clone(),
+                        reply_to: m.reply_to.clone(),
+                        ts: m.created_at,
+                    }))
+                    .await
+                {
+                    Ok(()) => {
+                        self.storage
+                            .update_message_status(&m.id, MessageStatus::Sent)?;
+                        self.emit(Event::MessageStatus {
+                            id: m.id.clone(),
+                            status: MessageStatus::Sent,
+                        });
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = self
+                            .storage
+                            .update_message_status(&m.id, MessageStatus::Failed);
+                        self.emit(Event::MessageStatus {
+                            id: m.id.clone(),
+                            status: MessageStatus::Failed,
+                        });
+                        Err(e.into())
+                    }
+                }
+            }
+            MessageKind::File => {
+                let file_id = m
+                    .file_id
+                    .clone()
+                    .ok_or_else(|| ServiceError::Other("文件记录缺失".into()))?;
+                let meta = self
+                    .storage
+                    .get_file(&file_id)?
+                    .ok_or_else(|| ServiceError::Other("文件记录缺失".into()))?;
+                if meta.path.is_empty() || !Path::new(&meta.path).exists() {
+                    return Err(ServiceError::Other("原文件已不存在，无法重发".into()));
+                }
+                let node = self.clone();
+                let path = PathBuf::from(&meta.path);
+                tokio::spawn(async move {
+                    let _ = node.send_file(&path).await;
+                });
+                Ok(())
+            }
+            MessageKind::System => Err(ServiceError::Other("系统消息不能重发".into())),
+        }
     }
 
     /// 发送正在输入状态。
@@ -578,6 +782,10 @@ impl Node {
             .await
             .map_err(|_| ServiceError::Other("等待对方接收确认超时".into()))?
             .map_err(|_| ServiceError::Other("对方接收通道已关闭".into()))?;
+        if self.take_cancelled(&transfer_id).await {
+            self.finish_cancelled(&transfer_id, &msg.id).await;
+            return Ok(transfer_id);
+        }
         let missing = missing_ranges(&received, size);
         self.emit(Event::TransferProgress {
             transfer_id: transfer_id.clone(),
@@ -593,6 +801,10 @@ impl Node {
             let mut offset = start;
             file.seek(SeekFrom::Start(start))?;
             while offset < end {
+                if self.take_cancelled(&transfer_id).await {
+                    self.finish_cancelled(&transfer_id, &msg.id).await;
+                    return Ok(transfer_id);
+                }
                 let want = ((end - offset) as usize).min(CHUNK_SIZE);
                 let mut buf = vec![0u8; want];
                 file.read_exact(&mut buf)?;
@@ -680,6 +892,7 @@ impl Node {
             .write(true)
             .open(&part_path)?;
         file.set_len(size)?;
+        let file_id = new_id();
         self.recv_files.lock().await.insert(
             transfer_id.clone(),
             RecvState {
@@ -687,12 +900,12 @@ impl Node {
                 total: size,
                 sha256: sha256.clone(),
                 msg_id: msg_id.clone(),
+                file_id: file_id.clone(),
                 part_path,
                 ranges: ranges.clone(),
                 written: covered_bytes(&ranges),
             },
         );
-        let file_id = new_id();
         self.storage.save_file(&FileMeta {
             id: file_id.clone(),
             name: name.clone(),
@@ -798,6 +1011,10 @@ impl Node {
                 .update_message_status(&st.msg_id, MessageStatus::Delivered);
             let final_path = self.download_dir.join(&st.name);
             std::fs::rename(&st.part_path, &final_path)?;
+            // 回写落地路径，文件菜单（打开/另存为等）靠它定位文件
+            let _ = self
+                .storage
+                .update_file_path(&st.file_id, &final_path.to_string_lossy());
             self.storage.save_transfer(
                 &transfer_id,
                 "",
@@ -823,6 +1040,98 @@ impl Node {
             .send(&Frame::Control(Control::FileVerify { transfer_id, ok }))
             .await?;
         Ok(())
+    }
+
+    // ---------- 存储与文件 ----------
+    /// 设置页存储区：聊天记录占用走数据库统计，文件/缓存走下载目录实测。
+    pub fn storage_stats(&self) -> StorageStats {
+        let (chat_count, chat_bytes) = self.storage.message_stats().unwrap_or((0, 0));
+        let mut files_bytes = 0u64;
+        let mut files_count = 0u64;
+        let mut cache_bytes = 0u64;
+        if let Ok(rd) = std::fs::read_dir(&self.download_dir) {
+            for e in rd.flatten() {
+                let Ok(md) = e.metadata() else { continue };
+                if !md.is_file() {
+                    continue;
+                }
+                if e.file_name().to_string_lossy().ends_with(".part") {
+                    cache_bytes += md.len();
+                } else {
+                    files_bytes += md.len();
+                    files_count += 1;
+                }
+            }
+        }
+        StorageStats {
+            chat_count,
+            chat_bytes,
+            files_bytes,
+            files_count,
+            cache_bytes,
+        }
+    }
+
+    /// 清理缓存：删掉已不在接收中的 .part 半成品文件，返回释放字节数。
+    pub async fn clean_cache(&self) -> u64 {
+        let active: HashSet<String> = self.recv_files.lock().await.keys().cloned().collect();
+        let mut freed = 0u64;
+        if let Ok(rd) = std::fs::read_dir(&self.download_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let Some(tid) = name.strip_suffix(".part") else {
+                    continue;
+                };
+                if active.contains(tid) {
+                    continue;
+                }
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                if std::fs::remove_file(e.path()).is_ok() {
+                    freed += size;
+                }
+            }
+        }
+        freed
+    }
+
+    /// 清空全部聊天记录（设置页存储区，二次确认后调用）。
+    pub fn clear_chat_history(&self) -> Result<(), ServiceError> {
+        self.storage.clear_all_messages()?;
+        Ok(())
+    }
+
+    /// 一条文件消息对应的本地文件信息（文件菜单用）：路径优先取记录值，
+    /// 接收文件记录缺失时按下载目录 + 文件名兜底定位。
+    pub fn file_info(&self, message_id: &str) -> Result<Option<MessageFileInfo>, ServiceError> {
+        let Some(m) = self.storage.get_message(message_id)? else {
+            return Ok(None);
+        };
+        let Some(file_id) = m.file_id else {
+            return Ok(None);
+        };
+        let Some(meta) = self.storage.get_file(&file_id)? else {
+            return Ok(None);
+        };
+        let recorded = PathBuf::from(&meta.path);
+        let path = if !meta.path.is_empty() && recorded.exists() {
+            Some(recorded)
+        } else {
+            let fallback = self.download_dir.join(&meta.name);
+            if fallback.exists() {
+                Some(fallback)
+            } else if !meta.path.is_empty() {
+                Some(recorded)
+            } else {
+                None
+            }
+        };
+        let exists = path.as_ref().map(|p| p.exists()).unwrap_or(false);
+        Ok(Some(MessageFileInfo {
+            name: meta.name,
+            size: meta.size,
+            path: path.map(|p| p.to_string_lossy().to_string()),
+            exists,
+        }))
     }
 
     // ---------- AI ----------
@@ -872,24 +1181,7 @@ impl Node {
             })
             .collect();
 
-        let cfg = self.ai_cfg.lock().await.clone();
-        let full = if let Some(cfg) = cfg.filter(|c| c.is_ready()) {
-            let client = AiClient::new(cfg);
-            let node = self.clone();
-            let cid = conv_id.clone();
-            client
-                .chat_stream(&msgs, |delta| {
-                    node.emit(Event::AiChunk {
-                        conversation_id: cid.clone(),
-                        delta: delta.to_string(),
-                    });
-                })
-                .await?
-        } else if self.is_connected().await {
-            self.ai_via_peer(&msgs).await?
-        } else {
-            return Err(bluelink_ai::AiError::NotConfigured.into());
-        };
+        let full = self.chat_anywhere(&conv_id, &msgs).await?;
 
         let ai_msg = Message {
             id: new_id(),
@@ -933,24 +1225,7 @@ impl Node {
                 content: m.body.clone(),
             })
             .collect();
-        let cfg = self.ai_cfg.lock().await.clone();
-        let full = if let Some(cfg) = cfg.filter(|c| c.is_ready()) {
-            let client = AiClient::new(cfg);
-            let node = self.clone();
-            let cid = conv_id.clone();
-            client
-                .chat_stream(&msgs, |delta| {
-                    node.emit(Event::AiChunk {
-                        conversation_id: cid.clone(),
-                        delta: delta.to_string(),
-                    });
-                })
-                .await?
-        } else if self.is_connected().await {
-            self.ai_via_peer(&msgs).await?
-        } else {
-            return Err(bluelink_ai::AiError::NotConfigured.into());
-        };
+        let full = self.chat_anywhere(&conv_id, &msgs).await?;
         let ai_msg = Message {
             id: new_id(),
             conversation_id: conv_id.clone(),
@@ -970,8 +1245,83 @@ impl Node {
         Ok(ai_msg)
     }
 
-    /// 经对端代理提问：响应帧由 handle_ai_proxy_frame 转入等待通道。
-    async fn ai_via_peer(&self, msgs: &[ChatMessage]) -> Result<String, ServiceError> {
+    /// AI 调用核心：本机配置优先（按配置的流式开关走流式/整段），
+    /// 否则经已连接设备代理转发；两条路的增量都交给 on_delta（可为空）。
+    async fn chat_core(
+        &self,
+        msgs: &[ChatMessage],
+        on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
+    ) -> Result<String, ServiceError> {
+        let cfg = self.ai_cfg.lock().await.clone();
+        if let Some(cfg) = cfg.filter(|c| c.is_ready()) {
+            let client = AiClient::new(cfg.clone());
+            if cfg.stream {
+                let mut cb = on_delta;
+                let full = client
+                    .chat_stream(msgs, |d| {
+                        if let Some(f) = cb.as_deref_mut() {
+                            f(d);
+                        }
+                    })
+                    .await?;
+                return Ok(full);
+            }
+            let full = client.chat_once(msgs).await?;
+            if let Some(f) = on_delta {
+                f(&full);
+            }
+            return Ok(full);
+        }
+        if self.is_connected().await {
+            return self.proxy_to_peer(msgs, on_delta).await;
+        }
+        Err(bluelink_ai::AiError::NotConfigured.into())
+    }
+
+    /// AI 页的一轮调用：增量同步转成 AiChunk 事件推给前端。
+    async fn chat_anywhere(
+        self: &Arc<Self>,
+        conv_id: &str,
+        msgs: &[ChatMessage],
+    ) -> Result<String, ServiceError> {
+        let node = self.clone();
+        let cid = conv_id.to_string();
+        let mut cb = move |d: &str| {
+            node.emit(Event::AiChunk {
+                conversation_id: cid.clone(),
+                delta: d.to_string(),
+            });
+        };
+        self.chat_core(msgs, Some(&mut cb)).await
+    }
+
+    /// 本地 API 网关入口：供本机其他软件经 OpenAI 兼容接口调用（见应用层本地 API 服务）。
+    /// 路由与 AI 页一致：本机配置优先，否则经已连接设备转发；请求里带的模型名仅作参考，
+    /// 实际模型以真正调用上游一侧的配置为准（/v1/models 如实返回该模型名）。
+    pub async fn gateway_chat(
+        &self,
+        msgs: &[ChatMessage],
+        on_delta: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<String, ServiceError> {
+        self.chat_core(msgs, Some(on_delta)).await
+    }
+
+    /// 本机当前生效的 AI 模型名（本地接口 /v1/models 用）：本机配置优先，
+    /// 未配置时返回网关占位名（经对端转发时实际模型在对端）。
+    pub async fn gateway_model(&self) -> String {
+        let cfg = self.ai_cfg.lock().await.clone();
+        match cfg.filter(|c| c.is_ready()) {
+            Some(c) => c.model,
+            None => "bluelink-proxy".to_string(),
+        }
+    }
+
+    /// 经对端代理提问：响应帧由 handle_ai_proxy_frame 转入等待通道，增量同步回调。
+    async fn proxy_to_peer(
+        &self,
+        msgs: &[ChatMessage],
+        mut on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
+    ) -> Result<String, ServiceError> {
         let session = self.session().await?;
         let request_id = new_id();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<String, String>>(64);
@@ -998,6 +1348,9 @@ impl Node {
                     if delta.is_empty() {
                         break;
                     } // 空增量 = 结束信号
+                    if let Some(f) = on_delta.as_deref_mut() {
+                        f(&delta);
+                    }
                     full.push_str(&delta);
                 }
                 Err(e) => {
@@ -1029,13 +1382,61 @@ impl Node {
         }
     }
 
+    /// 今日转发统计的存储键：按 UTC+8 日期分桶（本应用以国内时区为准）。
+    fn proxy_day_key() -> String {
+        let days = (now_ms() + 8 * 3600 * 1000) / 86_400_000;
+        format!("proxy_day_{days}")
+    }
+
+    /// 今日已转发统计（次数, 约 tokens；tokens 按字符数粗估，中文约 1 字 1 token）。
+    pub fn proxy_today_stats(&self) -> (u64, u64) {
+        let raw = self
+            .storage
+            .get_setting(&Self::proxy_day_key())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut it = raw.split(',');
+        let n = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let c = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        (n, c)
+    }
+
+    fn add_proxy_stats(&self, chars: u64) {
+        let (n, c) = self.proxy_today_stats();
+        let _ = self.storage.set_setting(
+            &Self::proxy_day_key(),
+            &format!("{},{}", n + 1, c + chars),
+        );
+    }
+
     /// 宿主侧：替无网对端调用本机 AI 并流式回传。
+    /// 前置门槛：本机用户须在设置里开启「AI 转发」许可（默认关）——花的是本机密钥额度；
+    /// 未开启时明确回绝，让对方界面能如实提示。
     async fn serve_ai_proxy(
         &self,
         session: Arc<PeerSession>,
         request_id: String,
         messages: Vec<serde_json::Value>,
     ) -> Result<(), ServiceError> {
+        let allowed = self
+            .storage
+            .get_setting("ai_proxy_allow")
+            .map(|v| v.as_deref() == Some("1"))
+            .unwrap_or(false);
+        if !allowed {
+            session
+                .conn
+                .send(&Frame::Control(Control::AiProxyDone {
+                    request_id,
+                    error: Some(
+                        "对方未开启 AI 转发许可：请让对方在设置的「AI 转发」里打开允许开关"
+                            .into(),
+                    ),
+                }))
+                .await?;
+            return Ok(());
+        }
         let cfg = self.ai_cfg.lock().await.clone();
         let Some(cfg) = cfg.filter(|c| c.is_ready()) else {
             session
@@ -1062,6 +1463,7 @@ impl Node {
                     .to_string(),
             })
             .collect();
+        let prompt_chars: u64 = msgs.iter().map(|m| m.content.chars().count() as u64).sum();
         let client = AiClient::new(cfg);
         // 增量先入通道、由转发任务顺序发出，保证分片先于 Done 到达（不能逐段 spawn，会乱序）
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -1084,11 +1486,18 @@ impl Node {
             .await;
         drop(tx);
         let _ = forwarder.await;
-        let error = result.err().map(|e| e.to_string());
+        let error = match &result {
+            Ok(full) => {
+                self.add_proxy_stats(prompt_chars + full.chars().count() as u64);
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        };
         session
             .conn
             .send(&Frame::Control(Control::AiProxyDone { request_id, error }))
             .await?;
         Ok(())
     }
+
 }
