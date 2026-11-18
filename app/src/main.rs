@@ -24,6 +24,11 @@ struct AppState {
     server: Option<Arc<bluelink_transport::ble::BleServer>>,
     /// 蓝牙广播（服务端）启动失败时的原始错误，界面据此如实提示原因。
     server_error: Option<String>,
+    /// 经典蓝牙运行时（仅 Windows）：Inquiry 中心端 + RFCOMM 服务端，与 BLE 并行。
+    classic_central: Option<Arc<bluelink_transport::classic::ClassicCentral>>,
+    classic_server: Option<Arc<bluelink_transport::classic::ClassicServer>>,
+    /// 经典蓝牙服务端启动失败时的原始错误，界面据此如实提示原因。
+    classic_server_error: Option<String>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     listening: Mutex<Option<tokio::task::JoinHandle<()>>>,
     local_api: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -56,12 +61,17 @@ async fn get_identity(state: State<'_, AppState>) -> Result<Identity, String> {
     Ok(identity_of(&state.node).await)
 }
 
-/// 蓝牙状态（连接页展示）：适配器是否可用、广播（可被发现）是否已开启。
+/// 蓝牙状态（连接页展示）：适配器是否可用、广播（可被发现）是否已开启；
+/// classic_* 三个字段是经典蓝牙通道的同构状态（仅 Windows 有意义，
+/// 前端据 classic_available 决定是否显示「经典蓝牙 / BLE」连接方式选择）。
 #[derive(Serialize)]
 struct BtState {
     available: bool,
     advertising: bool,
     message: String,
+    classic_available: bool,
+    classic_serving: bool,
+    classic_message: String,
 }
 
 #[tauri::command]
@@ -78,24 +88,100 @@ async fn bt_state(state: State<'_, AppState>) -> Result<BtState, String> {
     } else {
         "蓝牙已开启，但本机广播未启动".to_string()
     };
+    let classic_available = state.classic_central.is_some();
+    // start_classic_server 同步完成 bind/listen 才返回 Ok，server 存在即在监听
+    let classic_serving = state.classic_server.is_some();
+    let classic_message = if !bluelink_transport::classic::classic_supported() {
+        "经典蓝牙仅支持 Windows".to_string()
+    } else if !classic_available {
+        "未检测到蓝牙适配器或蓝牙未开启".to_string()
+    } else if classic_serving {
+        if state
+            .classic_server
+            .as_ref()
+            .map(|s| s.is_registered())
+            .unwrap_or(false)
+        {
+            "经典蓝牙已开启，本机可被附近设备发现".to_string()
+        } else {
+            "经典蓝牙服务已启动，但 SDP 注册失败，对方可能找不到本机".to_string()
+        }
+    } else if let Some(err) = &state.classic_server_error {
+        format!("经典蓝牙已开启，但服务启动失败：{err}")
+    } else {
+        "经典蓝牙已开启，但服务未启动".to_string()
+    };
     Ok(BtState {
         available,
         advertising,
         message,
+        classic_available,
+        classic_serving,
+        classic_message,
     })
 }
 
-/// 开始扫描附近的 BlueLink 设备：结果经 bt_devices 事件每秒推送快照。
+/// 扫描中心端的统一视图：经典蓝牙（Inquiry）与 BLE 两套中心端方法签名对齐，
+/// 扫描轮询逻辑共用一份。transport 参数由连接页的连接方式选择传入（"classic" / "ble"）。
+enum ScanCentral {
+    Ble(Arc<bluelink_transport::ble::BleCentral>),
+    Classic(Arc<bluelink_transport::classic::ClassicCentral>),
+}
+
+impl ScanCentral {
+    async fn start_scan(&self) -> Result<(), String> {
+        match self {
+            ScanCentral::Ble(c) => c.start_scan().await.map_err(|e| e.to_string()),
+            ScanCentral::Classic(c) => c.start_scan().map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn list_found(
+        &self,
+    ) -> Result<Vec<bluelink_transport::ble::FoundDevice>, String> {
+        match self {
+            ScanCentral::Ble(c) => c.list_found().await.map_err(|e| e.to_string()),
+            ScanCentral::Classic(c) => c.list_found().map_err(|e| e.to_string()),
+        }
+    }
+
+    fn log_tag(&self) -> &'static str {
+        match self {
+            ScanCentral::Ble(_) => "ble",
+            ScanCentral::Classic(_) => "classic",
+        }
+    }
+}
+
+/// 开始扫描附近的设备：结果经 bt_devices 事件每秒推送快照。
+/// transport = "classic" 走经典 Inquiry（不过滤，含已配对/记住的设备），
+/// 其余值走 BLE 扫描（按 BlueLink 服务过滤）。
 #[tauri::command]
-async fn bt_start_scan(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
-    let central = state
-        .central
-        .clone()
-        .ok_or_else(|| "蓝牙不可用".to_string())?;
-    central.start_scan().await.map_err(|e| e.to_string())?;
+async fn bt_start_scan(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    transport: String,
+) -> Result<(), String> {
+    let central = if transport == "classic" {
+        ScanCentral::Classic(
+            state
+                .classic_central
+                .clone()
+                .ok_or_else(|| "经典蓝牙不可用".to_string())?,
+        )
+    } else {
+        ScanCentral::Ble(
+            state
+                .central
+                .clone()
+                .ok_or_else(|| "蓝牙不可用".to_string())?,
+        )
+    };
+    central.start_scan().await?;
     if let Some(h) = state.scan_task.lock().await.take() {
         h.abort();
     }
+    let tag = central.log_tag();
     let handle = tokio::spawn(async move {
         // 偶发读取错误不终止扫描（否则界面还显示「正在扫描」实际已停）；连续失败多次才停
         let mut consecutive_errors = 0u32;
@@ -107,7 +193,7 @@ async fn bt_start_scan(state: State<'_, AppState>, app: AppHandle) -> Result<(),
                 }
                 Err(e) => {
                     consecutive_errors += 1;
-                    bluelink_services::log_line("ble", &format!("扫描读取设备列表失败（第 {consecutive_errors} 次）：{e}"));
+                    bluelink_services::log_line(tag, &format!("扫描读取设备列表失败（第 {consecutive_errors} 次）：{e}"));
                     if consecutive_errors >= 5 {
                         break;
                     }
@@ -120,7 +206,7 @@ async fn bt_start_scan(state: State<'_, AppState>, app: AppHandle) -> Result<(),
     Ok(())
 }
 
-/// 停止扫描。
+/// 停止扫描（两套中心端都停，互不影响）。
 #[tauri::command]
 async fn bt_stop_scan(state: State<'_, AppState>) -> Result<(), String> {
     if let Some(h) = state.scan_task.lock().await.take() {
@@ -128,6 +214,9 @@ async fn bt_stop_scan(state: State<'_, AppState>) -> Result<(), String> {
     }
     if let Some(c) = &state.central {
         let _ = c.stop_scan().await;
+    }
+    if let Some(c) = &state.classic_central {
+        let _ = c.stop_scan();
     }
     Ok(())
 }
@@ -154,6 +243,34 @@ fn set_dev_mode(state: State<'_, AppState>, on: bool) -> Result<(), String> {
         .node
         .storage
         .set_setting("dev_mode", if on { "1" } else { "0" })
+        .map_err(|e| e.to_string())
+}
+
+/// 读取开发者模式里选定的蓝牙传输（设置键 bt_transport）：classic / ble / simpleble。
+/// 普通模式不读它（连接页固定经典蓝牙），仅开发者模式开启时前端据此切换通道。
+#[tauri::command]
+fn get_bt_transport(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state
+        .node
+        .storage
+        .get_setting("bt_transport")
+        .map_err(|e| e.to_string())?
+        .filter(|v| matches!(v.as_str(), "classic" | "ble" | "simpleble"))
+        .unwrap_or_else(|| "classic".to_string()))
+}
+
+/// 保存开发者模式里选定的蓝牙传输；非法值一律落回 classic（默认）。
+#[tauri::command]
+fn set_bt_transport(state: State<'_, AppState>, transport: String) -> Result<(), String> {
+    let v = match transport.as_str() {
+        "ble" => "ble",
+        "simpleble" => "simpleble",
+        _ => "classic",
+    };
+    state
+        .node
+        .storage
+        .set_setting("bt_transport", v)
         .map_err(|e| e.to_string())
 }
 
@@ -226,20 +343,33 @@ async fn set_last_peer(state: State<'_, AppState>, json: String) -> Result<(), S
 }
 
 /// 连接扫描到的设备（访客模式）：code 为对方屏幕上显示的连接码，握手时校验。
+/// transport 与扫描时一致："classic" 经 SDP 连经典蓝牙，其余走 BLE。
 #[tauri::command]
 async fn bt_connect(
     state: State<'_, AppState>,
     device_id: String,
     code: String,
+    transport: String,
 ) -> Result<String, String> {
-    let central = state
-        .central
-        .clone()
-        .ok_or_else(|| "蓝牙不可用".to_string())?;
-    let conn = central
-        .connect(&device_id)
-        .await
-        .map_err(|e| format!("蓝牙连接失败：{e}"))?;
+    let conn = if transport == "classic" {
+        let central = state
+            .classic_central
+            .clone()
+            .ok_or_else(|| "经典蓝牙不可用".to_string())?;
+        central
+            .connect(&device_id)
+            .await
+            .map_err(|e| format!("经典蓝牙连接失败：{e}"))?
+    } else {
+        let central = state
+            .central
+            .clone()
+            .ok_or_else(|| "蓝牙不可用".to_string())?;
+        central
+            .connect(&device_id)
+            .await
+            .map_err(|e| format!("蓝牙连接失败：{e}"))?
+    };
     let code_clean: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
     let peer = state
         .node
@@ -1115,6 +1245,51 @@ fn main() {
                 };
                 (central, server, server_error)
             });
+            // 经典蓝牙运行时（仅 Windows）：Inquiry 中心端 + RFCOMM 服务端（SDP 注册 SPP）。
+            // 与 BLE 服务端并行存在：哪个通道连进来就走哪个，入站一律走服务层宿主握手。
+            // 非 Windows 平台 classic_supported() 为 false，三个字段恒为 None，界面不显示经典选项。
+            let (classic_central, classic_server, classic_server_error) =
+                if bluelink_transport::classic::classic_supported() {
+                    let central = bluelink_transport::classic::classic_central()
+                        .map(Arc::new)
+                        .map_err(|e| {
+                            bluelink_services::log_line(
+                                "classic",
+                                &format!("经典蓝牙中心端不可用：{e}"),
+                            );
+                            e
+                        })
+                        .ok();
+                    let mut classic_error = None;
+                    let server = match bluelink_transport::classic::start_classic_server() {
+                        Ok((srv, mut inbound)) => {
+                            let node_in = node.clone();
+                            tauri::async_runtime::spawn(async move {
+                                while let Some(conn) = inbound.recv().await {
+                                    // 宿主侧握手：与 BLE 入站同一套校验
+                                    if let Err(e) = node_in.attach(conn, true, "").await {
+                                        bluelink_services::log_line(
+                                            "classic",
+                                            &format!("经典蓝牙入站连接握手失败：{e}"),
+                                        );
+                                    }
+                                }
+                            });
+                            Some(Arc::new(srv))
+                        }
+                        Err(e) => {
+                            bluelink_services::log_line(
+                                "classic",
+                                &format!("经典蓝牙服务端启动失败：{e}"),
+                            );
+                            classic_error = Some(e.to_string());
+                            None
+                        }
+                    };
+                    (central, server, classic_error)
+                } else {
+                    (None, None, None)
+                };
             app.manage(AppState {
                 node,
                 data_dir,
@@ -1122,6 +1297,9 @@ fn main() {
                 central,
                 server,
                 server_error,
+                classic_central,
+                classic_server,
+                classic_server_error,
                 scan_task: Mutex::new(None),
                 listening: Mutex::new(None),
                 local_api: Mutex::new(local_handle),
@@ -1234,6 +1412,8 @@ fn main() {
             bt_connect,
             get_dev_mode,
             set_dev_mode,
+            get_bt_transport,
+            set_bt_transport,
             start_listening,
             connect_to,
             get_last_peer,

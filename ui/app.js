@@ -696,16 +696,69 @@ $("btn-file").addEventListener("click", async () => {
 $("btn-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
 
 // ---------- 连接（蓝牙） ----------
+// 传输选择（仅开发者模式可用，存设置键 bt_transport）："classic" 经典蓝牙 / "ble"。
+// 普通模式连接页不出现选择，固定走经典蓝牙（用户 2026-11-18 定版）；
+// 非 Windows 没有经典通道（classic_available 为假）时一律回落 BLE。
+let btTransport = "classic"; // 开发者模式里选定的传输（启动时从设置读回）
+let btClassicAvailable = false;
+let btStateLoaded = false;
+
+function syncTransportSeg() {
+  $("seg-classic").classList.toggle("active", btTransport === "classic");
+  $("seg-ble").classList.toggle("active", btTransport === "ble");
+  $("seg-classic").disabled = !btClassicAvailable;
+}
+
+/** 本次扫描/连接实际用的传输：经典不可用时恒 BLE；普通模式恒经典；开发者模式用所选。 */
+function effectiveTransport() {
+  if (!btClassicAvailable) return "ble";
+  return state.devMode ? btTransport : "classic";
+}
+
+async function switchTransport(t) {
+  if (t === btTransport) { syncTransportSeg(); return; }
+  btTransport = t;
+  syncTransportSeg();
+  invoke("set_bt_transport", { transport: t }).catch(() => {});
+  refreshBtState();
+  // 正在扫描时切换通道：停掉旧扫描、用新通道重扫
+  if (scanning) {
+    await invoke("bt_stop_scan").catch(() => {});
+    try {
+      await invoke("bt_start_scan", { transport: effectiveTransport() });
+    } catch (e) {
+      scanning = false;
+      $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`;
+      $("connect-error").textContent = String(e);
+    }
+  }
+}
+$("seg-classic").addEventListener("click", () => switchTransport("classic"));
+$("seg-ble").addEventListener("click", () => switchTransport("ble"));
+
 async function refreshBtState() {
   try {
     const s = await invoke("bt_state");
+    btClassicAvailable = !!s.classic_available;
+    btStateLoaded = true;
+    // 传输选择行仅开发者模式显示，普通模式连接页保持干净
+    $("bt-transport-row").classList.toggle("hidden", !(state.devMode && (s.classic_available || s.available)));
+    syncTransportSeg();
+    if (effectiveTransport() === "classic") {
+      $("bt-status-text").textContent = s.classic_message;
+      $("bt-status-dot").className = "status-dot" + (s.classic_serving ? " on" : " warn");
+      $("btn-scan").disabled = false;
+      return;
+    }
     $("bt-status-text").textContent = s.message;
     $("bt-status-dot").className = "status-dot" + (s.advertising ? " on" : s.available ? " warn" : " off");
     if (!s.available) {
       $("btn-scan").disabled = true;
       $("bt-empty").textContent = "未检测到可用的蓝牙：请确认设备有蓝牙并已在系统中开启。";
+    } else {
+      $("btn-scan").disabled = false;
     }
-  } catch (_) { /* 忽略 */ }
+  } catch (_) { btStateLoaded = true; }
 }
 
 let scanning = false;
@@ -718,7 +771,8 @@ $("btn-scan").addEventListener("click", async () => {
       $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`;
       $("bt-empty").textContent = "点「扫描」查找附近打开了 BlueLink 的设备。";
     } else {
-      await invoke("bt_start_scan");
+      if (!btStateLoaded) await refreshBtState();
+      await invoke("bt_start_scan", { transport: effectiveTransport() });
       scanning = true;
       $("btn-scan").innerHTML = "停止";
       $("bt-empty").textContent = "正在扫描附近的设备…";
@@ -745,7 +799,7 @@ function renderBtDevices(devices) {
     row.className = "bt-device" + (state.btDevice === d.id ? " selected" : "");
     row.innerHTML = `<span class="bt-device-ico">${iconUse("i-bt", "ico ico-18")}</span>
       <span class="bt-device-main"><span class="bt-device-name">${esc(d.name)}</span>
-      <span class="bt-device-sub">${d.rssi != null ? `信号 ${d.rssi} dBm` : "蓝牙设备"}</span></span>
+      <span class="bt-device-sub">${d.rssi != null ? `信号 ${d.rssi} dBm` : effectiveTransport() === "classic" ? "经典蓝牙" : "蓝牙设备"}</span></span>
       <button class="btn small-btn">连接</button>`;
     row.querySelector("button").addEventListener("click", () => {
       state.btDevice = d.id;
@@ -767,8 +821,8 @@ function renderBtDevices(devices) {
       state.btDevice = hit.id;
       state.btDeviceName = hit.name;
       $("last-peer-status").textContent = `已找到「${hit.name}」，正在连接…`;
-      invoke("bt_connect", { deviceId: p.deviceId, code: p.code })
-        .then(() => saveLastPeer({ transport: "ble", deviceId: p.deviceId, code: p.code, name: hit.name }))
+      invoke("bt_connect", { deviceId: p.deviceId, code: p.code, transport: p.transport })
+        .then(() => saveLastPeer({ transport: p.transport, deviceId: p.deviceId, code: p.code, name: hit.name }))
         .catch((e) => { $("last-peer-status").textContent = ""; $("connect-error").textContent = String(e); });
       if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`; }
     }
@@ -798,7 +852,7 @@ async function loadLastPeer() {
     state.lastPeer = p;
     $("last-peer-name").textContent = p.name;
     const when = p.ts ? (() => { const d = new Date(p.ts); const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`; })() : "";
-    $("last-peer-sub").textContent = `${p.transport === "lan" ? "局域网" : "蓝牙"}${when ? " · 上次 " + when : ""}`;
+    $("last-peer-sub").textContent = `${p.transport === "lan" ? "局域网" : p.transport === "classic" ? "经典蓝牙" : "BLE"}${when ? " · 上次 " + when : ""}`;
     $("last-peer-ico").setAttribute("href", p.transport === "lan" ? "#i-wifi" : "#i-bt");
     $("last-peer-status").textContent = "";
     box.classList.remove("hidden");
@@ -825,8 +879,13 @@ $("last-peer-connect").addEventListener("click", async () => {
       $("connect-error").textContent = String(e);
     }
   } else {
+    // 按记录里的通道重连：经典记录走经典扫描（Inquiry 含已记住设备），BLE 记录走 BLE 扫描
+    const t = p.transport === "classic" ? "classic" : "ble";
+    btTransport = t;
+    syncTransportSeg();
+    refreshBtState();
     $("last-peer-status").textContent = `正在查找「${p.name}」，找到后自动连接…`;
-    pendingRemembered = { deviceId: p.deviceId, code: p.code };
+    pendingRemembered = { deviceId: p.deviceId, code: p.code, transport: t };
     clearTimeout(rememberedTimer);
     rememberedTimer = setTimeout(() => {
       if (pendingRemembered) {
@@ -836,7 +895,7 @@ $("last-peer-connect").addEventListener("click", async () => {
       }
     }, 25000);
     try {
-      await invoke("bt_start_scan");
+      await invoke("bt_start_scan", { transport: t });
       scanning = true;
       $("btn-scan").innerHTML = "停止";
     } catch (e) {
@@ -848,16 +907,37 @@ $("last-peer-connect").addEventListener("click", async () => {
   }
 });
 
-// ---------- 开发者模式（局域网测试通道，正式版默认隐藏） ----------
+// ---------- 开发者模式（局域网测试通道 + 传输切换，正式版默认隐藏） ----------
 function applyDevMode(on) {
   state.devMode = on;
   $("dev-lan-section").classList.toggle("hidden", !on);
-  const t = $("dev-mode-toggle");
-  if (t) t.checked = on;
+  const row = $("dev-mode-row");
+  if (row) row.classList.toggle("hidden", !on);
+  // 传输选择行与状态行随开发者模式重新计算（选择行只在开发者模式出现）
+  refreshBtState();
+  // 开关开发者模式时停掉进行中的扫描，避免新旧传输混杂
+  if (scanning) {
+    invoke("bt_stop_scan").catch(() => {});
+    scanning = false;
+    $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`;
+  }
 }
-$("dev-mode-toggle").addEventListener("change", async (e) => {
-  await invoke("set_dev_mode", { on: e.target.checked });
-  applyDevMode(e.target.checked);
+// 开发者模式开关：设置页连点版本号三次（用户 2026-11-18 定版入口，替代原开关）
+let versionClicks = 0;
+let versionClickTimer = null;
+$("set-version").addEventListener("click", async () => {
+  versionClicks += 1;
+  clearTimeout(versionClickTimer);
+  versionClickTimer = setTimeout(() => { versionClicks = 0; }, 900);
+  if (versionClicks < 3) return;
+  versionClicks = 0;
+  clearTimeout(versionClickTimer);
+  const on = !state.devMode;
+  try {
+    await invoke("set_dev_mode", { on });
+    applyDevMode(on);
+    showToast(on ? "开发者模式已开启" : "开发者模式已关闭");
+  } catch (e) { showToast("切换开发者模式失败：" + e); }
 });
 $("btn-listen").addEventListener("click", async () => {
   $("connect-error").textContent = "";
@@ -886,10 +966,12 @@ $("btn-bt-connect").addEventListener("click", async () => {
   const code = $("bt-peer-code").value.trim();
   if (!state.btDevice) { $("connect-error").textContent = "请先在列表中选择一台设备"; return; }
   if (!code) { $("connect-error").textContent = "请输入对方的连接码"; return; }
-  $("connect-status").textContent = `正在通过蓝牙连接「${state.btDeviceName || "对方设备"}」…`;
+  if (!btStateLoaded) await refreshBtState();
+  const t = effectiveTransport();
+  $("connect-status").textContent = `正在通过${t === "classic" ? "经典蓝牙" : "蓝牙"}连接「${state.btDeviceName || "对方设备"}」…`;
   try {
-    await invoke("bt_connect", { deviceId: state.btDevice, code });
-    saveLastPeer({ transport: "ble", deviceId: state.btDevice, code, name: state.btDeviceName || "对方设备" });
+    await invoke("bt_connect", { deviceId: state.btDevice, code, transport: t });
+    saveLastPeer({ transport: t, deviceId: state.btDevice, code, name: state.btDeviceName || "对方设备" });
     if (scanning) { await invoke("bt_stop_scan").catch(() => {}); scanning = false; }
   } catch (e) {
     $("connect-error").textContent = String(e);
@@ -1766,6 +1848,7 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
   $("my-name").textContent = state.identity.name;
   refreshBtState();
   invoke("get_dev_mode").then(applyDevMode).catch(() => {});
+  invoke("get_bt_transport").then((t) => { btTransport = t; syncTransportSeg(); }).catch(() => {});
   // 事件订阅失败不能拖垮其余启动流程（v2.0.0 曾因缺权限配置导致实时事件全灭）。
   try { await wireEvents(); } catch (e) { console.error("事件订阅失败", e); }
   // 拖拽文件到窗口直接发送（需已连接）；拖放提示层只做视觉提示，不拦截事件。

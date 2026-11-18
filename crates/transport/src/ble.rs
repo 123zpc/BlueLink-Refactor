@@ -46,9 +46,10 @@ fn ble_err<E: std::fmt::Display>(e: E) -> TransportError {
 // ================= 通道字节流 =================
 
 /// 字节流的平台侧端点：平台层把收到的字节推进 incoming_tx，把 outgoing_rx 的字节发出去。
+/// 字段对 crate 内开放：经典蓝牙（classic 模块）的 socket 泵同样走这套通道流。
 pub struct StreamEnds {
-    incoming_tx: mpsc::Sender<Vec<u8>>,
-    outgoing_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub(crate) incoming_tx: mpsc::Sender<Vec<u8>>,
+    pub(crate) outgoing_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
 /// 基于 mpsc 通道的字节流：一端交给 Conn 当 AsyncRead/AsyncWrite，

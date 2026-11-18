@@ -16,3 +16,13 @@ serde = { workspace = true }
 # GATT 服务端（广播 + 被连接）：btleplug 只有中心端 API，服务端用 ble-peripheral-rust
 # （含 Linux/BlueZ、Windows/WinRT、macOS/CoreBluetooth 三个后端）。
 ble-peripheral-rust = "0.2"
+
+# 经典蓝牙（RFCOMM/SPP）实现直接调 Windows 系统 API（Winsock AF_BTH + BluetoothApis），
+# 仅 Windows 编译；其他平台 classic 模块是返回「不支持」的空壳。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Devices_Bluetooth",
+    "Win32_System_Com",
+] }

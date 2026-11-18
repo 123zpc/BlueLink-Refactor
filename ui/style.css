@@ -122,6 +122,11 @@ section { display: flex; flex-direction: column; height: 100%; }
 .brand h1 { font-size: 20px; font-weight: 700; letter-spacing: 0.2px; }
 .brand-sub { text-align: center; margin-top: 6px; }
 .bt-status { display: flex; align-items: center; justify-content: center; gap: 7px; margin: 18px 0 4px; font-size: 13px; color: var(--text-2); }
+#bt-transport-row { margin-top: 12px; }
+.seg-group { display: flex; gap: 4px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 3px; }
+.seg-btn { flex: 1; padding: 6px 0; font-size: 13px; color: var(--text-2); background: transparent; border: none; border-radius: 6px; cursor: pointer; }
+.seg-btn.active { background: var(--panel); color: var(--accent); font-weight: 600; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.10); }
+#bt-transport-row .small { margin-top: 8px; text-align: left; }
 .bt-status .ico { color: var(--accent); }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
 .status-dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.18); }
