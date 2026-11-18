@@ -63,6 +63,58 @@ const STATUS_CN = { sending: "发送中", sent: "已发送", delivered: "已送�
 function iconUse(name, cls = "ico ico-16") {
   return `<svg class="${cls}"><use href="#${name}"/></svg>`;
 }
+
+/* ---------- 标志双环数据流特效：左环=本机，右环=链接的机器 ----------
+   本机发出数据 → 左环脉冲；对方数据进来 → 右环脉冲；文件传输进行中 → 对应环持续脉冲直到结束。 */
+const ringState = { me: { count: 0, until: 0, timer: null }, peer: { count: 0, until: 0, timer: null } };
+function ringApply() {
+  const logo = $("nav-logo");
+  if (!logo) return;
+  for (const side of ["me", "peer"]) {
+    const on = ringState[side].count > 0 || Date.now() < ringState[side].until;
+    logo.classList.toggle(side === "me" ? "flow-me" : "flow-peer", on);
+  }
+}
+function ringPulse(side) {
+  const s = ringState[side];
+  if (!s) return;
+  s.until = Date.now() + 1500;
+  ringApply();
+  clearTimeout(s.timer);
+  s.timer = setTimeout(ringApply, 1550);
+}
+function ringSet(side, on) {
+  const s = ringState[side];
+  if (!s) return;
+  s.count = Math.max(0, s.count + (on ? 1 : -1));
+  ringApply();
+}
+function ringClearAll() {
+  ringState.me.count = 0;
+  ringState.peer.count = 0;
+  ringApply();
+}
+
+/* ---------- 输入框自适应高度：随内容向上长高，到上限（168px，约 7 行）后框内滚动，滚动条已美化 ---------- */
+const COMPOSER_MAX_H = 168;
+const COMPOSER_MIN_H = 35; // 一行：行高 21 + 上下内边距 14
+function autoGrow(el) {
+  if (!el) return;
+  // 元素所在视图隐藏时没有布局，scrollHeight 为 0，量出来会把输入框压成一条缝；
+  // 隐藏时跳过，等视图切回来再量（switchView 末尾会补调）。
+  if (el.offsetParent === null) return;
+  el.style.height = "auto";
+  el.style.height = Math.min(Math.max(el.scrollHeight, COMPOSER_MIN_H), COMPOSER_MAX_H) + "px";
+}
+function wireAutoGrow(id) {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener("input", () => autoGrow(el));
+  autoGrow(el);
+}
+wireAutoGrow("input");
+wireAutoGrow("ai-input");
+window.addEventListener("resize", () => { autoGrow($("input")); autoGrow($("ai-input")); });
 /** 构建一条消息的 DOM（无头像，靠左右对齐与底色区分双方）。opts.ai 表示 AI 会话样式。 */
 function buildMessageEl(m, opts = {}) {
   const row = document.createElement("div");
@@ -98,9 +150,9 @@ function buildMessageEl(m, opts = {}) {
         await invoke("resend_message", { messageId: m.id });
         row.remove();
         state.renderedChat.delete(m.id);
-      } catch (err) { alert("重发失败：" + err); }
+      } catch (err) { showToast("重发失败：" + err); }
     });
-  } else if (opts.ai && m.sender === "ai") {
+  } else if (m.sender === "ai") {
     bubble.innerHTML = md(m.body);
   } else if (m.body.length > 500 || m.body.split("\n").length > 10) {
     // 长文本默认折叠，避免单个气泡刷屏，需要时点开全文
@@ -134,7 +186,7 @@ function buildMessageEl(m, opts = {}) {
   const actions = document.createElement("span");
   actions.className = "msg-actions";
   const btns = [["彩签", (e) => openCatPop(m.id, e.currentTarget)], ["收藏", () => toggleMark(m.id, "favorite")], ["置顶", () => toggleMark(m.id, "pin")]];
-  if (!opts.ai) btns.push(["引用", () => setReply(m)]);
+  if (!opts.ai) btns.push(["引用", () => setReply(m)], ["问AI", () => askAiAbout(m)]);
   if (opts.ai && m.sender === "ai") btns.push(["复制", () => navigator.clipboard.writeText(m.body)], ["重新生成", () => regenerateAi()]);
   for (const [label, fn] of btns) {
     const b = document.createElement("button");
@@ -143,6 +195,13 @@ function buildMessageEl(m, opts = {}) {
     actions.appendChild(b);
   }
   meta.appendChild(status); meta.appendChild(time); meta.appendChild(actions);
+  // 聊天里的 AI 回答（@AI 提问产生）加一个「AI 回答」标记，与对方消息区分
+  if (!opts.ai && m.sender === "ai") {
+    const badge = document.createElement("div");
+    badge.className = "ai-badge";
+    badge.textContent = "AI 回答";
+    wrap.appendChild(badge);
+  }
   wrap.appendChild(bubble); wrap.appendChild(meta);
   row.appendChild(wrap);
   refreshMessageCategory(m.id, tagsSpan);
@@ -162,7 +221,7 @@ function applyStatus(el, mid, status) {
         rowEl.remove();
         state.renderedChat.delete(mid);
       }
-    } catch (err) { alert("重试失败：" + err); }
+    } catch (err) { showToast("重试失败：" + err); }
   } : null;
 }
 
@@ -206,7 +265,8 @@ async function loadCategories() {
   return state.categories;
 }
 
-/** 刷新一条消息的彩签小片：备注优先展示，否则显示分类名；点小片改分类，右键给分类改名。 */
+/** 刷新一条消息的彩签小片：小片只显示分类名，备注不在小片上常驻，
+ * 鼠标悬浮小片时才以提示形式出现（用户 2026-11-18 裁定）；点小片改分类，右键给分类改名。 */
 async function refreshMessageCategory(mid, span) {
   try {
     const mc = await invoke("get_message_category", { messageId: mid });
@@ -215,10 +275,12 @@ async function refreshMessageCategory(mid, span) {
     const hex = CAT_COLORS[mc.color] || CAT_COLORS[0];
     const chip = document.createElement("span");
     chip.className = "tag-chip";
-    chip.textContent = mc.note || catName(mc.color);
+    chip.textContent = catName(mc.color);
     chip.style.borderColor = hex;
     chip.style.color = hex;
-    chip.title = `分类：${catName(mc.color)}（点击修改，右键改名）`;
+    chip.title = mc.note
+      ? `备注：${mc.note}（点击修改分类，右键给分类改名）`
+      : `分类：${catName(mc.color)}（点击修改，右键改名）`;
     chip.addEventListener("click", (e) => openCatPop(mid, e.currentTarget));
     chip.addEventListener("contextmenu", (e) => { e.preventDefault(); openRenamePop(mc.color, e.currentTarget); });
     span.appendChild(chip);
@@ -249,8 +311,10 @@ function appendMessage(container, m, renderedSet, opts) {
   container.scrollTop = container.scrollHeight;
 }
 
-/** 唯一的定位链路：切会话→加载消息→滚动到目标→高亮闪烁两次。 */
-async function locateMessage(conversationId, messageId) {
+/** 唯一的定位链路：切会话→加载消息→滚动到目标→高亮闪烁两次。
+ *  colorHex 可选：从某个彩签分类发起的定位（点彩签、悬停列表、分类总览）传该分类颜色，
+ *  脉冲高亮就用分类色；引用/搜索/收藏/置顶发起的定位不传，仍用默认蓝色。 */
+async function locateMessage(conversationId, messageId, colorHex) {
   const isAi = conversationId === state.aiConvId || conversationId.startsWith("ai");
   switchView(isAi ? "ai" : "chat");
   const container = isAi ? $("ai-messages") : $("messages");
@@ -264,8 +328,9 @@ async function locateMessage(conversationId, messageId) {
   const el = container.querySelector(`[data-mid="${messageId}"]`);
   if (el) {
     el.scrollIntoView({ block: "center" });
+    if (colorHex) el.style.setProperty("--flash-ring", colorHex);
     el.classList.add("flash");
-    setTimeout(() => el.classList.remove("flash"), 1300);
+    setTimeout(() => { el.classList.remove("flash"); el.style.removeProperty("--flash-ring"); }, 1300);
   }
   closeDrawer();
 }
@@ -274,14 +339,16 @@ async function locateMessage(conversationId, messageId) {
 function switchView(view) {
   state.view = view;
   document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
-  $("conv-list").classList.toggle("hidden", view !== "chat");
-  $("tag-list").classList.toggle("hidden", view !== "tags");
-  $("fav-list").classList.toggle("hidden", view !== "favorites");
   $("chat-view").classList.toggle("hidden", !(view === "chat" && state.connected));
   $("connect-view").classList.toggle("hidden", !(view === "chat" && !state.connected));
   $("ai-view").classList.toggle("hidden", view !== "ai");
+  $("tags-view").classList.toggle("hidden", view !== "tags");
+  $("fav-view").classList.toggle("hidden", view !== "favorites");
   $("settings-view").classList.toggle("hidden", view !== "settings");
-  $("placeholder-view").classList.toggle("hidden", !(view === "tags" || view === "favorites"));
+  applyAside();
+  // 视图刚变可见时补量一次输入框高度（隐藏期间 autoGrow 会跳过）
+  autoGrow($("input"));
+  autoGrow($("ai-input"));
   if (view === "tags") loadCategoryList();
   if (view === "favorites") loadFavList();
   if (view === "ai") loadAiMessages();
@@ -289,23 +356,29 @@ function switchView(view) {
 }
 
 document.querySelectorAll(".nav-item").forEach((b) =>
-  b.addEventListener("click", () => switchView(b.dataset.view)));
+  b.addEventListener("click", () => {
+    if (b.dataset.view === "chat" && localStorage.getItem("bl-aside") === "collapsed") {
+      localStorage.setItem("bl-aside", "open");
+    }
+    switchView(b.dataset.view);
+  }));
 
-// ---------- 中间列表收起/展开（长期只连同一台设备时可收起，状态记忆） ----------
-function applyAsideCollapsed() {
+// ---------- 会话列表收起/展开（列表只属于聊天页；收起即整列消失，不留残条） ----------
+// 默认收起（用户裁定，两次确认）：每次启动程序都以收起状态进入，不沿用上次退出时的展开状态；
+// 本次运行内用户展开/收起的选择照常生效，重启后回到收起。
+let asideBootDone = false;
+function applyAside() {
+  if (!asideBootDone) {
+    asideBootDone = true;
+    localStorage.setItem("bl-aside", "collapsed");
+  }
   const collapsed = localStorage.getItem("bl-aside") === "collapsed";
-  $("aside").classList.toggle("hidden", collapsed);
-  $("btn-expand-aside").classList.toggle("hidden", !collapsed);
+  $("aside").classList.toggle("hidden", state.view !== "chat" || collapsed);
 }
 $("btn-collapse-aside").addEventListener("click", () => {
   localStorage.setItem("bl-aside", "collapsed");
-  applyAsideCollapsed();
+  applyAside();
 });
-$("btn-expand-aside").addEventListener("click", () => {
-  localStorage.setItem("bl-aside", "open");
-  applyAsideCollapsed();
-});
-applyAsideCollapsed();
 
 // ---------- 会话列表 ----------
 async function loadConversations() {
@@ -323,21 +396,81 @@ async function loadConversations() {
 }
 
 // ---------- 聊天 ----------
+/* 分页懒加载（2026-11-18 用户问性能后补）：打开会话只渲染最近 CHAT_PAGE 条，
+   向上滚到接近顶部时再按页往前补，DOM 数量始终跟着「实际看过多少」走，
+   消息再多也不会一打开就把成千上万个节点全铺出来。定位（搜索/彩签/引用）
+   仍走 locateMessage 的整段加载兜底。 */
+const CHAT_PAGE = 100;
 async function loadChatMessages() {
   if (!state.peerConvId) return;
   await refreshRibbon();
-  const msgs = await invoke("list_messages", { conversationId: state.peerConvId, limit: 200 });
+  const msgs = await invoke("list_messages", { conversationId: state.peerConvId, limit: CHAT_PAGE });
   const container = $("messages");
   container.innerHTML = "";
   state.renderedChat.clear();
+  state.chatHasMore = msgs.length >= CHAT_PAGE;
+  state.chatLoadingOlder = false;
   for (const m of msgs) appendMessage(container, m, state.renderedChat, {});
   // 恢复草稿
   const convs = await invoke("list_conversations");
   const conv = convs.find((c) => c.id === state.peerConvId);
-  if (conv && conv.draft) $("input").value = conv.draft;
+  if (conv && conv.draft) { $("input").value = conv.draft; autoGrow($("input")); }
   refreshPinBar();
   rebuildDateRail();
 }
+
+/** 向上翻页：取当前最旧一条之前的一页，拼到顶部并保持阅读位置不动。 */
+async function loadOlderChat() {
+  const container = $("messages");
+  if (!state.peerConvId || !state.chatHasMore || state.chatLoadingOlder) return;
+  const first = container.querySelector(".msg-row");
+  if (!first) return;
+  state.chatLoadingOlder = true;
+  try {
+    const before = Number(first.dataset.ts || 0);
+    const older = await invoke("list_messages", { conversationId: state.peerConvId, before, limit: CHAT_PAGE });
+    const fresh = older.filter((m) => !state.renderedChat.has(m.id));
+    if (!fresh.length) { state.chatHasMore = false; return; }
+    if (older.length < CHAT_PAGE) state.chatHasMore = false;
+    // 先在临时容器里按正常顺序渲染（复用日期分隔/分组逻辑），再处理与现有第一条的接缝
+    const tmp = document.createElement("div");
+    for (const m of fresh) appendMessage(tmp, m, state.renderedChat, {});
+    const nextRow = container.querySelector(".msg-row");
+    if (nextRow) {
+      const lastNew = tmp.querySelectorAll(".msg-row");
+      const lastNewRow = lastNew.length ? lastNew[lastNew.length - 1] : null;
+      const prevSep = nextRow.previousElementSibling;
+      if (lastNewRow && fmtDay(Number(lastNewRow.dataset.ts)) === fmtDay(Number(nextRow.dataset.ts))) {
+        // 同一天：现有第一条上方那条日期分隔成了多余的（新批次里已有同日分隔或同属一天）
+        if (prevSep && prevSep.classList.contains("date-sep")) prevSep.remove();
+        if (nextRow.dataset.sender === lastNewRow.dataset.sender && Number(nextRow.dataset.ts) - Number(lastNewRow.dataset.ts) < 5 * 60 * 1000) {
+          nextRow.classList.add("grouped");
+        }
+      }
+    }
+    const h0 = container.scrollHeight;
+    const top0 = container.scrollTop;
+    container.prepend(...tmp.childNodes);
+    container.scrollTop = top0 + (container.scrollHeight - h0);
+    rebuildDateRail();
+  } catch (_) {
+    /* 翻页失败不打断阅读，下次滚到顶再试 */
+  } finally {
+    state.chatLoadingOlder = false;
+  }
+}
+
+/* 聊天区滚动：接近顶部自动翻页；离底部够远时亮出「回到底部」。 */
+$("messages").addEventListener("scroll", () => {
+  const c = $("messages");
+  if (c.scrollTop < 120) loadOlderChat();
+  const dist = c.scrollHeight - c.scrollTop - c.clientHeight;
+  $("btn-bottom").classList.toggle("hidden", dist <= 400);
+});
+$("btn-bottom").addEventListener("click", () => {
+  const c = $("messages");
+  c.scrollTo({ top: c.scrollHeight, behavior: "smooth" });
+});
 
 /** 日期锚点栏：列出当前会话出现过的日期，点击滚到当天第一条消息。 */
 function rebuildDateRail() {
@@ -467,7 +600,7 @@ $("input").addEventListener("paste", async (e) => {
     state.stagedImage = { path, size: file.size };
     $("attach-text").textContent = `粘贴的图片.${ext} · ${fmtSize(file.size)}（点发送时一并发给对方）`;
     $("attach-bar").classList.remove("hidden");
-  } catch (err) { alert("粘贴图片失败：" + err); }
+  } catch (err) { showToast("粘贴图片失败：" + err); }
 });
 $("attach-remove").addEventListener("click", () => {
   state.stagedImage = null;
@@ -484,20 +617,38 @@ async function sendCurrent() {
     state.stagedImage = null;
     $("attach-bar").classList.add("hidden");
     if (!state.connected) {
-      alert("尚未连接设备，图片未发送");
+      showToast("尚未连接设备，图片未发送");
     } else {
-      invoke("send_file_path", { path: img.path }).catch((e) => alert("图片发送失败：" + e));
+      invoke("send_file_path", { path: img.path }).catch((e) => showToast("图片发送失败：" + e));
     }
     if (!text) {
-      $("input").value = "";
+      $("input").value = ""; autoGrow($("input"));
       docDismissed = false;
       updateDocBar();
       return;
     }
   }
+  // @AI 路由：这条消息是问 AI 的，不发给对方；问答经事件回推落到当前聊天里
+  if (pendingAiRoute && text) {
+    if (chatAiBusy) { showToast("AI 正在回答上一个问题，请稍候"); return; }
+    const src = pendingAiRoute;
+    pendingAiRoute = null;
+    $("ai-route-bar").classList.add("hidden");
+    $("input").value = ""; autoGrow($("input"));
+    docDismissed = false;
+    updateDocBar();
+    invoke("save_draft", { conversationId: state.peerConvId, text: "" }).catch(() => {});
+    chatAiBusy = true;
+    try {
+      await invoke("chat_ask_ai", { conversationId: state.peerConvId, source: src, text });
+    } catch (e) {
+      showToast("问AI 失败：" + e);
+    } finally { chatAiBusy = false; }
+    return;
+  }
   const asDoc = docSuggestion;
   const replyTo = state.replyTo;
-  $("input").value = "";
+  $("input").value = ""; autoGrow($("input"));
   docDismissed = false;
   updateDocBar();
   state.replyTo = null;
@@ -507,12 +658,14 @@ async function sendCurrent() {
     if (asDoc) {
       // 转文档发送：文件气泡由后端事件回推，与选文件发送一致
       await invoke("send_document", { name: asDoc.name, content: raw });
+      ringPulse("me");
     } else {
       const m = await invoke("send_text", { text, replyTo });
+      ringPulse("me");
       appendMessage($("messages"), m, state.renderedChat, {});
     }
   } catch (e) {
-    alert("发送失败：" + e);
+    showToast("发送失败：" + e);
   }
 }
 
@@ -536,8 +689,8 @@ $("btn-file").addEventListener("click", async () => {
   try {
     const path = await window.__TAURI__.dialog.open({ multiple: false, directory: false });
     if (!path) return;
-    invoke("send_file_path", { path }).catch((e) => alert("文件发送失败：" + e));
-  } catch (e) { alert("选择文件失败：" + e); }
+    invoke("send_file_path", { path }).catch((e) => showToast("文件发送失败：" + e));
+  } catch (e) { showToast("选择文件失败：" + e); }
 });
 
 $("btn-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
@@ -573,6 +726,14 @@ $("btn-scan").addEventListener("click", async () => {
   } catch (e) { $("connect-error").textContent = String(e); }
 });
 
+/** 信号格数图标：按 RSSI 分 4 格（原型裁定，不用 dBm 文字）。 */
+function sigBars(rssi) {
+  const n = rssi >= -55 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : rssi >= -85 ? 1 : 0;
+  let bars = "";
+  for (let i = 1; i <= 4; i++) bars += `<i class="${i <= n ? "on" : ""}"></i>`;
+  return `<span class="sig" title="信号 ${rssi} dBm">${bars}</span>`;
+}
+
 /** 渲染扫描到的设备列表（bt_devices 事件推送快照）。 */
 function renderBtDevices(devices) {
   const list = $("bt-device-list");
@@ -596,7 +757,96 @@ function renderBtDevices(devices) {
     });
     list.appendChild(row);
   }
+  // 「上次连接」一键重连（蓝牙）：后台扫描就是为它跑的，名单里出现目标设备就自动发起连接
+  if (pendingRemembered) {
+    const hit = devices.find((d) => d.id === pendingRemembered.deviceId);
+    if (hit) {
+      const p = pendingRemembered;
+      pendingRemembered = null;
+      clearTimeout(rememberedTimer);
+      state.btDevice = hit.id;
+      state.btDeviceName = hit.name;
+      $("last-peer-status").textContent = `已找到「${hit.name}」，正在连接…`;
+      invoke("bt_connect", { deviceId: p.deviceId, code: p.code })
+        .then(() => saveLastPeer({ transport: "ble", deviceId: p.deviceId, code: p.code, name: hit.name }))
+        .catch((e) => { $("last-peer-status").textContent = ""; $("connect-error").textContent = String(e); });
+      if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`; }
+    }
+  }
 }
+
+// ---------- 上次连接（一键重连） ----------
+// 记住上次成功连接的设备（后端设置表存 JSON），连接页渲染成一行，点「连接」直接重连：
+// 局域网用存下的地址+连接码直连；蓝牙在后台自动扫描、找到目标设备后自动连接，
+// 用户不用打开扫描列表等、也不用再输连接码（用户 2026-11-18 要求）。
+let pendingRemembered = null;
+let rememberedTimer = null;
+
+async function saveLastPeer(p) {
+  try { await invoke("set_last_peer", { json: JSON.stringify({ ...p, ts: Date.now() }) }); } catch (_) { /* 保存失败不影响连接本身 */ }
+  loadLastPeer();
+}
+
+async function loadLastPeer() {
+  const box = $("last-peer");
+  try {
+    const raw = await invoke("get_last_peer");
+    const p = raw ? JSON.parse(raw) : null;
+    if (!p || !p.name) { box.classList.add("hidden"); return; }
+    // 局域网记录只在开发者模式下可用（与局域网测试区一致），关了开发者模式就不显示
+    if (p.transport === "lan" && !state.devMode) { box.classList.add("hidden"); return; }
+    state.lastPeer = p;
+    $("last-peer-name").textContent = p.name;
+    const when = p.ts ? (() => { const d = new Date(p.ts); const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`; })() : "";
+    $("last-peer-sub").textContent = `${p.transport === "lan" ? "局域网" : "蓝牙"}${when ? " · 上次 " + when : ""}`;
+    $("last-peer-ico").setAttribute("href", p.transport === "lan" ? "#i-wifi" : "#i-bt");
+    $("last-peer-status").textContent = "";
+    box.classList.remove("hidden");
+  } catch (_) { box.classList.add("hidden"); }
+}
+
+$("last-peer-clear").addEventListener("click", async () => {
+  await invoke("set_last_peer", { json: "" }).catch(() => {});
+  state.lastPeer = null;
+  $("last-peer").classList.add("hidden");
+});
+
+$("last-peer-connect").addEventListener("click", async () => {
+  const p = state.lastPeer;
+  if (!p) return;
+  $("connect-error").textContent = "";
+  if (p.transport === "lan") {
+    $("last-peer-status").textContent = `正在连接「${p.name}」…`;
+    try {
+      const name = await invoke("connect_to", { addr: p.addr, code: p.code });
+      saveLastPeer({ ...p, name: name || p.name });
+    } catch (e) {
+      $("last-peer-status").textContent = "";
+      $("connect-error").textContent = String(e);
+    }
+  } else {
+    $("last-peer-status").textContent = `正在查找「${p.name}」，找到后自动连接…`;
+    pendingRemembered = { deviceId: p.deviceId, code: p.code };
+    clearTimeout(rememberedTimer);
+    rememberedTimer = setTimeout(() => {
+      if (pendingRemembered) {
+        pendingRemembered = null;
+        $("last-peer-status").textContent = "未找到该设备，请确认对方已开机并打开 BlueLink 后再试。";
+        if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`; }
+      }
+    }, 25000);
+    try {
+      await invoke("bt_start_scan");
+      scanning = true;
+      $("btn-scan").innerHTML = "停止";
+    } catch (e) {
+      pendingRemembered = null;
+      clearTimeout(rememberedTimer);
+      $("last-peer-status").textContent = "";
+      $("connect-error").textContent = String(e);
+    }
+  }
+});
 
 // ---------- 开发者模式（局域网测试通道，正式版默认隐藏） ----------
 function applyDevMode(on) {
@@ -623,7 +873,8 @@ $("btn-connect").addEventListener("click", async () => {
   if (!addr || !code) { $("connect-error").textContent = "请填写对方地址和连接码"; return; }
   $("connect-status").textContent = "正在连接…";
   try {
-    await invoke("connect_to", { addr, code });
+    const name = await invoke("connect_to", { addr, code });
+    saveLastPeer({ transport: "lan", addr, code, name: name || "对方设备" });
   } catch (e) {
     $("connect-error").textContent = String(e);
     $("connect-status").textContent = "";
@@ -638,6 +889,7 @@ $("btn-bt-connect").addEventListener("click", async () => {
   $("connect-status").textContent = `正在通过蓝牙连接「${state.btDeviceName || "对方设备"}」…`;
   try {
     await invoke("bt_connect", { deviceId: state.btDevice, code });
+    saveLastPeer({ transport: "ble", deviceId: state.btDevice, code, name: state.btDeviceName || "对方设备" });
     if (scanning) { await invoke("bt_stop_scan").catch(() => {}); scanning = false; }
   } catch (e) {
     $("connect-error").textContent = String(e);
@@ -672,7 +924,7 @@ async function openCategoryDrawer(color) {
     const item = document.createElement("div");
     item.className = "list-item";
     item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(it.note || m.body.slice(0, 80))}</div>`;
-    item.addEventListener("click", () => locateMessage(m.conversation_id, m.id));
+    item.addEventListener("click", () => locateMessage(m.conversation_id, m.id, CAT_COLORS[color]));
     list.appendChild(item);
   }
   $("drawer").classList.remove("hidden");
@@ -686,7 +938,7 @@ async function toggleMark(mid, kind) {
     if (kind === "pin") refreshPinBar();
     if (kind === "favorite" && state.view === "favorites") loadFavList();
     return on;
-  } catch (e) { alert("操作失败：" + e); }
+  } catch (e) { showToast("操作失败：" + e); }
 }
 
 async function loadFavList() {
@@ -780,8 +1032,13 @@ async function openFileMenu(mid, x, y) {
         await navigator.clipboard.write([new ClipboardItem({ [blob.type || "application/octet-stream"]: blob })]);
         showToast("文件已复制到剪贴板");
       } catch (_) {
-        await navigator.clipboard.writeText(info.path);
-        showToast("此系统不支持复制文件本身，已复制文件路径");
+        try {
+          await navigator.clipboard.writeText(info.path);
+          showToast("此系统不支持复制文件本身，已复制文件路径");
+        } catch (_) {
+          // WebKitGTK 等环境剪贴板整体不可用时，给中文提示，不把英文 DOM 异常抛给用户
+          showToast("复制失败：当前系统剪贴板不可用");
+        }
       }
     }, ""],
     ["另存为…", exists, async () => {
@@ -809,7 +1066,7 @@ async function openFileMenu(mid, x, y) {
     b.disabled = !enabled;
     b.addEventListener("click", async () => {
       menu.classList.add("hidden");
-      try { await fn(); } catch (e) { alert("操作失败：" + e); }
+      try { await fn(); } catch (e) { showToast("操作失败：" + e); }
     });
     menu.appendChild(b);
   }
@@ -865,7 +1122,7 @@ async function refreshRibbon() {
       const n = (state.ribbonCycle[c.color] || 0) + 1;
       state.ribbonCycle[c.color] = n;
       const it = list[list.length - 1 - ((n - 1) % list.length)];
-      locateMessage(state.peerConvId, it.message.id);
+      locateMessage(state.peerConvId, it.message.id, CAT_COLORS[c.color]);
     });
     tab.addEventListener("mouseenter", () => showRibbonList(c.color, tab));
     tab.addEventListener("mouseleave", () => scheduleHideRibbonList());
@@ -891,9 +1148,11 @@ function showRibbonList(color, tab) {
     const d = document.createElement("div");
     d.className = "rl-item";
     d.innerHTML = `<div class="rl-note">${esc(it.note || it.message.body.slice(0, 60))}</div><div class="rl-sub">${fmtDay(it.message.created_at)} ${fmtTime(it.message.created_at)}${it.note ? " · " + esc(it.message.body.slice(0, 40)) : ""}</div>`;
+    // 条目只显示一行（CSS 省略号）；悬停条目时用提示显示完整备注（无备注则显示完整正文）——用户 2026-11-18 裁定
+    d.title = it.note || it.message.body;
     d.addEventListener("click", () => {
       box.classList.add("hidden");
-      locateMessage(it.message.conversation_id, it.message.id);
+      locateMessage(it.message.conversation_id, it.message.id, CAT_COLORS[color]);
     });
     box.appendChild(d);
   }
@@ -934,7 +1193,7 @@ $("rename-save").addEventListener("click", async () => {
     });
     refreshRibbon();
     if (state.view === "tags") loadCategoryList();
-  } catch (e) { alert("改名失败：" + e); }
+  } catch (e) { showToast("改名失败：" + e); }
 });
 document.addEventListener("click", (e) => {
   const pop = $("rename-pop");
@@ -976,13 +1235,13 @@ async function loadAiMessages() {
 async function sendAi() {
   const text = $("ai-input").value.trim();
   if (!text || state.aiGenerating) return;
-  $("ai-input").value = "";
+  $("ai-input").value = ""; autoGrow($("ai-input"));
   state.aiGenerating = true;
   $("btn-ai-stop").classList.remove("hidden");
   try {
     await invoke("ai_send", { text });
   } catch (e) {
-    alert("AI 提问失败：" + e);
+    showToast("AI 提问失败：" + e);
   } finally {
     state.aiGenerating = false;
     state.streamEl = null;
@@ -996,7 +1255,7 @@ async function regenerateAi() {
   try {
     await invoke("ai_regenerate");
     await loadAiMessages();
-  } catch (e) { alert("重新生成失败：" + e); }
+  } catch (e) { showToast("重新生成失败：" + e); }
   state.aiGenerating = false;
   state.streamEl = null;
   $("btn-ai-stop").classList.add("hidden");
@@ -1005,17 +1264,118 @@ $("btn-local-api").addEventListener("click", () => {
   switchView("settings");
   setTimeout(() => $("local-api-section").scrollIntoView({ behavior: "smooth" }), 60);
 });
-/** AI 页副标题：如实说明当前走哪条路（本机直连 / 经对端转发 / 都不可用）。 */
+/** AI 页副标题：如实说明默认 AI 当前走哪条路（本机 / 对方设备 / 自动）。 */
 async function updateAiState() {
   try {
     const cfg = await invoke("get_ai_config");
-    const ready = cfg.has_key && cfg.base_url && cfg.model;
-    $("ai-state").textContent = ready
-      ? "使用本机配置的 AI 接口"
-      : state.connected
-        ? `本机未配置 AI · 经${state.peerName || "对方设备"}转发回答`
-        : "本机未配置 AI，也未连接设备";
+    const ready = !!(cfg.has_key && cfg.base_url && cfg.model);
+    state.aiLocalReady = ready;
+    state.aiLocalModel = cfg.model || "";
+    const src = await invoke("get_ai_source").catch(() => "auto");
+    state.aiSource = src;
+    const sel = $("ai-source");
+    if (sel && document.activeElement !== sel) sel.value = src;
+    const peerLabel = state.peerName || "对方设备";
+    $("ai-state").textContent =
+      src === "local"
+        ? ready ? `默认AI：本机AI（${cfg.model}）` : "默认AI：本机AI（尚未配置）"
+        : src === "peer"
+          ? state.connected ? `默认AI：${peerLabel} 的 AI（经对方转发）` : "默认AI：对方设备 AI（当前未连接设备）"
+          : ready
+            ? "默认AI：自动（使用本机配置的 AI 接口）"
+            : state.connected
+              ? `默认AI：自动（本机未配置 · 经${peerLabel}转发回答）`
+              : "默认AI：自动（本机未配置 AI，也未连接设备）";
   } catch (_) { /* 忽略 */ }
+}
+$("ai-source").addEventListener("change", async (e) => {
+  await invoke("set_ai_source", { source: e.target.value }).catch(() => {});
+  updateAiState();
+});
+
+// ---------- 聊天框 @AI ----------
+// 输入 @ 弹出 AI 选项（本机AI / 对方设备AI / 默认AI），选定后这条消息不发给对方，
+// 而是作为问题发给所选 AI，回答以「AI 回答」气泡落在当前聊天里（仅本机保存）。
+let pendingAiRoute = null;
+let chatAiBusy = false;
+let aiPickBusy = false;
+
+function aiRouteName(key) {
+  if (key === "local") return "本机AI";
+  if (key === "peer") return `${state.peerName || "对方设备"}的AI`;
+  return "默认AI";
+}
+
+async function openAiPick() {
+  if (aiPickBusy) return;
+  aiPickBusy = true;
+  try {
+    await updateAiState();
+    const box = $("ai-pick");
+    const peerLabel = state.peerName || "对方设备";
+    const items = [
+      { key: "local", title: "本机AI", sub: state.aiLocalReady ? (state.aiLocalModel || "本机配置") : "未配置" },
+      { key: "peer", title: `${peerLabel}的AI`, sub: state.connected ? "连接设备" : "未连接" },
+      { key: "default", title: "默认AI", sub: "按 AI 页的默认AI 设置" },
+    ];
+    box.innerHTML = "";
+    for (const it of items) {
+      const row = document.createElement("div");
+      row.className = "ai-pick-item";
+      row.innerHTML = `<span class="ai-pick-title">@${esc(it.title)}</span><span class="muted small">${esc(it.sub)}</span>`;
+      row.addEventListener("click", () => chooseAiRoute(it.key));
+      box.appendChild(row);
+    }
+    box.classList.remove("hidden");
+  } finally { aiPickBusy = false; }
+}
+function closeAiPick() { $("ai-pick").classList.add("hidden"); }
+function chooseAiRoute(key) {
+  const el = $("input");
+  el.value = el.value.replace(/@$/, "");
+  pendingAiRoute = key;
+  closeAiPick();
+  const bar = $("ai-route-bar");
+  bar.innerHTML = `<span>提问给：${esc(aiRouteName(key))}（这条不发给对方）</span><button class="btn small-btn">取消</button>`;
+  bar.querySelector("button").addEventListener("click", () => {
+    pendingAiRoute = null;
+    bar.classList.add("hidden");
+    el.focus();
+  });
+  bar.classList.remove("hidden");
+  el.focus();
+}
+$("input").addEventListener("input", () => {
+  const v = $("input").value;
+  if (/(^|\s)@$/.test(v)) openAiPick(); else closeAiPick();
+});
+$("input").addEventListener("keydown", (e) => {
+  if ($("ai-pick").classList.contains("hidden")) return;
+  if (e.key === "Enter") {
+    e.preventDefault();
+    e.stopPropagation();
+    const first = $("ai-pick").querySelector(".ai-pick-item");
+    if (first) first.click();
+  }
+  if (e.key === "Escape") closeAiPick();
+}, true);
+
+/** 聊天页「问AI」：把这条消息作为上下文发给默认 AI，跳到 AI 页看回答并可继续追问。 */
+async function askAiAbout(m) {
+  if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
+  switchView("ai");
+  state.aiGenerating = true;
+  $("btn-ai-stop").classList.remove("hidden");
+  try {
+    await invoke("ai_ask_message", { conversationId: m.conversation_id, messageId: m.id });
+  } catch (e) {
+    showToast("问AI 失败：" + e);
+  } finally {
+    state.aiGenerating = false;
+    state.streamEl = null;
+    $("btn-ai-stop").classList.add("hidden");
+    loadAiMessages();
+  }
 }
 $("btn-ai-send").addEventListener("click", sendAi);
 $("ai-input").addEventListener("keydown", (e) => {
@@ -1050,7 +1410,9 @@ function showToast(text) {
 
 // ---------- 设置 ----------
 async function loadSettings() {
-  const id = state.identity || (await invoke("get_identity"));
+  // 身份信息每次进设置页都刷新：下载目录等字段可能已被改动，缓存会显示旧值
+  try { state.identity = await invoke("get_identity"); } catch (_) { /* 保留缓存兜底 */ }
+  const id = state.identity;
   $("set-name").textContent = id.name;
   $("set-code").textContent = id.code_display;
   $("set-dl").textContent = id.download_dir;
@@ -1087,8 +1449,32 @@ async function loadStorageStats() {
     $("store-chat").textContent = `${fmtSize(s.chat_bytes)} · ${s.chat_count} 条`;
     $("store-files").textContent = `${fmtSize(s.files_bytes)} · ${s.files_count} 个`;
     $("store-cache").textContent = fmtSize(s.cache_bytes);
+    $("store-dir").textContent = s.download_dir || "-";
+    $("store-dir").title = s.download_dir || "";
+    $("store-log").textContent = s.log_dir || "-";
+    $("store-log").title = s.log_dir || "";
   } catch (_) { /* 忽略 */ }
 }
+$("store-dir-change").addEventListener("click", async () => {
+  try {
+    const path = await window.__TAURI__.dialog.open({ multiple: false, directory: true });
+    if (!path) return;
+    const eff = await invoke("set_download_dir", { path });
+    showToast("保存目录已改为：" + eff);
+    loadStorageStats();
+  } catch (e) { showToast("更改保存目录失败：" + e); }
+});
+$("store-dir-reset").addEventListener("click", async () => {
+  try {
+    const eff = await invoke("set_download_dir", { path: null });
+    showToast("保存目录已恢复默认：" + eff);
+    loadStorageStats();
+  } catch (e) { showToast("恢复默认失败：" + e); }
+});
+$("store-log-open").addEventListener("click", async () => {
+  try { await invoke("open_log_dir"); }
+  catch (e) { showToast("打开日志目录失败：" + e); }
+});
 $("ai-temp").addEventListener("input", () => {
   $("ai-temp-val").textContent = Number($("ai-temp").value).toFixed(1);
 });
@@ -1167,7 +1553,7 @@ $("btn-clear-history").addEventListener("click", async () => {
 // ---------- 导出 ----------
 /** 导出当前设备会话为 Markdown 文本文件（路径由保存对话框选定）。 */
 async function exportCurrentConv() {
-  if (!state.peerConvId) { alert("还没有可导出的会话"); return; }
+  if (!state.peerConvId) { showToast("还没有可导出的会话"); return; }
   const msgs = await invoke("list_messages", { conversationId: state.peerConvId, limit: 1000 });
   const lines = ["# BlueLink 聊天记录", "", `导出时间：${new Date().toLocaleString("zh-CN")}`, ""];
   for (const m of msgs) {
@@ -1178,7 +1564,7 @@ async function exportCurrentConv() {
   if (!path) return;
   await invoke("save_text_file", { path, content: lines.join("\n") });
 }
-$("btn-export").addEventListener("click", () => exportCurrentConv().catch((e) => alert("导出失败：" + e)));
+$("btn-export").addEventListener("click", () => exportCurrentConv().catch((e) => showToast("导出失败：" + e)));
 
 // ---------- 命令面板（Ctrl+K） ----------
 const paletteState = { items: [], sel: 0 };
@@ -1231,26 +1617,35 @@ async function wireEvents() {
   await listen("bt_devices", (e) => renderBtDevices(e.payload || []));
   await listen("connection_state", async (e) => {
     state.connected = e.payload.connected;
+    $("nav-logo").classList.toggle("linked", state.connected);
+    if (!state.connected) ringClearAll();
     state.peerName = e.payload.peer_name;
     $("peer-name").textContent = state.peerName || "未连接";
     $("peer-state").textContent = state.connected ? "已连接" : "离线";
     $("connect-status").textContent = state.connected ? "" : $("connect-status").textContent;
     await loadConversations();
     if (state.connected) { switchView("chat"); loadChatMessages(); }
-    else switchView(state.view);
+    else { loadLastPeer(); switchView(state.view); }
     updateAiState();
   });
   await listen("message_new", (e) => {
     const m = e.payload;
+    ringPulse(m.sender === "me" ? "me" : "peer");
     if (m.conversation_id === state.aiConvId) appendMessage($("ai-messages"), m, state.renderedAi, { ai: true });
     else { appendMessage($("messages"), m, state.renderedChat, {}); rebuildDateRail(); }
   });
   await listen("message_status", (e) => {
-    const row = document.querySelector(`[data-mid="${e.payload.id}"] .msg-status`);
-    if (row) applyStatus(row, e.payload.id, e.payload.status);
+    // 回执可能早于本地回显气泡渲染到达：找不到元素时稍后重试一次，避免状态标签停在「已发送」
+    const apply = () => {
+      const row = document.querySelector(`[data-mid="${e.payload.id}"] .msg-status`);
+      if (row) applyStatus(row, e.payload.id, e.payload.status);
+      return !!row;
+    };
+    if (!apply()) setTimeout(apply, 400);
   });
   await listen("peer_typing", (e) => {
     $("typing-hint").classList.toggle("hidden", !e.payload);
+    if (e.payload) ringPulse("peer");
   });
   await listen("transfer_progress", (e) => {
     const { transfer_id, msg_id, received, total } = e.payload;
@@ -1275,6 +1670,12 @@ async function wireEvents() {
       }
       const cancel = b.querySelector(".progress-cancel");
       if (cancel && received < total) cancel.classList.remove("hidden");
+      // 传输进行中：对应环持续特效（我发出的看左环，对方发来的看右环），一个气泡只计一次
+      if (received < total && !b.dataset.flowing) {
+        const side = b.closest(".msg-row")?.dataset.sender === "me" ? "me" : "peer";
+        b.dataset.flowing = side;
+        ringSet(side, true);
+      }
     }
   });
   await listen("transfer_state", (e) => {
@@ -1292,6 +1693,8 @@ async function wireEvents() {
     const cancel = b.querySelector(".progress-cancel");
     const retry = b.querySelector(".transfer-retry");
     if (cancel) cancel.classList.add("hidden");
+    // 传输结束（完成/取消/校验失败）：停掉对应环的持续特效
+    if (b.dataset.flowing) { ringSet(b.dataset.flowing, false); delete b.dataset.flowing; }
     if (tstate === "done") {
       if (meta) meta.textContent = "已完成";
       setTimeout(() => {
@@ -1322,7 +1725,7 @@ async function wireEvents() {
     if (state.streamEl) { state.streamEl = null; }
     loadAiMessages();
   });
-  await listen("ai_error", (e) => alert("AI 错误：" + e.payload.error));
+  await listen("ai_error", (e) => showToast(e.payload.error));
 }
 
 // ---------- 主题 ----------
@@ -1331,6 +1734,11 @@ function applyTheme(mode) {
   else document.documentElement.setAttribute("data-theme", mode);
   document.querySelectorAll("#theme-seg button").forEach((b) =>
     b.classList.toggle("active", b.dataset.themeSet === mode));
+  // 原生窗口标题栏跟随主题（深色时不再是一条白杠）
+  try {
+    const w = window.__TAURI__.window.getCurrentWindow();
+    w.setTheme(mode === "system" ? null : mode).catch(() => {});
+  } catch (_) { /* 忽略 */ }
 }
 document.querySelectorAll("#theme-seg button").forEach((b) =>
   b.addEventListener("click", () => {
@@ -1345,6 +1753,13 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
   if (window.__TAURI__.app && window.__TAURI__.app.getVersion) {
     window.__TAURI__.app.getVersion().then((v) => { $("set-version").textContent = v; }).catch(() => {});
   }
+  // 屏蔽 WebView 默认右键菜单（浏览器式的 Back/Reload/Inspect 与本应用无关）；
+  // 输入框内保留默认菜单，方便粘贴等编辑操作。
+  document.addEventListener("contextmenu", (e) => {
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    e.preventDefault();
+  });
   await loadCategories();
   state.identity = await invoke("get_identity");
   $("my-code").textContent = state.identity.code_display;
@@ -1361,9 +1776,9 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
         $("drop-overlay").classList.remove("hidden");
       } else if (p.type === "drop") {
         $("drop-overlay").classList.add("hidden");
-        if (!state.connected) { alert("尚未连接设备，无法发送文件"); return; }
+        if (!state.connected) { showToast("尚未连接设备，无法发送文件"); return; }
         for (const path of p.paths || []) {
-          invoke("send_file_path", { path }).catch((err) => alert("文件发送失败：" + err));
+          invoke("send_file_path", { path }).catch((err) => showToast("文件发送失败：" + err));
         }
       } else {
         $("drop-overlay").classList.add("hidden");
@@ -1371,6 +1786,7 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
     });
   } catch (e) { console.error("拖拽监听注册失败", e); }
   await loadConversations();
+  loadLastPeer();
   if (state.identity.connected) {
     state.connected = true;
     switchView("chat");

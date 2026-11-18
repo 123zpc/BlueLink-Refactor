@@ -158,12 +158,12 @@ pub async fn ble_central() -> Result<BleCentral, TransportError> {
 }
 
 impl BleCentral {
-    /// 开始扫描（按 BlueLink 服务 UUID 过滤）。
+    /// 开始扫描。不设系统级服务过滤：部分平台（Windows）的系统过滤会漏掉
+    /// 服务 UUID 位于扫描响应包中的广播，导致永远扫不到；改为全量扫描，
+    /// 由 list_found 按广播服务严格筛选（见下）。
     pub async fn start_scan(&self) -> Result<(), TransportError> {
         self.adapter
-            .start_scan(ScanFilter {
-                services: vec![SERVICE_UUID],
-            })
+            .start_scan(ScanFilter::default())
             .await
             .map_err(ble_err)
     }
@@ -179,8 +179,9 @@ impl BleCentral {
         for p in self.adapter.peripherals().await.map_err(ble_err)? {
             let props = p.properties().await.map_err(ble_err)?;
             let Some(props) = props else { continue };
-            // 平台过滤不彻底时再按广播服务二次过滤；服务列表为空（如 macOS 缓存未全）时保留
-            if !props.services.is_empty() && !props.services.contains(&SERVICE_UUID) {
+            // 只认广播里带 BlueLink 服务 UUID 的设备。服务列表暂时为空的设备
+            // （广播包还没收全）先跳过，后续轮询收到完整广播后自然会出现。
+            if !props.services.contains(&SERVICE_UUID) {
                 continue;
             }
             out.push(FoundDevice {

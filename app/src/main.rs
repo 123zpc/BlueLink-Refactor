@@ -22,6 +22,8 @@ struct AppState {
     ai_cancel: Mutex<Option<oneshot::Sender<()>>>,
     central: Option<Arc<bluelink_transport::ble::BleCentral>>,
     server: Option<Arc<bluelink_transport::ble::BleServer>>,
+    /// 蓝牙广播（服务端）启动失败时的原始错误，界面据此如实提示原因。
+    server_error: Option<String>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     listening: Mutex<Option<tokio::task::JoinHandle<()>>>,
     local_api: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -65,16 +67,16 @@ struct BtState {
 #[tauri::command]
 async fn bt_state(state: State<'_, AppState>) -> Result<BtState, String> {
     let available = state.central.is_some();
-    let advertising = match &state.server {
-        Some(s) => s.is_powered().await,
-        None => false,
-    };
+    // start_ble_server 只有在广播真正启动后才返回 Ok，server 存在即正在广播
+    let advertising = state.server.is_some();
     let message = if !available {
         "未检测到蓝牙适配器或蓝牙未开启".to_string()
     } else if advertising {
         "蓝牙已开启，本机可被附近设备发现".to_string()
+    } else if let Some(err) = &state.server_error {
+        format!("蓝牙已开启，但本机广播启动失败：{err}")
     } else {
-        "蓝牙已开启，但本机广播未启动（系统限制）".to_string()
+        "蓝牙已开启，但本机广播未启动".to_string()
     };
     Ok(BtState {
         available,
@@ -95,12 +97,21 @@ async fn bt_start_scan(state: State<'_, AppState>, app: AppHandle) -> Result<(),
         h.abort();
     }
     let handle = tokio::spawn(async move {
+        // 偶发读取错误不终止扫描（否则界面还显示「正在扫描」实际已停）；连续失败多次才停
+        let mut consecutive_errors = 0u32;
         loop {
             match central.list_found().await {
                 Ok(devices) => {
+                    consecutive_errors = 0;
                     let _ = app.emit("bt_devices", devices);
                 }
-                Err(_) => break,
+                Err(e) => {
+                    consecutive_errors += 1;
+                    bluelink_services::log_line("ble", &format!("扫描读取设备列表失败（第 {consecutive_errors} 次）：{e}"));
+                    if consecutive_errors >= 5 {
+                        break;
+                    }
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
@@ -191,6 +202,27 @@ async fn connect_to(
         .await
         .map_err(|e| e.to_string())?;
     Ok(peer.name)
+}
+
+/// 读取上次成功连接的设备（JSON 字符串，存设置表 last_peer 键；前端负责序列化）。
+/// 连接页据此渲染「上次连接」一键重连入口（用户 2026-11-18 要求：记住上次设备、点一下直接连）。
+#[tauri::command]
+async fn get_last_peer(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    state
+        .node
+        .storage
+        .get_setting("last_peer")
+        .map_err(|e| e.to_string())
+}
+
+/// 保存上次连接设备（json 为空串 = 清除记录）。
+#[tauri::command]
+async fn set_last_peer(state: State<'_, AppState>, json: String) -> Result<(), String> {
+    state
+        .node
+        .storage
+        .set_setting("last_peer", &json)
+        .map_err(|e| e.to_string())
 }
 
 /// 连接扫描到的设备（访客模式）：code 为对方屏幕上显示的连接码，握手时校验。
@@ -293,12 +325,13 @@ fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>, S
 fn list_messages(
     state: State<'_, AppState>,
     conversation_id: String,
+    before: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<Message>, String> {
     state
         .node
         .storage
-        .list_messages(&conversation_id, None, limit.unwrap_or(200))
+        .list_messages(&conversation_id, before, limit.unwrap_or(200))
         .map_err(|e| e.to_string())
 }
 
@@ -418,6 +451,67 @@ async fn ai_send(state: State<'_, AppState>, text: String) -> Result<Message, St
         r = node.ai_send(&text) => r.map_err(|e| e.to_string()),
         _ = rx => Err("已停止生成".to_string()),
     }
+}
+
+/// 聊天页「问AI」：把指定聊天消息作为上下文发给默认 AI，问答落在 AI 会话。
+#[tauri::command]
+async fn ai_ask_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    message_id: String,
+) -> Result<Message, String> {
+    let (tx, rx) = oneshot::channel::<()>();
+    *state.ai_cancel.lock().await = Some(tx);
+    let node = state.node.clone();
+    tokio::select! {
+        r = node.ai_ask_message(&conversation_id, &message_id) => r.map_err(|e| e.to_string()),
+        _ = rx => Err("已停止生成".to_string()),
+    }
+}
+
+/// 聊天框 @AI 提问：source = local / peer / default，问答落在当前聊天会话（仅本机保存）。
+#[tauri::command]
+async fn chat_ask_ai(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    source: String,
+    text: String,
+) -> Result<Message, String> {
+    state
+        .node
+        .chat_ask_ai(
+            &conversation_id,
+            bluelink_services::AiSource::parse(&source),
+            &text,
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 读取默认 AI 来源（auto / local / peer）。
+#[tauri::command]
+fn get_ai_source(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state
+        .node
+        .storage
+        .get_setting("ai_default_source")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "auto".to_string()))
+}
+
+/// 保存默认 AI 来源。
+#[tauri::command]
+fn set_ai_source(state: State<'_, AppState>, source: String) -> Result<(), String> {
+    let v = match source.as_str() {
+        "local" => "local",
+        "peer" => "peer",
+        _ => "auto",
+    };
+    state
+        .node
+        .storage
+        .set_setting("ai_default_source", v)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -651,18 +745,47 @@ struct StorageStatsView {
     files_bytes: u64,
     files_count: u64,
     cache_bytes: u64,
+    /// 当前接收文件保存目录（设置页展示，可修改）。
+    download_dir: String,
+    /// 运行日志所在目录（设置页展示，可打开）。
+    log_dir: String,
 }
 
 #[tauri::command]
 fn storage_stats(state: State<'_, AppState>) -> Result<StorageStatsView, String> {
     let s = state.node.storage_stats();
+    let log_dir = bluelink_services::log::log_path()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+        .unwrap_or_default();
     Ok(StorageStatsView {
         chat_count: s.chat_count,
         chat_bytes: s.chat_bytes,
         files_bytes: s.files_bytes,
         files_count: s.files_count,
         cache_bytes: s.cache_bytes,
+        download_dir: state.node.download_dir().to_string_lossy().to_string(),
+        log_dir,
     })
+}
+
+/// 修改接收文件保存目录（传空 = 恢复默认），返回生效后的目录。
+#[tauri::command]
+fn set_download_dir(state: State<'_, AppState>, path: Option<String>) -> Result<String, String> {
+    let dir = path.as_deref().filter(|s| !s.trim().is_empty());
+    let effective = state
+        .node
+        .set_download_dir(dir.map(std::path::Path::new))
+        .map_err(|e| e.to_string())?;
+    Ok(effective.to_string_lossy().to_string())
+}
+
+/// 在系统文件管理器中打开运行日志目录。
+#[tauri::command]
+fn open_log_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let _ = &state;
+    let path = bluelink_services::log::log_path().ok_or("日志尚未初始化")?;
+    let dir = path.parent().ok_or("日志目录不存在")?;
+    bluelink_services::open_file(dir).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -961,15 +1084,16 @@ fn main() {
             forward_events(app.handle().clone(), node.clone());
             // 蓝牙运行时：中心端（扫描/连出）+ 服务端（广播/被连入）。
             // 无适配器或未开启时为 None，应用照常启动，界面如实提示（bt_state）。
-            let (central, server) = tauri::async_runtime::block_on(async {
+            let (central, server, server_error) = tauri::async_runtime::block_on(async {
                 let central = bluelink_transport::ble::ble_central()
                     .await
                     .map(Arc::new)
                     .map_err(|e| {
-                        eprintln!("蓝牙中心端不可用：{e}");
+                        bluelink_services::log_line("ble", &format!("蓝牙中心端不可用：{e}"));
                         e
                     })
                     .ok();
+                let mut server_error = None;
                 let server = match bluelink_transport::ble::start_ble_server(&name).await {
                     Ok((srv, mut inbound)) => {
                         let node_in = node.clone();
@@ -977,18 +1101,19 @@ fn main() {
                             while let Some(conn) = inbound.recv().await {
                                 // 宿主侧握手：校验对方给出的连接码是否为本机连接码
                                 if let Err(e) = node_in.attach(conn, true, "").await {
-                                    eprintln!("蓝牙入站连接握手失败：{e}");
+                                    bluelink_services::log_line("ble", &format!("蓝牙入站连接握手失败：{e}"));
                                 }
                             }
                         });
                         Some(Arc::new(srv))
                     }
                     Err(e) => {
-                        eprintln!("蓝牙服务端不可用：{e}");
+                        bluelink_services::log_line("ble", &format!("蓝牙服务端（广播）启动失败：{e}"));
+                        server_error = Some(e.to_string());
                         None
                     }
                 };
-                (central, server)
+                (central, server, server_error)
             });
             app.manage(AppState {
                 node,
@@ -996,10 +1121,109 @@ fn main() {
                 ai_cancel: Mutex::new(None),
                 central,
                 server,
+                server_error,
                 scan_task: Mutex::new(None),
                 listening: Mutex::new(None),
                 local_api: Mutex::new(local_handle),
             });
+            // 系统托盘：聊天软件的标准行为——关窗口只隐藏到托盘，蓝牙与连接不断；
+            // 真正退出走托盘菜单「退出」。左键点托盘图标重新打开窗口。
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+                use tauri::Manager as _;
+                let show_item = MenuItem::with_id(app, "tray_show", "打开 BlueLink", true, None::<&str>)?;
+                let quit_item = MenuItem::with_id(app, "tray_quit", "退出", true, None::<&str>)?;
+                let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+                let mut tray_builder = TrayIconBuilder::new()
+                    .menu(&tray_menu)
+                    .show_menu_on_left_click(false)
+                    .tooltip("BlueLink")
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "tray_show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "tray_quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray_builder = tray_builder.icon(icon.clone());
+                }
+                // Linux 上缺 appindicator 运行库时托盘构建会直接 panic（第三方库行为），
+                // 先查 ld 缓存确认库存在；缺失则跳过托盘并记日志，绝不让托盘拖垮启动。
+                #[cfg(target_os = "linux")]
+                let tray_supported = {
+                    let in_cache = std::fs::read("/etc/ld.so.cache")
+                        .map(|cache| {
+                            let text = String::from_utf8_lossy(&cache);
+                            text.contains("libayatana-appindicator3.so")
+                                || text.contains("libappindicator3.so")
+                        })
+                        .unwrap_or(false);
+                    // AppImage 等场景库在 LD_LIBRARY_PATH 的自带目录里，ld 缓存查不到，一并检查
+                    let in_ld_path = std::env::var("LD_LIBRARY_PATH")
+                        .map(|paths| {
+                            paths.split(':').filter(|d| !d.is_empty()).any(|dir| {
+                                ["libayatana-appindicator3.so.1", "libappindicator3.so.1"]
+                                    .iter()
+                                    .any(|f| std::path::Path::new(dir).join(f).exists())
+                            })
+                        })
+                        .unwrap_or(false);
+                    in_cache || in_ld_path
+                };
+                #[cfg(not(target_os = "linux"))]
+                let tray_supported = true;
+                let mut tray_ok = false;
+                if tray_supported {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tray_builder.build(app)
+                    })) {
+                        Ok(Ok(_tray)) => tray_ok = true,
+                        Ok(Err(e)) => {
+                            bluelink_services::log_line("app", &format!("系统托盘创建失败，已跳过：{e}"))
+                        }
+                        Err(_) => {
+                            bluelink_services::log_line("app", "系统托盘创建异常，已跳过（不影响使用）")
+                        }
+                    }
+                } else {
+                    bluelink_services::log_line(
+                        "app",
+                        "系统缺少 appindicator 运行库，已跳过系统托盘（关窗口将直接退出）",
+                    );
+                }
+                // 只有托盘真建好了才拦截关闭；没托盘时关窗口就是退出，不能把窗口藏到找不回来
+                if tray_ok {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let win = window.clone();
+                        window.on_window_event(move |event| {
+                            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                                api.prevent_close();
+                                let _ = win.hide();
+                                bluelink_services::log_line("app", "窗口关闭：已隐藏到系统托盘（应用继续运行）");
+                            }
+                        });
+                    }
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1012,6 +1236,8 @@ fn main() {
             set_dev_mode,
             start_listening,
             connect_to,
+            get_last_peer,
+            set_last_peer,
             disconnect,
             send_text,
             send_file_path,
@@ -1030,6 +1256,10 @@ fn main() {
             save_draft,
             save_text_file,
             ai_send,
+            ai_ask_message,
+            chat_ask_ai,
+            get_ai_source,
+            set_ai_source,
             ai_regenerate,
             ai_stop,
             get_ai_config,
@@ -1045,6 +1275,8 @@ fn main() {
             cancel_transfer,
             resend_message,
             storage_stats,
+            set_download_dir,
+            open_log_dir,
             clean_cache,
             clear_chat_history,
             file_info,

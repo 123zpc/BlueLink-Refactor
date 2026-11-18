@@ -284,14 +284,22 @@ impl Storage {
         Ok(v)
     }
 
-    /// 全文搜索（FTS5），返回命中消息（按时间倒序，上限 200）。
+    /// 子串搜索，返回命中消息（按时间倒序，上限 200）。
+    /// 不用 FTS5：默认 unicode61 分词器把整段中文当一个词条，
+    /// 搜「复验」匹配不到「重建后复验消息」；本地消息量小，LIKE 子串匹配更符合聊天搜索预期。
     pub fn search_messages(&self, query: &str) -> Result<Vec<Message>, StorageError> {
         let conn = self.lock();
+        // 转义 LIKE 通配符，用户输入按字面子串匹配
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT m.id,m.conversation_id,m.sender,m.kind,m.body,m.file_id,m.reply_to,m.status,m.created_at
-             FROM messages_fts f JOIN messages m ON m.rowid=f.rowid
-             WHERE messages_fts MATCH ?1 ORDER BY m.created_at DESC LIMIT 200")?;
-        let rows = stmt.query_map(params![query], map_message)?;
+            "SELECT id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at
+             FROM messages
+             WHERE body LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC LIMIT 200")?;
+        let rows = stmt.query_map(params![pattern], map_message)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -756,6 +764,11 @@ mod tests {
         assert_eq!(older.len(), 10);
         let hits = s.search_messages("苹果").unwrap();
         assert_eq!(hits.len(), 30);
+        // 中文子串必须能命中：整段无空格文本里的任意片段（FTS5 分词做不到，回归防线）
+        s.insert_message(&消息("mx", &c.id, "重建后复验消息", 100)).unwrap();
+        assert_eq!(s.search_messages("复验").unwrap().len(), 1);
+        assert_eq!(s.search_messages("建后复").unwrap().len(), 1);
+        assert_eq!(s.search_messages("不存在的词").unwrap().len(), 0);
     }
 
     #[test]

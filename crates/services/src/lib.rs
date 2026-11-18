@@ -1,6 +1,9 @@
 //! 应用服务层：把协议、传输、存储、AI 编排成一个可用的节点（Node）。
 //! 桌面端（Tauri）与演示 CLI 都只调用这一层，不直接碰底层 crate。
 
+pub mod log;
+pub use log::log_line;
+
 use bluelink_ai::{AiClient, AiConfig, ChatMessage};
 use bluelink_domain::*;
 use bluelink_protocol::{Control, FileChunk, Frame, CHUNK_SIZE};
@@ -28,7 +31,7 @@ pub enum ServiceError {
     BadCode,
     #[error("对方拒绝了连接")]
     Rejected,
-    #[error("AI 错误：{0}")]
+    #[error("{0}")]
     Ai(#[from] bluelink_ai::AiError),
     #[error("{0}")]
     Other(String),
@@ -69,6 +72,25 @@ pub enum Event {
         error: String,
     },
     PeerTyping(bool),
+}
+
+/// AI 来源：Auto = 本机优先、否则经对端转发；Local = 只用本机配置；Peer = 只用连接设备的 AI。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSource {
+    Auto,
+    Local,
+    Peer,
+}
+
+impl AiSource {
+    /// 解析前端传来的来源字符串（default/auto 归 Auto）。
+    pub fn parse(s: &str) -> AiSource {
+        match s {
+            "local" => AiSource::Local,
+            "peer" => AiSource::Peer,
+            _ => AiSource::Auto,
+        }
+    }
 }
 
 /// 设置页存储区数据（聊天记录/接收文件/缓存占用）。
@@ -222,7 +244,10 @@ pub struct Node {
     pub device_id: String,
     pub device_name: String,
     pub storage: Arc<Storage>,
-    download_dir: PathBuf,
+    /// 接收文件保存目录：可在设置里修改（运行时可换，存在 RwLock 里）。
+    download_dir: std::sync::RwLock<PathBuf>,
+    /// 默认保存目录（数据目录下的 downloads），「恢复默认」时回到这里。
+    default_download_dir: PathBuf,
     peer: Mutex<Option<Arc<PeerSession>>>,
     events: broadcast::Sender<Event>,
     ai_cfg: Mutex<Option<AiConfig>>,
@@ -238,8 +263,32 @@ impl Node {
     /// 创建节点。identity_path 中持久化设备 ID，保证重启后连接码不变。
     pub fn new(data_dir: &Path, device_name: &str) -> Result<Arc<Self>, ServiceError> {
         std::fs::create_dir_all(data_dir)?;
-        let download_dir = data_dir.join("downloads");
-        std::fs::create_dir_all(&download_dir)?;
+        log::init_log(data_dir);
+        log::log_line(
+            "app",
+            &format!("节点启动：设备名「{device_name}」，数据目录 {}", data_dir.display()),
+        );
+        let storage = Arc::new(Storage::open(
+            data_dir
+                .join("bluelink.db")
+                .to_str()
+                .unwrap_or("bluelink.db"),
+        )?);
+        // 保存目录：优先用设置里用户自选的目录（建不出来时回落默认），否则默认目录
+        let default_download_dir = data_dir.join("downloads");
+        let saved_dir = storage
+            .get_setting("download_dir")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+        let download_dir = match saved_dir {
+            Some(dir) if std::fs::create_dir_all(&dir).is_ok() => dir,
+            _ => {
+                std::fs::create_dir_all(&default_download_dir)?;
+                default_download_dir.clone()
+            }
+        };
         let id_path = data_dir.join("device_id.txt");
         let device_id = if id_path.exists() {
             std::fs::read_to_string(&id_path)?.trim().to_string()
@@ -248,18 +297,13 @@ impl Node {
             std::fs::write(&id_path, &id)?;
             id
         };
-        let storage = Arc::new(Storage::open(
-            data_dir
-                .join("bluelink.db")
-                .to_str()
-                .unwrap_or("bluelink.db"),
-        )?);
         let (events, _) = broadcast::channel(512);
         Ok(Arc::new(Self {
             device_id,
             device_name: device_name.to_string(),
             storage,
-            download_dir,
+            download_dir: std::sync::RwLock::new(download_dir),
+            default_download_dir,
             peer: Mutex::new(None),
             events,
             ai_cfg: Mutex::new(None),
@@ -276,9 +320,32 @@ impl Node {
         connection_code(&self.device_id)
     }
 
-    /// 下载目录（接收文件落地处）。
-    pub fn download_dir(&self) -> &Path {
-        &self.download_dir
+    /// 当前接收文件保存目录（接收文件落地处）。
+    pub fn download_dir(&self) -> PathBuf {
+        self.download_dir
+            .read()
+            .map(|d| d.clone())
+            .unwrap_or_else(|_| self.default_download_dir.clone())
+    }
+
+    /// 修改保存目录：传 None 恢复默认。目录会被创建并持久化到设置，立即生效。
+    pub fn set_download_dir(&self, dir: Option<&Path>) -> Result<PathBuf, ServiceError> {
+        let target = match dir {
+            Some(p) => p.to_path_buf(),
+            None => self.default_download_dir.clone(),
+        };
+        std::fs::create_dir_all(&target)?;
+        if let Ok(mut cur) = self.download_dir.write() {
+            *cur = target.clone();
+        }
+        let saved = if dir.is_some() {
+            target.to_string_lossy().to_string()
+        } else {
+            String::new()
+        };
+        self.storage.set_setting("download_dir", &saved)?;
+        log::log_line("files", &format!("接收文件保存目录改为 {}", target.display()));
+        Ok(target)
     }
 
     /// 订阅事件。
@@ -876,7 +943,7 @@ impl Node {
         _mime: Option<String>,
     ) -> Result<(), ServiceError> {
         // 恢复已有进度：传输记录 + .part 文件都在才算数
-        let part_path = self.download_dir.join(format!("{transfer_id}.part"));
+        let part_path = self.download_dir().join(format!("{transfer_id}.part"));
         let mut ranges = self
             .storage
             .load_transfer_ranges(&transfer_id)?
@@ -1007,7 +1074,7 @@ impl Node {
             let _ = self
                 .storage
                 .update_message_status(&st.msg_id, MessageStatus::Delivered);
-            let final_path = self.download_dir.join(&st.name);
+            let final_path = self.download_dir().join(&st.name);
             std::fs::rename(&st.part_path, &final_path)?;
             // 回写落地路径，文件菜单（打开/另存为等）靠它定位文件
             let _ = self
@@ -1026,12 +1093,17 @@ impl Node {
                 transfer_id: transfer_id.clone(),
                 state: "done".into(),
             });
+            log::log_line(
+                "files",
+                &format!("接收完成：{}（{} 字节）→ {}", st.name, st.total, final_path.display()),
+            );
         } else {
             let _ = std::fs::remove_file(&st.part_path);
             self.emit(Event::TransferState {
                 transfer_id: transfer_id.clone(),
                 state: "verify_failed".into(),
             });
+            log::log_line("files", &format!("接收校验失败，已删除半成品：{}", st.name));
         }
         session
             .conn
@@ -1047,7 +1119,7 @@ impl Node {
         let mut files_bytes = 0u64;
         let mut files_count = 0u64;
         let mut cache_bytes = 0u64;
-        if let Ok(rd) = std::fs::read_dir(&self.download_dir) {
+        if let Ok(rd) = std::fs::read_dir(self.download_dir()) {
             for e in rd.flatten() {
                 let Ok(md) = e.metadata() else { continue };
                 if !md.is_file() {
@@ -1074,7 +1146,7 @@ impl Node {
     pub async fn clean_cache(&self) -> u64 {
         let active: HashSet<String> = self.recv_files.lock().await.keys().cloned().collect();
         let mut freed = 0u64;
-        if let Ok(rd) = std::fs::read_dir(&self.download_dir) {
+        if let Ok(rd) = std::fs::read_dir(self.download_dir()) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
                 let Some(tid) = name.strip_suffix(".part") else {
@@ -1114,7 +1186,7 @@ impl Node {
         let path = if !meta.path.is_empty() && recorded.exists() {
             Some(recorded)
         } else {
-            let fallback = self.download_dir.join(&meta.name);
+            let fallback = self.download_dir().join(&meta.name);
             if fallback.exists() {
                 Some(fallback)
             } else if !meta.path.is_empty() {
@@ -1148,9 +1220,91 @@ impl Node {
         Ok(id)
     }
 
-    /// 在 AI 会话里提问：本机配置了 AI 就直连，否则经对端代理（原版核心思想）。
+    /// 在 AI 会话里提问：走「默认 AI」来源（本机配置 / 连接设备的 AI / 自动）。
     pub async fn ai_send(self: &Arc<Self>, text: &str) -> Result<Message, ServiceError> {
         let conv_id = self.ensure_ai_conversation()?;
+        self.ai_push_and_answer(&conv_id, text).await
+    }
+
+    /// 聊天页「问AI」：把某条聊天消息作为上下文发给默认 AI，问答落在 AI 会话里
+    /// （用户消息带出处标题，方便在 AI 页接着追问）。
+    pub async fn ai_ask_message(
+        self: &Arc<Self>,
+        conv_id: &str,
+        msg_id: &str,
+    ) -> Result<Message, ServiceError> {
+        let orig = self
+            .storage
+            .get_message(msg_id)?
+            .ok_or_else(|| ServiceError::Other("要问 AI 的消息不存在".into()))?;
+        let title = self
+            .storage
+            .list_conversations()?
+            .into_iter()
+            .find(|c| c.id == conv_id)
+            .map(|c| c.title)
+            .unwrap_or_else(|| "聊天".into());
+        let ai_conv = self.ensure_ai_conversation()?;
+        let body = format!("【来自与「{title}」的聊天】\n{}", orig.body);
+        self.ai_push_and_answer(&ai_conv, &body).await
+    }
+
+    /// 聊天框 @AI 提问：问题与回答都落在当前聊天会话里（仅本机保存，不发给对方），
+    /// 来源由前端 @ 选择决定（本机 / 对方设备 / 默认）。
+    pub async fn chat_ask_ai(
+        self: &Arc<Self>,
+        conv_id: &str,
+        source: AiSource,
+        text: &str,
+    ) -> Result<Message, ServiceError> {
+        let q = Message {
+            id: new_id(),
+            conversation_id: conv_id.to_string(),
+            sender: Sender::Me,
+            kind: MessageKind::Text,
+            body: text.to_string(),
+            file_id: None,
+            reply_to: None,
+            status: MessageStatus::Sent,
+            created_at: now_ms(),
+        };
+        let qid = q.id.clone();
+        self.storage.insert_message(&q)?;
+        self.emit(Event::MessageNew(q));
+        // @ 选择「默认」时按设置里的默认来源走（未设置则自动）
+        let source = if source == AiSource::Auto {
+            self.default_ai_source()
+        } else {
+            source
+        };
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: text.to_string(),
+        }];
+        let full = self.chat_core_src(&msgs, None, source).await?;
+        let a = Message {
+            id: new_id(),
+            conversation_id: conv_id.to_string(),
+            sender: Sender::Ai,
+            kind: MessageKind::Text,
+            body: full,
+            file_id: None,
+            reply_to: Some(qid),
+            status: MessageStatus::Received,
+            created_at: now_ms(),
+        };
+        self.storage.insert_message(&a)?;
+        self.emit(Event::MessageNew(a.clone()));
+        Ok(a)
+    }
+
+    /// 把一条用户消息写入 AI 会话并生成回复（AI 页提问与「问AI」共用）。
+    async fn ai_push_and_answer(
+        self: &Arc<Self>,
+        conv_id: &str,
+        text: &str,
+    ) -> Result<Message, ServiceError> {
+        let conv_id = conv_id.to_string();
         let user_msg = Message {
             id: new_id(),
             conversation_id: conv_id.clone(),
@@ -1245,33 +1399,69 @@ impl Node {
 
     /// AI 调用核心：本机配置优先（按配置的流式开关走流式/整段），
     /// 否则经已连接设备代理转发；两条路的增量都交给 on_delta（可为空）。
+    /// 默认 AI 来源（用户 2026-11-18 要求：默认 AI 可选本机配置或连接设备的 AI）。
+    /// 设置键 ai_default_source = local / peer；未设置 = Auto（本机优先、否则经对端转发）。
+    fn default_ai_source(&self) -> AiSource {
+        match self
+            .storage
+            .get_setting("ai_default_source")
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("local") => AiSource::Local,
+            Some("peer") => AiSource::Peer,
+            _ => AiSource::Auto,
+        }
+    }
+
     async fn chat_core(
         &self,
         msgs: &[ChatMessage],
         on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
     ) -> Result<String, ServiceError> {
+        self.chat_core_src(msgs, on_delta, AiSource::Auto).await
+    }
+
+    /// 按指定来源提问：Local 只走本机配置、Peer 只走对端转发、Auto 本机优先否则转发。
+    async fn chat_core_src(
+        &self,
+        msgs: &[ChatMessage],
+        on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
+        source: AiSource,
+    ) -> Result<String, ServiceError> {
         let cfg = self.ai_cfg.lock().await.clone();
-        if let Some(cfg) = cfg.filter(|c| c.is_ready()) {
-            let client = AiClient::new(cfg.clone());
-            if cfg.stream {
-                let mut cb = on_delta;
-                let full = client
-                    .chat_stream(msgs, |d| {
-                        if let Some(f) = cb.as_deref_mut() {
-                            f(d);
-                        }
-                    })
-                    .await?;
+        if source != AiSource::Peer {
+            if let Some(cfg) = cfg.filter(|c| c.is_ready()) {
+                let client = AiClient::new(cfg.clone());
+                if cfg.stream {
+                    let mut cb = on_delta;
+                    let full = client
+                        .chat_stream(msgs, |d| {
+                            if let Some(f) = cb.as_deref_mut() {
+                                f(d);
+                            }
+                        })
+                        .await?;
+                    return Ok(full);
+                }
+                let full = client.chat_once(msgs).await?;
+                if let Some(f) = on_delta {
+                    f(&full);
+                }
                 return Ok(full);
             }
-            let full = client.chat_once(msgs).await?;
-            if let Some(f) = on_delta {
-                f(&full);
+            if source == AiSource::Local {
+                return Err(bluelink_ai::AiError::NotConfigured.into());
             }
-            return Ok(full);
         }
-        if self.is_connected().await {
-            return self.proxy_to_peer(msgs, on_delta).await;
+        if source != AiSource::Local {
+            if self.is_connected().await {
+                return self.proxy_to_peer(msgs, on_delta).await;
+            }
+            if source == AiSource::Peer {
+                return Err(ServiceError::NotConnected);
+            }
         }
         Err(bluelink_ai::AiError::NotConfigured.into())
     }
@@ -1290,7 +1480,9 @@ impl Node {
                 delta: d.to_string(),
             });
         };
-        self.chat_core(msgs, Some(&mut cb)).await
+        // AI 页提问遵循「默认 AI」设置（本机 / 对方设备 / 自动）
+        let source = self.default_ai_source();
+        self.chat_core_src(msgs, Some(&mut cb), source).await
     }
 
     /// 本地 API 网关入口：供本机其他软件经 OpenAI 兼容接口调用（见应用层本地 API 服务）。
