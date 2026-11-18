@@ -22,7 +22,9 @@ pub fn simpleble_compiled() -> bool {
 #[cfg(feature = "simpleble")]
 mod imp {
     use super::{FoundDevice, TransportError};
-    use crate::ble::{channel_stream, StreamEnds, ATT_CHUNK, INBOX_UUID, OUTBOX_UUID, SERVICE_UUID};
+    use crate::ble::{
+        channel_stream, StreamEnds, ATT_CHUNK, INBOX_UUID, OUTBOX_UUID, SERVICE_UUID,
+    };
     use crate::Conn;
     use futures_util::StreamExt;
     use simplersble::{
@@ -128,10 +130,7 @@ mod imp {
                 for p in results {
                     let is_bluelink = p
                         .services()
-                        .map(|svcs| {
-                            svcs.iter()
-                                .any(|s| s.uuid().eq_ignore_ascii_case(&svc))
-                        })
+                        .map(|svcs| svcs.iter().any(|s| s.uuid().eq_ignore_ascii_case(&svc)))
                         .unwrap_or(false);
                     if !is_bluelink {
                         continue;
@@ -185,9 +184,7 @@ mod imp {
                 .unwrap()
                 .get(device_id)
                 .cloned()
-                .ok_or_else(|| {
-                    TransportError::Ble("设备已不在扫描范围内，请重新扫描".into())
-                })?;
+                .ok_or_else(|| TransportError::Ble("设备已不在扫描范围内，请重新扫描".into()))?;
 
             // 连接事件流要在 connect 之前订阅，否则断开事件可能漏掉。
             let mut conn_events = peripheral.on_connection_event();
@@ -351,7 +348,10 @@ mod imp {
             let outbox = service
                 .add_characteristic(
                     &outbox_uuid(),
-                    &[CharacteristicCapability::Notify, CharacteristicCapability::Read],
+                    &[
+                        CharacteristicCapability::Notify,
+                        CharacteristicCapability::Read,
+                    ],
                 )
                 .map_err(sble_err)?;
             // 读 OUTBOX 时回空值（与 ble 模块的 ReadRequest 行为一致）。
@@ -516,9 +516,7 @@ mod imp {
 
     /// 未编译 SimpleBLE 时的统一错误：如实说明原因，app 层据此回落并提示。
     fn not_compiled() -> TransportError {
-        TransportError::Ble(
-            "SimpleBLE 未编译进此版本（构建时未开启 simpleble feature）".into(),
-        )
+        TransportError::Ble("SimpleBLE 未编译进此版本（构建时未开启 simpleble feature）".into())
     }
 
     /// SimpleBLE 中心端空壳（未编译）：所有操作返回「未编译」错误。
