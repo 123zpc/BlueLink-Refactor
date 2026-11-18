@@ -24,7 +24,7 @@ struct AppState {
     server: Option<Arc<bluelink_transport::ble::BleServer>>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     listening: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    local_api: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    local_api: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 /// 本机身份信息（连接页与设置页用）。
@@ -817,13 +817,7 @@ fn gateway_view(state: &AppState) -> GatewaySettingsView {
 #[tauri::command]
 async fn get_gateway_settings(state: State<'_, AppState>) -> Result<GatewaySettingsView, String> {
     let mut v = gateway_view(&state);
-    v.local_running = state
-        .local_api
-        .lock()
-        .await
-        .as_ref()
-        .map(|h| !h.is_finished())
-        .unwrap_or(false);
+    v.local_running = local_api::is_running();
     Ok(v)
 }
 
@@ -853,6 +847,7 @@ async fn set_local_api(
     let mut slot = state.local_api.lock().await;
     if let Some(h) = slot.take() {
         h.abort();
+        local_api::mark_stopped();
     }
     if enabled {
         *slot = Some(local_api::spawn(state.node.clone()));

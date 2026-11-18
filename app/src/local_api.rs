@@ -12,9 +12,24 @@ use tokio::net::{TcpListener, TcpStream};
 /// 本地接口端口（原型定版：http://127.0.0.1:8321/v1）。
 pub const PORT: u16 = 8321;
 
+/// 服务是否真正在监听（绑定成功后置位、任务结束清除）。
+/// Tauri 的 JoinHandle 没有 is_finished，运行状态靠这个标志如实反映。
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_running() -> bool {
+    RUNNING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 上层 abort 任务时调用：被取消的任务来不及自己清标志，这里补上。
+pub fn mark_stopped() {
+    RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 启动服务（返回任务句柄，上层持有以便按设置开关启停）。
-pub fn spawn(node: Arc<Node>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+/// 必须走 Tauri 的异步运行时：setup 阶段主线程上没有 Tokio 上下文，
+/// 直接 tokio::spawn 会 panic（开启本地 API 后重启应用必崩，已实测）。
+pub fn spawn(node: Arc<Node>) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
         let listener = match TcpListener::bind(("127.0.0.1", PORT)).await {
             Ok(l) => l,
             Err(e) => {
@@ -22,12 +37,14 @@ pub fn spawn(node: Arc<Node>) -> tokio::task::JoinHandle<()> {
                 return;
             }
         };
+        RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
         while let Ok((sock, _)) = listener.accept().await {
             let n = node.clone();
             tokio::spawn(async move {
                 let _ = handle(n, sock).await;
             });
         }
+        RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
     })
 }
 
