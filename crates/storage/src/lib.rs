@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS transfers(id TEXT PRIMARY KEY, file_id TEXT, directio
     ranges TEXT, state TEXT, updated_at INTEGER);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS reading_positions(conversation_id TEXT PRIMARY KEY, message_id TEXT, updated_at INTEGER);
+CREATE TABLE IF NOT EXISTS categories(color INTEGER PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS message_category(message_id TEXT PRIMARY KEY, color INTEGER NOT NULL, note TEXT);
+INSERT OR IGNORE INTO categories(color,name) VALUES (0,'灰色'),(1,'红色'),(2,'橙色'),(3,'黄色'),(4,'绿色'),(5,'青色'),(6,'蓝色'),(7,'紫色'),(8,'粉色');
 "#;
 
 /// 存储句柄（内部互斥，单连接模型足够桌面端使用）。
@@ -74,9 +77,77 @@ impl Storage {
     pub fn open(path: &str) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self {
+        let s = Self {
             conn: Mutex::new(conn),
-        })
+        };
+        s.migrate_legacy_tags()?;
+        Ok(s)
+    }
+
+    /// 一次性迁移（v2.2）：把旧的自由标签按颜色并入彩签分类——
+    /// 每个颜色的分类名取该颜色下用得最多的旧标签名；一条消息有多个旧标签时，
+    /// 取创建时间最早的那个标签的颜色为其分类（颜色相同自然合并）。
+    /// 以 settings 标记防重复执行；老表数据保留不删（旧命令仍可读）。
+    pub fn migrate_legacy_tags(&self) -> Result<(), StorageError> {
+        let mut conn = self.lock();
+        let marker: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='cat_migrated'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if marker.as_deref() == Some("1") {
+            return Ok(());
+        }
+        let tx = conn.transaction()?;
+        // 分类名：每个颜色取消息数最多的旧标签名
+        for color in 0..=8i64 {
+            let name: Option<String> = tx
+                .query_row(
+                    "SELECT t.name FROM tags t JOIN message_tags mt ON mt.tag_id=t.id
+                     WHERE t.color=?1 GROUP BY t.id ORDER BY COUNT(*) DESC, t.created_at ASC LIMIT 1",
+                    params![color],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(name) = name {
+                tx.execute(
+                    "UPDATE categories SET name=?1 WHERE color=?2",
+                    params![name, color],
+                )?;
+            }
+        }
+        // 归属：每条消息取其最早创建的旧标签的颜色
+        let mut stmt = tx.prepare(
+            "SELECT mt.message_id, t.color FROM message_tags mt JOIN tags t ON t.id=mt.tag_id
+             ORDER BY mt.message_id, t.created_at ASC, t.id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut seen = std::collections::HashSet::new();
+        let mut winners: Vec<(String, i64)> = Vec::new();
+        for row in rows {
+            let (mid, color) = row?;
+            if seen.insert(mid.clone()) {
+                winners.push((mid, color));
+            }
+        }
+        drop(stmt);
+        for (mid, color) in winners {
+            tx.execute(
+                "INSERT OR IGNORE INTO message_category(message_id,color,note) VALUES(?1,?2,NULL)",
+                params![mid, color],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO settings(key,value) VALUES('cat_migrated','1')
+             ON CONFLICT(key) DO UPDATE SET value='1'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -304,6 +375,102 @@ impl Storage {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    // ---------- 彩签分类（v2.2 新模型：颜色即分类） ----------
+    /// 全部 9 个分类及各自消息数（按颜色序号排列，空分类也在内）。
+    pub fn list_categories(&self) -> Result<Vec<Category>, StorageError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.color, c.name, COUNT(mc.message_id) FROM categories c
+             LEFT JOIN message_category mc ON mc.color=c.color
+             GROUP BY c.color ORDER BY c.color",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Category {
+                color: r.get(0)?,
+                name: r.get(1)?,
+                count: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 给分类改名（改名后全部分类成员同步显示新名，因为名字只存一份）。
+    pub fn rename_category(&self, color: i64, name: &str) -> Result<(), StorageError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE categories SET name=?1 WHERE color=?2",
+            params![name.trim(), color],
+        )?;
+        Ok(())
+    }
+
+    /// 设置一条消息的彩签分类；None 表示清除。备注为空串时按无备注存。
+    pub fn set_message_category(
+        &self,
+        message_id: &str,
+        category: Option<(i64, Option<String>)>,
+    ) -> Result<(), StorageError> {
+        let conn = self.lock();
+        match category {
+            Some((color, note)) => {
+                let note = note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+                conn.execute(
+                    "INSERT INTO message_category(message_id,color,note) VALUES(?1,?2,?3)
+                     ON CONFLICT(message_id) DO UPDATE SET color=?2, note=?3",
+                    params![message_id, color, note],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "DELETE FROM message_category WHERE message_id=?1",
+                    params![message_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 一条消息的彩签归属（无则 None）。
+    pub fn get_message_category(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<MessageCategory>, StorageError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT color, note FROM message_category WHERE message_id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![message_id], |r| {
+            Ok(MessageCategory {
+                color: r.get(0)?,
+                note: r.get(1)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 某分类下的全部消息及备注（时间正序，供悬停列表与总览抽屉）。
+    pub fn list_messages_by_category(
+        &self,
+        color: i64,
+    ) -> Result<Vec<CategorizedMessage>, StorageError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT m.id,m.conversation_id,m.sender,m.kind,m.body,m.file_id,m.reply_to,m.status,m.created_at, mc.note
+             FROM messages m JOIN message_category mc ON mc.message_id=m.id
+             WHERE mc.color=?1 ORDER BY m.created_at",
+        )?;
+        let rows = stmt.query_map(params![color], |r| {
+            Ok(CategorizedMessage {
+                message: map_message(r)?,
+                note: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     // ---------- 收藏/置顶 ----------
     /// 切换标记状态，返回切换后是否已标记。
     pub fn toggle_mark(&self, message_id: &str, kind: MarkKind) -> Result<bool, StorageError> {
@@ -345,6 +512,62 @@ impl Storage {
             "INSERT OR REPLACE INTO files(id,name,size,sha256,path,mime) VALUES(?1,?2,?3,?4,?5,?6)",
             params![f.id, f.name, f.size as i64, f.sha256, f.path, f.mime],
         )?;
+        Ok(())
+    }
+
+    /// 按文件 ID 取元信息。
+    pub fn get_file(&self, file_id: &str) -> Result<Option<FileMeta>, StorageError> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT id,name,size,sha256,path,mime FROM files WHERE id=?1")?;
+        let mut rows = stmt.query_map(params![file_id], |r| {
+            Ok(FileMeta {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                size: r.get::<_, i64>(2)? as u64,
+                sha256: r.get(3)?,
+                path: r.get(4)?,
+                mime: r.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 回写文件落地路径（接收完成时 .part 转正后调用）。
+    pub fn update_file_path(&self, file_id: &str, path: &str) -> Result<(), StorageError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE files SET path=?1 WHERE id=?2",
+            params![path, file_id],
+        )?;
+        Ok(())
+    }
+
+    /// 消息统计（设置页存储区）：条数与正文总字节数。
+    pub fn message_stats(&self) -> Result<(i64, i64), StorageError> {
+        let conn = self.lock();
+        let row = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(body)),0) FROM messages",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        Ok(row)
+    }
+
+    /// 清空全部聊天记录（消息、全文索引、彩签归属、收藏/置顶一并清，会话与设置保留）。
+    pub fn clear_all_messages(&self) -> Result<(), StorageError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM message_category", [])?;
+        tx.execute("DELETE FROM message_tags", [])?;
+        tx.execute("DELETE FROM message_marks", [])?;
+        tx.execute("DELETE FROM messages", [])?;
+        // 外部内容 FTS：用 rebuild 按已清空的内容表重建索引（结果为空索引）
+        tx.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -555,6 +778,70 @@ mod tests {
         assert_eq!(s.list_marked(MarkKind::Favorite).unwrap().len(), 1);
         assert!(!s.toggle_mark("m1", MarkKind::Favorite).unwrap());
         assert_eq!(s.list_marked(MarkKind::Favorite).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn 彩签分类全流程() {
+        let (s, c) = 准备();
+        s.insert_message(&消息("m1", &c.id, "合同终版", 1)).unwrap();
+        s.insert_message(&消息("m2", &c.id, "另一条", 2)).unwrap();
+        // 初始 9 个分类都在，计数为 0
+        let cats = s.list_categories().unwrap();
+        assert_eq!(cats.len(), 9);
+        assert!(cats.iter().all(|x| x.count == 0));
+        assert_eq!(cats[1].name, "红色");
+        // 归类 + 备注
+        s.set_message_category("m1", Some((1, Some(" 终版合同 ".into()))))
+            .unwrap();
+        s.set_message_category("m2", Some((1, None))).unwrap();
+        let mc = s.get_message_category("m1").unwrap().unwrap();
+        assert_eq!(mc.color, 1);
+        assert_eq!(mc.note.as_deref(), Some("终版合同"));
+        let cats = s.list_categories().unwrap();
+        assert_eq!(cats[1].count, 2);
+        // 改名全类同步
+        s.rename_category(1, "文件").unwrap();
+        assert_eq!(s.list_categories().unwrap()[1].name, "文件");
+        // 按分类列取（带备注）
+        let list = s.list_messages_by_category(1).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].message.id, "m1");
+        assert_eq!(list[0].note.as_deref(), Some("终版合同"));
+        // 改归属：一人一类，换色即移走
+        s.set_message_category("m1", Some((4, None))).unwrap();
+        assert_eq!(s.list_categories().unwrap()[1].count, 1);
+        assert_eq!(s.list_categories().unwrap()[4].count, 1);
+        // 清除
+        s.set_message_category("m1", None).unwrap();
+        assert!(s.get_message_category("m1").unwrap().is_none());
+        // 清空记录连带清归属
+        s.clear_all_messages().unwrap();
+        assert_eq!(s.message_stats().unwrap().0, 0);
+        assert_eq!(s.list_categories().unwrap()[1].count, 0);
+    }
+
+    #[test]
+    fn 老标签按颜色迁移() {
+        let (s, c) = 准备();
+        s.insert_message(&消息("m1", &c.id, "甲", 1)).unwrap();
+        s.insert_message(&消息("m2", &c.id, "乙", 2)).unwrap();
+        // 旧模型：自由标签 + 每签一色；m1 有两签（红的文件、用得少；蓝的其它）
+        s.set_message_tags("m1", &["文件".into(), "其它".into()])
+            .unwrap();
+        s.set_message_tags("m2", &["文件".into()]).unwrap();
+        s.set_tag_color("文件", 1).unwrap();
+        s.set_tag_color("其它", 6).unwrap();
+        // open 时迁移已在空库跑过，这里手动重置标记再迁一次（模拟老库首次升级打开）
+        s.set_setting("cat_migrated", "0").unwrap();
+        s.migrate_legacy_tags().unwrap();
+        let cats = s.list_categories().unwrap();
+        assert_eq!(cats[1].name, "文件"); // 红色分类名取自旧标签「文件」
+        assert_eq!(cats[1].count, 2); // m1（最早标签为文件）、m2 都归红
+        assert_eq!(s.get_message_category("m1").unwrap().unwrap().color, 1);
+        // 迁移幂等：再跑不变
+        s.set_setting("cat_migrated", "0").unwrap();
+        s.migrate_legacy_tags().unwrap();
+        assert_eq!(s.list_categories().unwrap()[1].count, 2);
     }
 
     #[test]

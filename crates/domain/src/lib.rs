@@ -145,6 +145,46 @@ pub struct Tag {
     pub count: i64,
 }
 
+/// 彩签分类（v2.2 起的新模型）：颜色即分类——9 个颜色（0–8）各是一个分类，
+/// 每个分类可命名，一条消息至多归入一个分类。颜色序号与调色板一一对应：
+/// 0 灰、1 红、2 橙、3 黄、4 绿、5 青、6 蓝、7 紫、8 粉。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Category {
+    pub color: i64,
+    pub name: String,
+    pub count: i64,
+}
+
+/// 彩签分类的默认名（未命名时按颜色显示）。
+pub fn category_default_name(color: i64) -> &'static str {
+    match color {
+        0 => "灰色",
+        1 => "红色",
+        2 => "橙色",
+        3 => "黄色",
+        4 => "绿色",
+        5 => "青色",
+        6 => "蓝色",
+        7 => "紫色",
+        8 => "粉色",
+        _ => "未命名",
+    }
+}
+
+/// 一条消息的彩签归属：分类颜色 + 可选备注（备注优先于分类名展示）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageCategory {
+    pub color: i64,
+    pub note: Option<String>,
+}
+
+/// 某分类下的一条消息及其备注（彩签悬停列表与总览抽屉用）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CategorizedMessage {
+    pub message: Message,
+    pub note: Option<String>,
+}
+
 /// 字节区间集合工具：断点续传用它计算已收区间与缺失区间。
 /// 区间为左闭右开 [start, end)。
 pub type Ranges = Vec<(u64, u64)>;
