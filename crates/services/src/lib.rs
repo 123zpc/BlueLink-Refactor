@@ -266,7 +266,10 @@ impl Node {
         log::init_log(data_dir);
         log::log_line(
             "app",
-            &format!("节点启动：设备名「{device_name}」，数据目录 {}", data_dir.display()),
+            &format!(
+                "节点启动：设备名「{device_name}」，数据目录 {}",
+                data_dir.display()
+            ),
         );
         let storage = Arc::new(Storage::open(
             data_dir
@@ -344,7 +347,10 @@ impl Node {
             String::new()
         };
         self.storage.set_setting("download_dir", &saved)?;
-        log::log_line("files", &format!("接收文件保存目录改为 {}", target.display()));
+        log::log_line(
+            "files",
+            &format!("接收文件保存目录改为 {}", target.display()),
+        );
         Ok(target)
     }
 
@@ -1095,7 +1101,12 @@ impl Node {
             });
             log::log_line(
                 "files",
-                &format!("接收完成：{}（{} 字节）→ {}", st.name, st.total, final_path.display()),
+                &format!(
+                    "接收完成：{}（{} 字节）→ {}",
+                    st.name,
+                    st.total,
+                    final_path.display()
+                ),
             );
         } else {
             let _ = std::fs::remove_file(&st.part_path);

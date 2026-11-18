@@ -33,7 +33,10 @@ pub fn spawn(node: Arc<Node>) -> tauri::async_runtime::JoinHandle<()> {
         let listener = match TcpListener::bind(("127.0.0.1", PORT)).await {
             Ok(l) => l,
             Err(e) => {
-                bluelink_services::log_line("api", &format!("本地 API 服务启动失败（端口 {PORT} 可能被占用）：{e}"));
+                bluelink_services::log_line(
+                    "api",
+                    &format!("本地 API 服务启动失败（端口 {PORT} 可能被占用）：{e}"),
+                );
                 return;
             }
         };

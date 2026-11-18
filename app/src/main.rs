@@ -136,9 +136,7 @@ impl ScanCentral {
         }
     }
 
-    async fn list_found(
-        &self,
-    ) -> Result<Vec<bluelink_transport::ble::FoundDevice>, String> {
+    async fn list_found(&self) -> Result<Vec<bluelink_transport::ble::FoundDevice>, String> {
         match self {
             ScanCentral::Ble(c) => c.list_found().await.map_err(|e| e.to_string()),
             ScanCentral::Classic(c) => c.list_found().map_err(|e| e.to_string()),
@@ -193,7 +191,10 @@ async fn bt_start_scan(
                 }
                 Err(e) => {
                     consecutive_errors += 1;
-                    bluelink_services::log_line(tag, &format!("扫描读取设备列表失败（第 {consecutive_errors} 次）：{e}"));
+                    bluelink_services::log_line(
+                        tag,
+                        &format!("扫描读取设备列表失败（第 {consecutive_errors} 次）：{e}"),
+                    );
                     if consecutive_errors >= 5 {
                         break;
                     }
@@ -1231,14 +1232,20 @@ fn main() {
                             while let Some(conn) = inbound.recv().await {
                                 // 宿主侧握手：校验对方给出的连接码是否为本机连接码
                                 if let Err(e) = node_in.attach(conn, true, "").await {
-                                    bluelink_services::log_line("ble", &format!("蓝牙入站连接握手失败：{e}"));
+                                    bluelink_services::log_line(
+                                        "ble",
+                                        &format!("蓝牙入站连接握手失败：{e}"),
+                                    );
                                 }
                             }
                         });
                         Some(Arc::new(srv))
                     }
                     Err(e) => {
-                        bluelink_services::log_line("ble", &format!("蓝牙服务端（广播）启动失败：{e}"));
+                        bluelink_services::log_line(
+                            "ble",
+                            &format!("蓝牙服务端（广播）启动失败：{e}"),
+                        );
                         server_error = Some(e.to_string());
                         None
                     }
@@ -1310,7 +1317,8 @@ fn main() {
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
                 use tauri::Manager as _;
-                let show_item = MenuItem::with_id(app, "tray_show", "打开 BlueLink", true, None::<&str>)?;
+                let show_item =
+                    MenuItem::with_id(app, "tray_show", "打开 BlueLink", true, None::<&str>)?;
                 let quit_item = MenuItem::with_id(app, "tray_quit", "退出", true, None::<&str>)?;
                 let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
                 let mut tray_builder = TrayIconBuilder::new()
@@ -1375,12 +1383,14 @@ fn main() {
                         tray_builder.build(app)
                     })) {
                         Ok(Ok(_tray)) => tray_ok = true,
-                        Ok(Err(e)) => {
-                            bluelink_services::log_line("app", &format!("系统托盘创建失败，已跳过：{e}"))
-                        }
-                        Err(_) => {
-                            bluelink_services::log_line("app", "系统托盘创建异常，已跳过（不影响使用）")
-                        }
+                        Ok(Err(e)) => bluelink_services::log_line(
+                            "app",
+                            &format!("系统托盘创建失败，已跳过：{e}"),
+                        ),
+                        Err(_) => bluelink_services::log_line(
+                            "app",
+                            "系统托盘创建异常，已跳过（不影响使用）",
+                        ),
                     }
                 } else {
                     bluelink_services::log_line(
@@ -1396,7 +1406,10 @@ fn main() {
                             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                                 api.prevent_close();
                                 let _ = win.hide();
-                                bluelink_services::log_line("app", "窗口关闭：已隐藏到系统托盘（应用继续运行）");
+                                bluelink_services::log_line(
+                                    "app",
+                                    "窗口关闭：已隐藏到系统托盘（应用继续运行）",
+                                );
                             }
                         });
                     }

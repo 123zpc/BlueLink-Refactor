@@ -16,7 +16,11 @@ pub fn init_log(data_dir: &std::path::Path) {
     }
     let (y, m, d, _, _, _) = now_parts();
     let path = dir.join(format!("bluelink-{y:04}-{m:02}-{d:02}.log"));
-    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         if let Ok(mut g) = LOG_FILE.lock() {
             *g = Some(f);
         }

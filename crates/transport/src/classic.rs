@@ -91,7 +91,7 @@ mod imp {
         accept, bind, closesocket, connect, getsockname, listen, recv, send, shutdown, socket,
         WSAGetLastError, WSASetServiceW, WSAStartup, CSADDR_INFO, INVALID_SOCKET,
         RNRSERVICE_DELETE, RNRSERVICE_REGISTER, SD_BOTH, SOCKADDR, SOCKET, SOCKET_ERROR,
-        SOCK_STREAM, WSAESETSERVICEOP, WSAQUERYSETW, WSADATA,
+        SOCK_STREAM, WSADATA, WSAESETSERVICEOP, WSAQUERYSETW,
     };
 
     /// 标准 SPP 服务 UUID（00001101-0000-1000-8000-00805F9B34FB），与老版本一致：
@@ -188,9 +188,8 @@ mod imp {
                 let mut off = 0usize;
                 let mut failed = false;
                 while off < bytes.len() {
-                    let n = unsafe {
-                        send(sock, bytes[off..].as_ptr(), (bytes.len() - off) as i32, 0)
-                    };
+                    let n =
+                        unsafe { send(sock, bytes[off..].as_ptr(), (bytes.len() - off) as i32, 0) };
                     if n <= 0 {
                         failed = true;
                         break;
@@ -245,8 +244,7 @@ mod imp {
             let generation = self.generation.clone();
             let found = self.found.clone();
             std::thread::spawn(move || {
-                while scanning.load(Ordering::SeqCst) && generation.load(Ordering::SeqCst) == gen
-                {
+                while scanning.load(Ordering::SeqCst) && generation.load(Ordering::SeqCst) == gen {
                     // 单轮失败（适配器忙等）不终止扫描，下一轮重试——与 BLE 轮询容错一致
                     if let Ok(devs) = run_inquiry() {
                         if let Ok(mut slot) = found.lock() {
@@ -496,7 +494,8 @@ mod imp {
                 // stop() 关监听 socket 时 accept 在此失败退出；其余错误同样结束本轮服务
                 break;
             }
-            let conn = conn_from_socket(client, format!("classic:{}", mac_to_string(peer_sa.btAddr)));
+            let conn =
+                conn_from_socket(client, format!("classic:{}", mac_to_string(peer_sa.btAddr)));
             if inbound_tx.blocking_send(conn).is_err() {
                 break; // 应用已退出
             }

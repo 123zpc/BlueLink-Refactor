@@ -298,7 +298,8 @@ impl Storage {
         let mut stmt = conn.prepare(
             "SELECT id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at
              FROM messages
-             WHERE body LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC LIMIT 200")?;
+             WHERE body LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC LIMIT 200",
+        )?;
         let rows = stmt.query_map(params![pattern], map_message)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -765,7 +766,8 @@ mod tests {
         let hits = s.search_messages("苹果").unwrap();
         assert_eq!(hits.len(), 30);
         // 中文子串必须能命中：整段无空格文本里的任意片段（FTS5 分词做不到，回归防线）
-        s.insert_message(&消息("mx", &c.id, "重建后复验消息", 100)).unwrap();
+        s.insert_message(&消息("mx", &c.id, "重建后复验消息", 100))
+            .unwrap();
         assert_eq!(s.search_messages("复验").unwrap().len(), 1);
         assert_eq!(s.search_messages("建后复").unwrap().len(), 1);
         assert_eq!(s.search_messages("不存在的词").unwrap().len(), 0);
