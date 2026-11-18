@@ -14,6 +14,7 @@ use tokio::sync::{oneshot, Mutex};
 /// 蓝牙不可用（无适配器/未开启）时对应字段为 None，界面据 bt_state 如实展示。
 struct AppState {
     node: Arc<Node>,
+    data_dir: std::path::PathBuf,
     ai_cancel: Mutex<Option<oneshot::Sender<()>>>,
     central: Option<Arc<bluelink_transport::ble::BleCentral>>,
     server: Option<Arc<bluelink_transport::ble::BleServer>>,
@@ -239,6 +240,35 @@ async fn send_file_path(state: State<'_, AppState>, path: String) -> Result<Stri
         .map_err(|e| e.to_string())
 }
 
+/// 把一段文本（代码/长文）落成本地文档后按文件发送：前端负责识别类型与命名，
+/// 这里消毒文件名防路径穿越，写入数据目录的 outbox 再走文件引擎发送。
+#[tauri::command]
+async fn send_document(
+    state: State<'_, AppState>,
+    name: String,
+    content: String,
+) -> Result<String, String> {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = safe.trim_matches('.').to_string();
+    if safe.is_empty() || !safe.contains('.') {
+        return Err("文件名无效".into());
+    }
+    let dir = state.data_dir.join("outbox");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(&safe);
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    state.node.send_file(&path).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn send_typing(state: State<'_, AppState>, typing: bool) -> Result<(), String> {
     state.node.send_typing(typing).await;
@@ -301,6 +331,19 @@ fn get_message_tags(state: State<'_, AppState>, message_id: String) -> Result<Ve
 #[tauri::command]
 fn list_tags(state: State<'_, AppState>) -> Result<Vec<Tag>, String> {
     state.node.storage.list_tags().map_err(|e| e.to_string())
+}
+
+/// 设置标签颜色（调色板序号 0–8，0 为默认），供聊天页右上角彩签自定义颜色。
+#[tauri::command]
+fn set_tag_color(state: State<'_, AppState>, tag: String, color: i64) -> Result<(), String> {
+    if !(0..=8).contains(&color) {
+        return Err("颜色序号无效".into());
+    }
+    state
+        .node
+        .storage
+        .set_tag_color(&tag, color)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -618,6 +661,7 @@ fn main() {
             });
             app.manage(AppState {
                 node,
+                data_dir,
                 ai_cancel: Mutex::new(None),
                 central,
                 server,
@@ -639,6 +683,7 @@ fn main() {
             disconnect,
             send_text,
             send_file_path,
+            send_document,
             send_typing,
             list_conversations,
             list_messages,
@@ -646,6 +691,7 @@ fn main() {
             set_message_tags,
             get_message_tags,
             list_tags,
+            set_tag_color,
             list_messages_by_tag,
             toggle_mark,
             list_marked,

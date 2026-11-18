@@ -57,40 +57,15 @@ function fmtSize(n) {
 }
 const STATUS_CN = { sending: "发送中", sent: "已发送", delivered: "已送达", received: "", failed: "发送失败" };
 
-const AVATAR_COLORS = ["#2563EB", "#0E7490", "#047857", "#B45309", "#BE123C", "#475569"];
-function avatarColor(key) {
-  let h = 0;
-  for (const ch of String(key || "?")) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return AVATAR_COLORS[h % AVATAR_COLORS.length];
-}
 function iconUse(name, cls = "ico ico-16") {
   return `<svg class="${cls}"><use href="#${name}"/></svg>`;
 }
-/** 头像：AI 用机器人图标，本机用“我”，对端用名称首字 + 按名称派生的底色。 */
-function buildAvatarEl(m, opts = {}) {
-  const av = document.createElement("div");
-  if (opts.ai && m.sender === "ai") {
-    av.className = "avatar avatar-32 avatar-ai";
-    av.innerHTML = iconUse("i-bot", "ico ico-18");
-  } else if (m.sender === "me") {
-    av.className = "avatar avatar-32 avatar-me";
-    av.textContent = "我";
-  } else {
-    const name = state.peerName || "对方";
-    av.className = "avatar avatar-32";
-    av.style.background = avatarColor(name);
-    av.textContent = name.slice(0, 1);
-  }
-  return av;
-}
-
-/** 构建一条消息的 DOM。opts.ai 表示 AI 会话样式。 */
+/** 构建一条消息的 DOM（无头像，靠左右对齐与底色区分双方）。opts.ai 表示 AI 会话样式。 */
 function buildMessageEl(m, opts = {}) {
   const row = document.createElement("div");
   row.className = "msg-row" + (m.sender === "me" ? " me" : "");
   row.dataset.mid = m.id;
   row.dataset.sender = m.sender;
-  row.appendChild(buildAvatarEl(m, opts));
   const wrap = document.createElement("div");
   wrap.className = "msg";
   const bubble = document.createElement("div");
@@ -100,6 +75,20 @@ function buildMessageEl(m, opts = {}) {
     state.lastFileBubble = bubble;
   } else if (opts.ai && m.sender === "ai") {
     bubble.innerHTML = md(m.body);
+  } else if (m.body.length > 500 || m.body.split("\n").length > 10) {
+    // 长文本默认折叠，避免单个气泡刷屏，需要时点开全文
+    const textDiv = document.createElement("div");
+    textDiv.className = "msg-text collapsed";
+    textDiv.textContent = m.body;
+    const tg = document.createElement("button");
+    tg.className = "bubble-toggle";
+    tg.textContent = "展开全文";
+    tg.addEventListener("click", () => {
+      const collapsed = textDiv.classList.toggle("collapsed");
+      tg.textContent = collapsed ? "展开全文" : "收起";
+    });
+    bubble.appendChild(textDiv);
+    bubble.appendChild(tg);
   } else {
     bubble.textContent = m.body;
   }
@@ -139,6 +128,8 @@ async function refreshMessageTags(mid, span) {
       const chip = document.createElement("span");
       chip.className = "tag-chip";
       chip.textContent = t;
+      const chipHex = (state.tagColorMap || {})[t.toLowerCase()];
+      if (chipHex) { chip.style.borderColor = chipHex; chip.style.color = chipHex; }
       chip.addEventListener("click", () => openTagDrawer(t));
       span.appendChild(chip);
     }
@@ -160,7 +151,7 @@ function appendMessage(container, m, renderedSet, opts) {
   }
   const el = buildMessageEl(m, opts);
   el.dataset.ts = m.created_at;
-  // 消息分组：同日、同发送者、间隔 < 5 分钟时收起头像并压缩间距
+  // 消息分组：同日、同发送者、间隔 < 5 分钟时压缩间距
   if (!newDay && last && last.dataset.sender === m.sender && m.created_at - lastTs < 5 * 60 * 1000) {
     el.classList.add("grouped");
   }
@@ -211,6 +202,22 @@ function switchView(view) {
 document.querySelectorAll(".nav-item").forEach((b) =>
   b.addEventListener("click", () => switchView(b.dataset.view)));
 
+// ---------- 中间列表收起/展开（长期只连同一台设备时可收起，状态记忆） ----------
+function applyAsideCollapsed() {
+  const collapsed = localStorage.getItem("bl-aside") === "collapsed";
+  $("aside").classList.toggle("hidden", collapsed);
+  $("btn-expand-aside").classList.toggle("hidden", !collapsed);
+}
+$("btn-collapse-aside").addEventListener("click", () => {
+  localStorage.setItem("bl-aside", "collapsed");
+  applyAsideCollapsed();
+});
+$("btn-expand-aside").addEventListener("click", () => {
+  localStorage.setItem("bl-aside", "open");
+  applyAsideCollapsed();
+});
+applyAsideCollapsed();
+
 // ---------- 会话列表 ----------
 async function loadConversations() {
   const convs = await invoke("list_conversations");
@@ -220,10 +227,7 @@ async function loadConversations() {
     if (c.kind === "peer") state.peerConvId = c.id;
     const item = document.createElement("div");
     item.className = "list-item conv-item";
-    const avatar = c.kind === "ai"
-      ? `<span class="avatar avatar-40 avatar-ai">${iconUse("i-bot", "ico ico-20")}</span>`
-      : `<span class="avatar avatar-40" style="background:${avatarColor(c.title)}">${esc(c.title.slice(0, 1))}</span>`;
-    item.innerHTML = `${avatar}<span class="li-main"><span class="li-title"><span>${esc(c.title)}</span></span><span class="li-sub">${c.kind === "ai" ? "AI 会话" : "设备会话"}</span></span>`;
+    item.innerHTML = `<span class="li-main"><span class="li-title"><span>${esc(c.title)}</span></span><span class="li-sub">${c.kind === "ai" ? "AI 会话" : "设备会话"}</span></span>`;
     item.addEventListener("click", () => switchView(c.kind === "ai" ? "ai" : "chat"));
     list.appendChild(item);
   }
@@ -232,6 +236,7 @@ async function loadConversations() {
 // ---------- 聊天 ----------
 async function loadChatMessages() {
   if (!state.peerConvId) return;
+  await refreshTagRibbon();
   const msgs = await invoke("list_messages", { conversationId: state.peerConvId, limit: 200 });
   const container = $("messages");
   container.innerHTML = "";
@@ -293,16 +298,81 @@ function setReply(m) {
   $("input").focus();
 }
 
+// ---------- 代码/长文本识别：自动转成对应后缀的文档发送 ----------
+let docSuggestion = null; // {name, kind: "code" | "long"}
+let docDismissed = false; // 用户对当前内容选择了「仍按文本发送」
+
+const FENCE_EXT = { rust: "rs", rs: "rs", python: "py", py: "py", javascript: "js", js: "js", typescript: "ts", ts: "ts", go: "go", java: "java", c: "c", cpp: "cpp", "c++": "cpp", json: "json", html: "html", css: "css", markdown: "md", md: "md", shell: "sh", bash: "sh", sh: "sh", text: "txt", txt: "txt" };
+const CODE_SIGNALS = [
+  { re: /^\s*(pub\s+)?(async\s+)?fn\s+\w+\s*\(|^\s*use\s+[\w:]+;|\w+\s*->\s*[\w&]+\s*\{?\s*$/, name: "代码片段.rs" },
+  { re: /^\s*def\s+\w+\s*\(|^\s*(import|from)\s+[\w.]+|^\s*class\s+\w+.*:\s*$/, name: "代码片段.py" },
+  { re: /^\s*(function|const|let|var)\s+\w+|=>\s*\{|console\.log\(/, name: "代码片段.js" },
+  { re: /^\s*package\s+[\w.]+;|^\s*public\s+(final\s+)?(class|static)/, name: "代码片段.java" },
+  { re: /^#include\s*[<"]|^\s*int\s+main\s*\(/, name: "代码片段.c" },
+  { re: /^\s*package\s+main\b|^\s*func\s+\w+\s*\(/, name: "代码片段.go" },
+];
+
+/** 识别输入内容是否应转文档：围栏代码块 / 代码特征 / 超长纯文本。返回 {name, kind} 或 null。 */
+function detectDocument(text) {
+  const t = text.trim();
+  if (t.length < 60) return null;
+  const fence = t.match(/^```([a-zA-Z0-9+#-]*)\s*\n/);
+  if (fence) {
+    const ext = FENCE_EXT[(fence[1] || "txt").toLowerCase()] || "txt";
+    return { name: "代码片段." + ext, kind: "code" };
+  }
+  const lines = t.split("\n");
+  if (lines.length >= 4) {
+    let codeLines = 0;
+    let firstName = null;
+    for (const line of lines) {
+      for (const s of CODE_SIGNALS) {
+        if (s.re.test(line)) { codeLines++; if (!firstName) firstName = s.name; break; }
+      }
+    }
+    const braceLines = lines.filter((l) => /[{};]\s*$/.test(l.trim())).length;
+    if (codeLines >= 2 || (codeLines >= 1 && braceLines >= 3)) {
+      return { name: firstName || "代码片段.txt", kind: "code" };
+    }
+  }
+  if (t.length > 1000) return { name: "长文.md", kind: "long" };
+  return null;
+}
+
+function updateDocBar() {
+  docSuggestion = docDismissed ? null : detectDocument($("input").value);
+  if (docSuggestion) {
+    $("doc-bar-text").textContent = docSuggestion.kind === "code"
+      ? `检测到代码，将作为文件发送：${docSuggestion.name}`
+      : `内容较长，将作为文档发送：${docSuggestion.name}`;
+    $("doc-bar").classList.remove("hidden");
+  } else {
+    $("doc-bar").classList.add("hidden");
+  }
+}
+$("doc-bar-cancel").addEventListener("click", () => { docDismissed = true; updateDocBar(); });
+$("input").addEventListener("paste", () => setTimeout(updateDocBar, 0));
+
 async function sendCurrent() {
-  const text = $("input").value.trim();
+  const raw = $("input").value;
+  const text = raw.trim();
   if (!text) return;
+  const asDoc = docSuggestion;
+  const replyTo = state.replyTo;
   $("input").value = "";
+  docDismissed = false;
+  updateDocBar();
+  state.replyTo = null;
+  $("reply-bar").classList.add("hidden");
+  invoke("save_draft", { conversationId: state.peerConvId, text: "" }).catch(() => {});
   try {
-    const m = await invoke("send_text", { text, replyTo: state.replyTo });
-    appendMessage($("messages"), m, state.renderedChat, {});
-    state.replyTo = null;
-    $("reply-bar").classList.add("hidden");
-    invoke("save_draft", { conversationId: state.peerConvId, text: "" }).catch(() => {});
+    if (asDoc) {
+      // 转文档发送：文件气泡由后端事件回推，与选文件发送一致
+      await invoke("send_document", { name: asDoc.name, content: raw });
+    } else {
+      const m = await invoke("send_text", { text, replyTo });
+      appendMessage($("messages"), m, state.renderedChat, {});
+    }
   } catch (e) {
     alert("发送失败：" + e);
   }
@@ -314,6 +384,7 @@ $("input").addEventListener("keydown", (e) => {
 });
 let typingTimer = null, draftTimer = null;
 $("input").addEventListener("input", () => {
+  updateDocBar();
   invoke("send_typing", { typing: true }).catch(() => {});
   clearTimeout(typingTimer);
   typingTimer = setTimeout(() => invoke("send_typing", { typing: false }).catch(() => {}), 1500);
@@ -448,7 +519,7 @@ async function loadTagList() {
   for (const t of tags) {
     const item = document.createElement("div");
     item.className = "list-item";
-    item.innerHTML = `<div class="li-title"><span><span class="tag-dot"></span>${esc(t.name)}</span><span class="muted">${t.count}</span></div>`;
+    item.innerHTML = `<div class="li-title"><span><span class="tag-dot" style="background:${tagColorHex(t.color) || "var(--muted)"}"></span>${esc(t.name)}</span><span class="muted">${t.count}</span></div>`;
     item.addEventListener("click", () => openTagDrawer(t.name));
     list.appendChild(item);
   }
@@ -540,6 +611,102 @@ $("tag-save").addEventListener("click", async () => {
   const row = document.querySelector(`[data-mid="${state.tagEditId}"] .msg-tags`);
   if (row) refreshMessageTags(state.tagEditId, row);
   if (state.view === "tags") loadTagList();
+  refreshTagRibbon();
+});
+
+// ---------- 聊天页右上角标签彩签 ----------
+// 调色板序号与存储层 tags.color 对应：0 默认，其余为彩签颜色。
+const TAG_PALETTE = [null, "#E11D48", "#EA580C", "#CA8A04", "#059669", "#0891B2", "#2563EB", "#7C3AED", "#DB2777"];
+function tagColorHex(idx) { return TAG_PALETTE[idx || 0] || null; }
+
+state.tagColorMap = {};  // 标签名（小写）→ 颜色 hex 或 null，供消息内标签小签着色
+state.ribbonMsgs = {};   // 标签名 → 本会话内消息 id 数组（时间正序）
+state.ribbonCycle = {};  // 标签名 → 已定位次数（连点轮换）
+
+/** 刷新彩签：只显示当前设备会话里出现过的标签；平时半透明不挡聊天，悬浮时凸显；点签定位，连点往前轮换。 */
+async function refreshTagRibbon() {
+  const ribbon = $("tag-ribbon");
+  if (!ribbon) return;
+  ribbon.innerHTML = "";
+  state.ribbonMsgs = {};
+  if (!state.peerConvId) return;
+  let tags = [];
+  try { tags = await invoke("list_tags"); } catch (_) { return; }
+  state.tagColorMap = {};
+  for (const t of tags) state.tagColorMap[t.name.toLowerCase()] = tagColorHex(t.color);
+  for (const t of tags) {
+    if (!t.count) continue;
+    let msgs = [];
+    try { msgs = await invoke("list_messages_by_tag", { tag: t.name }); } catch (_) { continue; }
+    const ids = msgs.filter((m) => m.conversation_id === state.peerConvId).map((m) => m.id);
+    if (!ids.length) continue;
+    state.ribbonMsgs[t.name] = ids;
+    const hex = tagColorHex(t.color);
+    const tab = document.createElement("div");
+    tab.className = "ribbon-tab";
+    if (hex) tab.style.borderLeft = `3px solid ${hex}`;
+    const dot = document.createElement("button");
+    dot.className = "r-dot";
+    dot.title = "设置标签颜色";
+    dot.style.background = hex || "var(--muted)";
+    dot.addEventListener("click", (e) => { e.stopPropagation(); openTagColorPop(t, tab); });
+    const name = document.createElement("span");
+    name.className = "r-name";
+    name.textContent = t.name;
+    const count = document.createElement("span");
+    count.className = "r-count";
+    count.textContent = ids.length;
+    tab.append(dot, name, count);
+    tab.title = `定位到「${t.name}」标记的消息（连点往前轮换）`;
+    tab.addEventListener("click", () => {
+      const list = state.ribbonMsgs[t.name] || [];
+      if (!list.length) return;
+      const n = (state.ribbonCycle[t.name] || 0) + 1;
+      state.ribbonCycle[t.name] = n;
+      const id = list[list.length - 1 - ((n - 1) % list.length)];
+      locateMessage(state.peerConvId, id);
+    });
+    ribbon.appendChild(tab);
+  }
+}
+
+/** 标签颜色选择弹层：默认 + 8 色，点选即保存，并刷新彩签与已渲染消息的标签着色。 */
+function openTagColorPop(tag, anchor) {
+  const pop = $("tag-color-pop");
+  pop.innerHTML = "";
+  const title = document.createElement("div");
+  title.className = "pop-title";
+  title.textContent = `「${tag.name}」的颜色`;
+  pop.appendChild(title);
+  const row = document.createElement("div");
+  row.className = "swatches";
+  TAG_PALETTE.forEach((hex, idx) => {
+    const b = document.createElement("button");
+    b.className = "swatch" + (idx === (tag.color || 0) ? " sel" : "") + (idx === 0 ? " default" : "");
+    if (hex) b.style.background = hex; else b.textContent = "默";
+    b.title = idx === 0 ? "默认" : hex;
+    b.addEventListener("click", async () => {
+      try { await invoke("set_tag_color", { tag: tag.name, color: idx }); }
+      catch (e) { alert("设置颜色失败：" + e); }
+      pop.classList.add("hidden");
+      refreshTagRibbon();
+      document.querySelectorAll(".msg-row").forEach((r) => {
+        const span = r.querySelector(".msg-tags");
+        if (span && r.dataset.mid) refreshMessageTags(r.dataset.mid, span);
+      });
+    });
+    row.appendChild(b);
+  });
+  pop.appendChild(row);
+  const view = $("chat-view").getBoundingClientRect();
+  const r = anchor.getBoundingClientRect();
+  pop.style.top = Math.max(64, r.top - view.top) + "px";
+  pop.classList.remove("hidden");
+}
+// 点到弹层之外时关闭
+document.addEventListener("click", (e) => {
+  const pop = $("tag-color-pop");
+  if (pop && !pop.classList.contains("hidden") && !pop.contains(e.target)) pop.classList.add("hidden");
 });
 
 // ---------- 搜索 ----------
@@ -705,11 +872,6 @@ async function wireEvents() {
     state.peerName = e.payload.peer_name;
     $("peer-name").textContent = state.peerName || "未连接";
     $("peer-state").textContent = state.connected ? "已连接" : "离线";
-    const pav = $("peer-avatar");
-    if (state.peerName) {
-      pav.textContent = state.peerName.slice(0, 1);
-      pav.style.background = avatarColor(state.peerName);
-    }
     $("connect-status").textContent = state.connected ? "" : $("connect-status").textContent;
     await loadConversations();
     if (state.connected) { switchView("chat"); loadChatMessages(); }
@@ -754,7 +916,7 @@ async function wireEvents() {
     if (!state.streamEl) {
       const row = document.createElement("div");
       row.className = "msg-row";
-      row.innerHTML = `<div class="avatar avatar-32 avatar-ai">${iconUse("i-bot", "ico ico-18")}</div><div class="msg"><div class="bubble"></div></div>`;
+      row.innerHTML = `<div class="msg"><div class="bubble"></div></div>`;
       container.appendChild(row);
       state.streamEl = row.querySelector(".bubble");
     }
@@ -791,6 +953,23 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
   invoke("get_dev_mode").then(applyDevMode).catch(() => {});
   // 事件订阅失败不能拖垮其余启动流程（v2.0.0 曾因缺权限配置导致实时事件全灭）。
   try { await wireEvents(); } catch (e) { console.error("事件订阅失败", e); }
+  // 拖拽文件到窗口直接发送（需已连接）；拖放提示层只做视觉提示，不拦截事件。
+  try {
+    await window.__TAURI__.webview.getCurrentWebview().onDragDropEvent((e) => {
+      const p = e.payload || {};
+      if (p.type === "enter" || p.type === "over") {
+        $("drop-overlay").classList.remove("hidden");
+      } else if (p.type === "drop") {
+        $("drop-overlay").classList.add("hidden");
+        if (!state.connected) { alert("尚未连接设备，无法发送文件"); return; }
+        for (const path of p.paths || []) {
+          invoke("send_file_path", { path }).catch((err) => alert("文件发送失败：" + err));
+        }
+      } else {
+        $("drop-overlay").classList.add("hidden");
+      }
+    });
+  } catch (e) { console.error("拖拽监听注册失败", e); }
   await loadConversations();
   if (state.identity.connected) {
     state.connected = true;

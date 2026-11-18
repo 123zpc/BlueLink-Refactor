@@ -75,7 +75,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 
 /* 列表区 */
 #aside { width: 288px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex: none; }
-.aside-head { padding: 12px; border-bottom: 1px solid var(--border); }
+.aside-head { padding: 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; }
+.aside-head .search-box { flex: 1; }
 .search-box { display: flex; align-items: center; gap: 7px; background: var(--bg);
   border: 1px solid var(--border); border-radius: 8px; padding: 0 10px; color: var(--muted); }
 .search-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); color: var(--accent); }
@@ -284,3 +285,45 @@ section { display: flex; flex-direction: column; height: 100%; }
 #tag-list::-webkit-scrollbar-thumb, #fav-list::-webkit-scrollbar-thumb, #drawer-list::-webkit-scrollbar-thumb,
 #palette-list::-webkit-scrollbar-thumb, .settings-body::-webkit-scrollbar-thumb {
   background: var(--border-strong); border-radius: 4px; }
+
+/* ===== v2.1.0：列表收起 / 长文本折叠 / 文档提示条 / 拖放层 / 标签彩签 ===== */
+#btn-expand-aside { width: 22px; flex: none; border: none; border-right: 1px solid var(--border);
+  background: var(--panel); color: var(--muted); cursor: pointer; display: flex;
+  align-items: flex-start; justify-content: center; padding-top: 14px; }
+#btn-expand-aside:hover { color: var(--accent); background: var(--hover); }
+#chat-view { position: relative; }
+.msg-text.collapsed { max-height: 168px; overflow: hidden; }
+.bubble-toggle { display: block; margin-top: 6px; padding: 0; background: none; border: none;
+  color: var(--accent); font-size: 12.5px; cursor: pointer; }
+.msg-row.me .bubble-toggle { color: #fff; text-decoration: underline; }
+#doc-bar { display: flex; align-items: center; gap: 10px; padding: 7px 12px; margin-bottom: 8px;
+  background: var(--accent-soft); color: var(--accent); border-radius: 8px; font-size: 13px; }
+#doc-bar span { flex: 1; }
+#drop-overlay { position: fixed; inset: 0; background: rgba(37, 99, 235, 0.08); z-index: 60;
+  display: flex; align-items: center; justify-content: center; pointer-events: none; }
+#drop-overlay .drop-inner { border: 2px dashed var(--accent); border-radius: 12px;
+  padding: 34px 48px; font-size: 16px; color: var(--accent); background: var(--panel); }
+#tag-ribbon { position: absolute; right: 0; top: 76px; z-index: 6; display: flex;
+  flex-direction: column; gap: 6px; align-items: flex-end; }
+.ribbon-tab { display: flex; align-items: center; gap: 6px; max-width: 160px; padding: 5px 9px;
+  background: var(--panel); border: 1px solid var(--border); border-right: none;
+  border-radius: 8px 0 0 8px; font-size: 12.5px; color: var(--text); cursor: pointer;
+  opacity: 0.55; transform: translateX(4px);
+  transition: opacity 0.15s, transform 0.15s, box-shadow 0.15s; }
+#tag-ribbon:hover .ribbon-tab { opacity: 1; transform: translateX(0); box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12); }
+.ribbon-tab .r-dot { width: 11px; height: 11px; border-radius: 50%; border: none; flex: none;
+  cursor: pointer; padding: 0; }
+.ribbon-tab .r-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ribbon-tab .r-count { color: var(--muted); font-size: 11px; }
+#tag-color-pop { position: absolute; right: 12px; z-index: 7; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16); }
+#tag-color-pop .pop-title { font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
+#tag-color-pop .swatches { display: flex; gap: 6px; }
+#tag-color-pop .swatch { width: 22px; height: 22px; border-radius: 50%;
+  border: 2px solid transparent; cursor: pointer; padding: 0; }
+#tag-color-pop .swatch.sel { border-color: var(--text); }
+#tag-color-pop .swatch.default { background: var(--hover); color: var(--muted); font-size: 11px;
+  display: flex; align-items: center; justify-content: center; }
+.tag-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  margin-right: 7px; background: var(--muted); }

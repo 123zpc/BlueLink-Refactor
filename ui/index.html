@@ -31,6 +31,8 @@
     <symbol id="i-quote" viewBox="0 0 24 24"><path d="M3 21c3 0 7-1 7-8V5c0-1.25-.756-2.017-2-2H4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2 1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1z"/><path d="M15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h.75c0 2.25.25 4-2.75 4v3c0 1 0 1 1 1z"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    <symbol id="i-chevrons-left" viewBox="0 0 24 24"><path d="m11 17-5-5 5-5"/><path d="m18 17-5-5 5-5"/></symbol>
+    <symbol id="i-chevrons-right" viewBox="0 0 24 24"><path d="m6 17 5-5-5-5"/><path d="m13 17 5-5-5-5"/></symbol>
   </defs>
 </svg>
 
@@ -53,12 +55,14 @@
         <svg class="ico ico-16"><use href="#i-search"/></svg>
         <input id="search-input" type="text" placeholder="搜索消息">
       </div>
+      <button id="btn-collapse-aside" class="icon-btn" title="收起列表"><svg class="ico ico-16"><use href="#i-chevrons-left"/></svg></button>
     </div>
     <div id="search-results" class="hidden"></div>
     <div id="conv-list"></div>
     <div id="tag-list" class="hidden"></div>
     <div id="fav-list" class="hidden"></div>
   </aside>
+  <button id="btn-expand-aside" class="hidden" title="展开会话列表"><svg class="ico ico-16"><use href="#i-chevrons-right"/></svg></button>
 
   <!-- 内容区 -->
   <main id="main">
@@ -95,6 +99,7 @@
         </div>
         <div id="bt-device-list"></div>
         <p id="bt-empty" class="muted small">点「扫描」查找附近打开了 BlueLink 的设备。</p>
+        <p class="muted small">连接方式：点选上面一台设备，下方会出现连接码输入框，填对方设备上显示的 6 位连接码即可连接。</p>
 
         <div id="bt-code-row" class="hidden">
           <input id="bt-peer-code" type="text" placeholder="输入对方连接码（6 位）" maxlength="7" inputmode="numeric">
@@ -123,7 +128,6 @@
     <section id="chat-view" class="hidden">
       <header class="chat-head">
         <div class="head-peer">
-          <div id="peer-avatar" class="avatar avatar-36">?</div>
           <div>
             <div id="peer-name" class="chat-title">未连接</div>
             <div id="peer-state" class="muted small">离线</div>
@@ -136,10 +140,16 @@
       </header>
       <div id="pin-bar" class="hidden"></div>
       <div id="messages"></div>
+      <div id="tag-ribbon"></div>
+      <div id="tag-color-pop" class="hidden"></div>
       <div id="date-rail"></div>
       <div id="typing-hint" class="muted small hidden">对方正在输入…</div>
       <div id="composer">
         <div id="reply-bar" class="hidden"></div>
+        <div id="doc-bar" class="hidden">
+          <span id="doc-bar-text"></span>
+          <button id="doc-bar-cancel" class="btn small-btn">仍按文本发送</button>
+        </div>
         <div class="composer-row">
           <button id="btn-file" class="icon-btn" title="发送文件"><svg class="ico"><use href="#i-clip"/></svg></button>
           <textarea id="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
@@ -152,7 +162,6 @@
     <section id="ai-view" class="hidden">
       <header class="chat-head">
         <div class="head-peer">
-          <div class="avatar avatar-36 avatar-ai"><svg class="ico ico-20"><use href="#i-bot"/></svg></div>
           <div>
             <div class="chat-title">AI 助手</div>
             <div id="ai-state" class="muted small">本机配置优先，未配置时经对方电脑代理</div>
@@ -247,6 +256,7 @@
     </div>
   </div>
 </div>
+<div id="drop-overlay" class="hidden"><div class="drop-inner">释放鼠标，把文件发给对方</div></div>
 <script src="app.js"></script>
 </body>
 </html>

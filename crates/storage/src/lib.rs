@@ -283,6 +283,16 @@ impl Storage {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// 设置标签颜色（调色板序号，0 为默认）。标签不存在时静默无操作。
+    pub fn set_tag_color(&self, name: &str, color: i64) -> Result<(), StorageError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE tags SET color=?1 WHERE name=?2 COLLATE NOCASE",
+            params![color, name],
+        )?;
+        Ok(())
+    }
+
     /// 某标签下的全部消息（按时间正序，供抽屉列表与定位）。
     pub fn list_messages_by_tag(&self, tag_name: &str) -> Result<Vec<Message>, StorageError> {
         let conn = self.lock();
