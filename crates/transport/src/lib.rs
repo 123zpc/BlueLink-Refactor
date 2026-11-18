@@ -1,10 +1,13 @@
 //! 传输层：把协议帧跑在某种字节流上。
 //! 产品通道：经典蓝牙 RFCOMM（见 classic 模块，Windows；老版本验证过的机制）与
 //! BLE（见 ble 模块，广播/扫描/GATT 字节流）。两者产出同一个 Conn，服务层不区分。
+//! SimpleBLE（见 simpleble 模块）是第三个 BLE 实现，与 ble 模块同语义，
+//! 仅开发者模式可选，且需构建时开启 simpleble feature 才真正编译进来。
 //! TCP 与进程内环回仅供开发测试（node-cli 与自动化测试），不进入产品界面。
 
 pub mod ble;
 pub mod classic;
+pub mod simpleble;
 
 use bluelink_protocol::{read_frame, write_frame, Frame, ProtocolError};
 use std::sync::Arc;

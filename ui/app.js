@@ -696,9 +696,11 @@ $("btn-file").addEventListener("click", async () => {
 $("btn-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
 
 // ---------- 连接（蓝牙） ----------
-// 传输选择（仅开发者模式可用，存设置键 bt_transport）："classic" 经典蓝牙 / "ble"。
+// 传输选择（仅开发者模式可用，存设置键 bt_transport）：
+// "classic" 经典蓝牙 / "ble" BLE / "simpleble" SimpleBLE（第三套实现，实验）。
 // 普通模式连接页不出现选择，固定走经典蓝牙（用户 2026-11-18 定版）；
 // 非 Windows 没有经典通道（classic_available 为假）时一律回落 BLE。
+// SimpleBLE 未编译进当前版本时，后端会如实回落经典蓝牙并在状态文案里写明。
 let btTransport = "classic"; // 开发者模式里选定的传输（启动时从设置读回）
 let btClassicAvailable = false;
 let btStateLoaded = false;
@@ -706,11 +708,14 @@ let btStateLoaded = false;
 function syncTransportSeg() {
   $("seg-classic").classList.toggle("active", btTransport === "classic");
   $("seg-ble").classList.toggle("active", btTransport === "ble");
+  $("seg-simpleble").classList.toggle("active", btTransport === "simpleble");
   $("seg-classic").disabled = !btClassicAvailable;
 }
 
-/** 本次扫描/连接实际用的传输：经典不可用时恒 BLE；普通模式恒经典；开发者模式用所选。 */
+/** 本次扫描/连接实际用的传输：开发者模式选了 SimpleBLE 就直传（后端负责未编译回落）；
+ * 经典不可用时恒 BLE；普通模式恒经典；开发者模式用所选。 */
 function effectiveTransport() {
+  if (state.devMode && btTransport === "simpleble") return "simpleble";
   if (!btClassicAvailable) return "ble";
   return state.devMode ? btTransport : "classic";
 }
@@ -735,6 +740,7 @@ async function switchTransport(t) {
 }
 $("seg-classic").addEventListener("click", () => switchTransport("classic"));
 $("seg-ble").addEventListener("click", () => switchTransport("ble"));
+$("seg-simpleble").addEventListener("click", () => switchTransport("simpleble"));
 
 async function refreshBtState() {
   try {
@@ -742,8 +748,15 @@ async function refreshBtState() {
     btClassicAvailable = !!s.classic_available;
     btStateLoaded = true;
     // 传输选择行仅开发者模式显示，普通模式连接页保持干净
-    $("bt-transport-row").classList.toggle("hidden", !(state.devMode && (s.classic_available || s.available)));
+    $("bt-transport-row").classList.toggle("hidden", !(state.devMode && (s.classic_available || s.available || s.simpleble_available)));
     syncTransportSeg();
+    if (effectiveTransport() === "simpleble") {
+      // SimpleBLE 状态如实展示：未编译时后端文案会写明已回落经典蓝牙
+      $("bt-status-text").textContent = s.simpleble_message;
+      $("bt-status-dot").className = "status-dot" + (s.simpleble_serving ? " on" : s.simpleble_available || !s.simpleble_compiled ? " warn" : " off");
+      $("btn-scan").disabled = false;
+      return;
+    }
     if (effectiveTransport() === "classic") {
       $("bt-status-text").textContent = s.classic_message;
       $("bt-status-dot").className = "status-dot" + (s.classic_serving ? " on" : " warn");
@@ -847,12 +860,12 @@ async function loadLastPeer() {
     const raw = await invoke("get_last_peer");
     const p = raw ? JSON.parse(raw) : null;
     if (!p || !p.name) { box.classList.add("hidden"); return; }
-    // 局域网记录只在开发者模式下可用（与局域网测试区一致），关了开发者模式就不显示
-    if (p.transport === "lan" && !state.devMode) { box.classList.add("hidden"); return; }
+    // 局域网与 SimpleBLE 记录只在开发者模式下可用（与各自的入口一致），关了开发者模式就不显示
+    if ((p.transport === "lan" || p.transport === "simpleble") && !state.devMode) { box.classList.add("hidden"); return; }
     state.lastPeer = p;
     $("last-peer-name").textContent = p.name;
     const when = p.ts ? (() => { const d = new Date(p.ts); const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`; })() : "";
-    $("last-peer-sub").textContent = `${p.transport === "lan" ? "局域网" : p.transport === "classic" ? "经典蓝牙" : "BLE"}${when ? " · 上次 " + when : ""}`;
+    $("last-peer-sub").textContent = `${p.transport === "lan" ? "局域网" : p.transport === "classic" ? "经典蓝牙" : p.transport === "simpleble" ? "SimpleBLE" : "BLE"}${when ? " · 上次 " + when : ""}`;
     $("last-peer-ico").setAttribute("href", p.transport === "lan" ? "#i-wifi" : "#i-bt");
     $("last-peer-status").textContent = "";
     box.classList.remove("hidden");
@@ -879,8 +892,9 @@ $("last-peer-connect").addEventListener("click", async () => {
       $("connect-error").textContent = String(e);
     }
   } else {
-    // 按记录里的通道重连：经典记录走经典扫描（Inquiry 含已记住设备），BLE 记录走 BLE 扫描
-    const t = p.transport === "classic" ? "classic" : "ble";
+    // 按记录里的通道重连：经典记录走经典扫描（Inquiry 含已记住设备），
+    // BLE 记录走 BLE 扫描，SimpleBLE 记录走 SimpleBLE 扫描（未编译时后端回落）
+    const t = p.transport === "classic" ? "classic" : p.transport === "simpleble" ? "simpleble" : "ble";
     btTransport = t;
     syncTransportSeg();
     refreshBtState();
@@ -968,7 +982,7 @@ $("btn-bt-connect").addEventListener("click", async () => {
   if (!code) { $("connect-error").textContent = "请输入对方的连接码"; return; }
   if (!btStateLoaded) await refreshBtState();
   const t = effectiveTransport();
-  $("connect-status").textContent = `正在通过${t === "classic" ? "经典蓝牙" : "蓝牙"}连接「${state.btDeviceName || "对方设备"}」…`;
+  $("connect-status").textContent = `正在通过${t === "classic" ? "经典蓝牙" : t === "simpleble" ? "SimpleBLE" : "蓝牙"}连接「${state.btDeviceName || "对方设备"}」…`;
   try {
     await invoke("bt_connect", { deviceId: state.btDevice, code, transport: t });
     saveLastPeer({ transport: t, deviceId: state.btDevice, code, name: state.btDeviceName || "对方设备" });
