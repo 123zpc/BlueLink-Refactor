@@ -1,0 +1,11 @@
+[package]
+name = "simpleble-probe"
+version = "0.1.0"
+edition = "2021"
+description = "CI 探针：验证 simplersble 能否为 x86_64-pc-windows-msvc 成功构建（中心端 + 外设端 API 编译级调用）"
+
+# 与产品 workspace 脱钩：本 crate 自成一个 workspace，不进产品构建。
+[workspace]
+
+[dependencies]
+simplersble = "=1.4.1-dev.14"
