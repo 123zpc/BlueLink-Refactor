@@ -704,7 +704,7 @@ async function wireEvents() {
     state.connected = e.payload.connected;
     state.peerName = e.payload.peer_name;
     $("peer-name").textContent = state.peerName || "未连接";
-    $("peer-state").textContent = state.connected ? "蓝牙已连接" : "离线";
+    $("peer-state").textContent = state.connected ? "已连接" : "离线";
     const pav = $("peer-avatar");
     if (state.peerName) {
       pav.textContent = state.peerName.slice(0, 1);
