@@ -1,0 +1,91 @@
+name: simpleble-check
+
+# 分支专用 workflow（feat/simpleble-transport）：
+# 只验证带 simpleble feature 的 bluelink-transport 能否在 GitHub 的 Windows runner
+# （自带 MSVC + Windows SDK + CMake）上为 x86_64-pc-windows-msvc 通过
+# cargo check 与 clippy。不进产品、不发版，不影响 release 流水线。
+# 完整输出写入仓库根 simpleble-build-log.txt，并由后续步骤提交回本分支；
+# 该文件已列入 paths-ignore，日志提交不会再次触发本 workflow。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/simpleble-transport
+    paths-ignore:
+      - 'simpleble-build-log.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable + windows-msvc target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Check bluelink-transport with simpleble feature for x86_64-pc-windows-msvc
+        id: build
+        shell: bash
+        run: |
+          log="simpleble-build-log.txt"
+          {
+            echo "=== simpleble-check CI log ==="
+            echo "date(UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run_url: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "runner: ${RUNNER_OS} ${RUNNER_ARCH}"
+            rustc --version || true
+            cargo --version || true
+            cmake --version | head -1 || true
+            echo "=== cargo check -p bluelink-transport --features simpleble --target x86_64-pc-windows-msvc ==="
+          } > "$log"
+          start=$(date +%s)
+          cargo check -p bluelink-transport --features simpleble --target x86_64-pc-windows-msvc 2>&1 | tee -a "$log"
+          check_code=${PIPESTATUS[0]}
+          end=$(date +%s)
+          echo "CHECK_EXIT_CODE=$check_code" >> "$log"
+          echo "CHECK_SECONDS=$((end - start))" >> "$log"
+          echo "=== cargo clippy -p bluelink-transport --features simpleble --target x86_64-pc-windows-msvc --all-targets ===" >> "$log"
+          start=$(date +%s)
+          cargo clippy -p bluelink-transport --features simpleble --target x86_64-pc-windows-msvc --all-targets 2>&1 | tee -a "$log"
+          clippy_code=${PIPESTATUS[0]}
+          end=$(date +%s)
+          {
+            echo "CLIPPY_EXIT_CODE=$clippy_code"
+            echo "CLIPPY_SECONDS=$((end - start))"
+          } >> "$log"
+          echo "check_exit=$check_code" >> "$GITHUB_OUTPUT"
+          echo "clippy_exit=$clippy_code" >> "$GITHUB_OUTPUT"
+          # 本步永不失败：先把日志提交回分支，成败由最后的 Verdict 步裁定。
+          exit 0
+
+      - name: Commit build log back to feat/simpleble-transport
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add simpleble-build-log.txt
+          if git diff --cached --quiet; then
+            echo "simpleble-build-log.txt 无变化，跳过提交"
+            exit 0
+          fi
+          if [ "${{ steps.build.outputs.check_exit }}" = "0" ] && [ "${{ steps.build.outputs.clippy_exit }}" = "0" ]; then result="成功"; else result="失败"; fi
+          git commit -m "simpleble-check 构建日志：${result}（run ${{ github.run_id }}）"
+          git push origin HEAD:feat/simpleble-transport
+
+      - name: Verdict
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.build.outputs.check_exit }}" != "0" ] || [ "${{ steps.build.outputs.clippy_exit }}" != "0" ]; then
+            echo "SimpleBLE Windows 目标 check/clippy 失败（详见本分支 simpleble-build-log.txt）"
+            exit 1
+          fi
+          echo "SimpleBLE Windows 目标 check/clippy 成功（详见本分支 simpleble-build-log.txt）"

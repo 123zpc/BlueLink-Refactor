@@ -16,5 +16,13 @@ bluelink-transport = { path = "../crates/transport" }
 bluelink-ai = { path = "../crates/ai" }
 bluelink-services = { path = "../crates/services" }
 
+[features]
+default = []
+# 构建带 SimpleBLE 传输的应用（开发者模式实验通道）：转发到 transport 的
+# 同名 feature。默认关闭——默认/发版构建不引入 CMake/C++ 原生构建，
+# 产物与未引入 SimpleBLE 时完全一致；未开启时应用内的 SimpleBLE 入口
+# 会如实回落经典蓝牙（见 main.rs 的 resolve_transport）。
+simpleble = ["bluelink-transport/simpleble"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

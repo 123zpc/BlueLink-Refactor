@@ -79,13 +79,14 @@
           <span id="bt-status-text">正在检测蓝牙…</span>
         </div>
 
-        <!-- 连接方式：经典蓝牙 / BLE（仅 Windows 有经典通道，后端 classic_available 为假时整行隐藏） -->
+        <!-- 连接方式：经典蓝牙 / BLE / SimpleBLE（仅开发者模式显示；仅 Windows 有经典通道） -->
         <div id="bt-transport-row" class="hidden">
           <div class="seg-group">
             <button id="seg-classic" class="seg-btn">经典蓝牙</button>
             <button id="seg-ble" class="seg-btn">BLE</button>
+            <button id="seg-simpleble" class="seg-btn">SimpleBLE</button>
           </div>
-          <p class="muted small">开发者模式下可切换传输。经典蓝牙与老版本同款：速度快，首次连接时系统可能弹出配对确认，点允许即可；BLE 免配对，但传输较慢。</p>
+          <p class="muted small">开发者模式下可切换传输。经典蓝牙与老版本同款：速度快，首次连接时系统可能弹出配对确认，点允许即可；BLE 免配对，但传输较慢。SimpleBLE 是第三套 BLE 实现（实验）：仅在编译了 SimpleBLE 的版本中可用，未编译的版本选了也会如实回落经典蓝牙；切换到 SimpleBLE 后需重启应用，本机才会被对方发现。</p>
         </div>
 
         <div class="my-device">
@@ -314,7 +315,7 @@
           <span>开发者模式</span>
           <span class="muted small">已开启</span>
         </div>
-        <p class="muted small">在下方「关于」里连续点击版本号三次，可开启或关闭开发者模式。开启后，连接页可切换蓝牙传输方式（经典 / BLE），并多出局域网测试通道（仅供开发调试）。正式使用请用经典蓝牙。</p>
+        <p class="muted small">在下方「关于」里连续点击版本号三次，可开启或关闭开发者模式。开启后，连接页可切换蓝牙传输方式（经典 / BLE / SimpleBLE），并多出局域网测试通道（仅供开发调试）。正式使用请用经典蓝牙。</p>
         <h3>关于</h3>
         <p class="muted small">BlueLink <span id="set-version"></span> — 离线聊天与文件传输（重构版）。</p>
        </div>

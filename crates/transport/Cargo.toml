@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# SimpleBLE 传输（第三个蓝牙实现，开发者模式可选）：底层是 C++ 库，
+# 构建时需要 CMake + C++ 工具链（Windows 上为 MSVC）。默认关闭，
+# 保证默认构建产物与发版流水线不引入任何原生构建依赖。
+simpleble = ["dep:simplersble"]
+
 [dependencies]
 tokio = { workspace = true }
 thiserror = { workspace = true }
@@ -16,6 +23,10 @@ serde = { workspace = true }
 # GATT 服务端（广播 + 被连接）：btleplug 只有中心端 API，服务端用 ble-peripheral-rust
 # （含 Linux/BlueZ、Windows/WinRT、macOS/CoreBluetooth 三个后端）。
 ble-peripheral-rust = "0.2"
+
+# SimpleBLE 的 Rust 绑定：仅在 simpleble feature 开启时编译（见上 [features]）。
+# 版本锁定为已在 GitHub windows-latest 上验证可构建的预发布版。
+simplersble = { version = "=1.4.1-dev.14", optional = true }
 
 # 经典蓝牙（RFCOMM/SPP）实现直接调 Windows 系统 API（Winsock AF_BTH + BluetoothApis），
 # 仅 Windows 编译；其他平台 classic 模块是返回「不支持」的空壳。

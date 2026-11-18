@@ -29,6 +29,13 @@ struct AppState {
     classic_server: Option<Arc<bluelink_transport::classic::ClassicServer>>,
     /// 经典蓝牙服务端启动失败时的原始错误，界面据此如实提示原因。
     classic_server_error: Option<String>,
+    /// SimpleBLE 运行时（第三个蓝牙实现，开发者模式可选）：中心端在编译了
+    /// simpleble feature 时创建；服务端仅在启动时设置已选 simpleble 才拉起
+    /// （避免与 BLE 服务端同时抢同一适配器的外设角色）。
+    sble_central: Option<Arc<bluelink_transport::simpleble::SbleCentral>>,
+    sble_server: Option<Arc<bluelink_transport::simpleble::SbleServer>>,
+    /// SimpleBLE 服务端启动失败时的原始错误，界面据此如实提示原因。
+    sble_server_error: Option<String>,
     scan_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     listening: Mutex<Option<tokio::task::JoinHandle<()>>>,
     local_api: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -72,6 +79,12 @@ struct BtState {
     classic_available: bool,
     classic_serving: bool,
     classic_message: String,
+    /// SimpleBLE 状态（开发者模式切换时展示）：compiled 为 false 表示此版本
+    /// 构建时未开启 simpleble feature，选了也会回落经典蓝牙，message 里写明。
+    simpleble_compiled: bool,
+    simpleble_available: bool,
+    simpleble_serving: bool,
+    simpleble_message: String,
 }
 
 #[tauri::command]
@@ -111,6 +124,22 @@ async fn bt_state(state: State<'_, AppState>) -> Result<BtState, String> {
     } else {
         "经典蓝牙已开启，但服务未启动".to_string()
     };
+    let simpleble_compiled = bluelink_transport::simpleble::simpleble_compiled();
+    let simpleble_available = state.sble_central.is_some();
+    // start_sble_server 在广播真正启动后才返回 Ok，server 存在即正在广播
+    let simpleble_serving = state.sble_server.is_some();
+    let simpleble_message = if !simpleble_compiled {
+        "SimpleBLE 未编译进此版本（构建时未开启 simpleble feature），已回落经典蓝牙".to_string()
+    } else if !simpleble_available {
+        "未检测到蓝牙适配器或蓝牙未开启".to_string()
+    } else if simpleble_serving {
+        "SimpleBLE 已开启，本机可被附近设备发现".to_string()
+    } else if let Some(err) = &state.sble_server_error {
+        format!("SimpleBLE 已开启，但广播启动失败：{err}")
+    } else {
+        "SimpleBLE 可用，但本机广播未启动（切换到 SimpleBLE 后重启应用才会被对方发现；主动扫描连接不受影响）"
+            .to_string()
+    };
     Ok(BtState {
         available,
         advertising,
@@ -118,14 +147,20 @@ async fn bt_state(state: State<'_, AppState>) -> Result<BtState, String> {
         classic_available,
         classic_serving,
         classic_message,
+        simpleble_compiled,
+        simpleble_available,
+        simpleble_serving,
+        simpleble_message,
     })
 }
 
-/// 扫描中心端的统一视图：经典蓝牙（Inquiry）与 BLE 两套中心端方法签名对齐，
-/// 扫描轮询逻辑共用一份。transport 参数由连接页的连接方式选择传入（"classic" / "ble"）。
+/// 扫描中心端的统一视图：经典蓝牙（Inquiry）、BLE 与 SimpleBLE 三套中心端
+/// 方法签名对齐，扫描轮询逻辑共用一份。transport 参数由连接页的连接方式
+/// 选择传入（"classic" / "ble" / "simpleble"，经 resolve_transport 归一化）。
 enum ScanCentral {
     Ble(Arc<bluelink_transport::ble::BleCentral>),
     Classic(Arc<bluelink_transport::classic::ClassicCentral>),
+    Simpleble(Arc<bluelink_transport::simpleble::SbleCentral>),
 }
 
 impl ScanCentral {
@@ -133,6 +168,7 @@ impl ScanCentral {
         match self {
             ScanCentral::Ble(c) => c.start_scan().await.map_err(|e| e.to_string()),
             ScanCentral::Classic(c) => c.start_scan().map_err(|e| e.to_string()),
+            ScanCentral::Simpleble(c) => c.start_scan().await.map_err(|e| e.to_string()),
         }
     }
 
@@ -142,6 +178,7 @@ impl ScanCentral {
         match self {
             ScanCentral::Ble(c) => c.list_found().await.map_err(|e| e.to_string()),
             ScanCentral::Classic(c) => c.list_found().map_err(|e| e.to_string()),
+            ScanCentral::Simpleble(c) => c.list_found().await.map_err(|e| e.to_string()),
         }
     }
 
@@ -149,33 +186,68 @@ impl ScanCentral {
         match self {
             ScanCentral::Ble(_) => "ble",
             ScanCentral::Classic(_) => "classic",
+            ScanCentral::Simpleble(_) => "simpleble",
         }
     }
 }
 
+/// 把前端请求的传输归一化为实际生效的传输。
+/// 关键回落：请求 simpleble 但此版本未编译 SimpleBLE（feature 未开启）时，
+/// 绝不假装在用 SimpleBLE——回落经典蓝牙（无经典通道的平台回落 BLE），
+/// 并在运行日志里如实写明原因（bt_state 的 simpleble_message 同步展示）。
+fn resolve_transport(state: &AppState, requested: &str) -> &'static str {
+    match requested {
+        "classic" => "classic",
+        "simpleble" => {
+            if bluelink_transport::simpleble::simpleble_compiled() {
+                "simpleble"
+            } else if state.classic_central.is_some() {
+                bluelink_services::log_line(
+                    "simpleble",
+                    "设置选择了 SimpleBLE，但此版本未编译 SimpleBLE（构建时未开启 simpleble feature），已回落经典蓝牙",
+                );
+                "classic"
+            } else {
+                bluelink_services::log_line(
+                    "simpleble",
+                    "设置选择了 SimpleBLE，但此版本未编译 SimpleBLE（构建时未开启 simpleble feature），已回落 BLE",
+                );
+                "ble"
+            }
+        }
+        _ => "ble",
+    }
+}
+
 /// 开始扫描附近的设备：结果经 bt_devices 事件每秒推送快照。
-/// transport = "classic" 走经典 Inquiry（不过滤，含已配对/记住的设备），
-/// 其余值走 BLE 扫描（按 BlueLink 服务过滤）。
+/// transport 先经 resolve_transport 归一化："classic" 走经典 Inquiry
+/// （不过滤，含已配对/记住的设备），"simpleble" 走 SimpleBLE 扫描
+/// （未编译时回落并记日志），其余值走 BLE 扫描（按 BlueLink 服务过滤）。
 #[tauri::command]
 async fn bt_start_scan(
     state: State<'_, AppState>,
     app: AppHandle,
     transport: String,
 ) -> Result<(), String> {
-    let central = if transport == "classic" {
-        ScanCentral::Classic(
+    let central = match resolve_transport(&state, &transport) {
+        "classic" => ScanCentral::Classic(
             state
                 .classic_central
                 .clone()
                 .ok_or_else(|| "经典蓝牙不可用".to_string())?,
-        )
-    } else {
-        ScanCentral::Ble(
+        ),
+        "simpleble" => ScanCentral::Simpleble(
+            state
+                .sble_central
+                .clone()
+                .ok_or_else(|| "SimpleBLE 不可用".to_string())?,
+        ),
+        _ => ScanCentral::Ble(
             state
                 .central
                 .clone()
                 .ok_or_else(|| "蓝牙不可用".to_string())?,
-        )
+        ),
     };
     central.start_scan().await?;
     if let Some(h) = state.scan_task.lock().await.take() {
@@ -206,7 +278,7 @@ async fn bt_start_scan(
     Ok(())
 }
 
-/// 停止扫描（两套中心端都停，互不影响）。
+/// 停止扫描（三套中心端都停，互不影响）。
 #[tauri::command]
 async fn bt_stop_scan(state: State<'_, AppState>) -> Result<(), String> {
     if let Some(h) = state.scan_task.lock().await.take() {
@@ -217,6 +289,9 @@ async fn bt_stop_scan(state: State<'_, AppState>) -> Result<(), String> {
     }
     if let Some(c) = &state.classic_central {
         let _ = c.stop_scan();
+    }
+    if let Some(c) = &state.sble_central {
+        let _ = c.stop_scan().await;
     }
     Ok(())
 }
@@ -343,7 +418,8 @@ async fn set_last_peer(state: State<'_, AppState>, json: String) -> Result<(), S
 }
 
 /// 连接扫描到的设备（访客模式）：code 为对方屏幕上显示的连接码，握手时校验。
-/// transport 与扫描时一致："classic" 经 SDP 连经典蓝牙，其余走 BLE。
+/// transport 与扫描时一致（经 resolve_transport 归一化）："classic" 经 SDP
+/// 连经典蓝牙，"simpleble" 走 SimpleBLE（未编译时回落），其余走 BLE。
 #[tauri::command]
 async fn bt_connect(
     state: State<'_, AppState>,
@@ -351,24 +427,37 @@ async fn bt_connect(
     code: String,
     transport: String,
 ) -> Result<String, String> {
-    let conn = if transport == "classic" {
-        let central = state
-            .classic_central
-            .clone()
-            .ok_or_else(|| "经典蓝牙不可用".to_string())?;
-        central
-            .connect(&device_id)
-            .await
-            .map_err(|e| format!("经典蓝牙连接失败：{e}"))?
-    } else {
-        let central = state
-            .central
-            .clone()
-            .ok_or_else(|| "蓝牙不可用".to_string())?;
-        central
-            .connect(&device_id)
-            .await
-            .map_err(|e| format!("蓝牙连接失败：{e}"))?
+    let conn = match resolve_transport(&state, &transport) {
+        "classic" => {
+            let central = state
+                .classic_central
+                .clone()
+                .ok_or_else(|| "经典蓝牙不可用".to_string())?;
+            central
+                .connect(&device_id)
+                .await
+                .map_err(|e| format!("经典蓝牙连接失败：{e}"))?
+        }
+        "simpleble" => {
+            let central = state
+                .sble_central
+                .clone()
+                .ok_or_else(|| "SimpleBLE 不可用".to_string())?;
+            central
+                .connect(&device_id)
+                .await
+                .map_err(|e| format!("SimpleBLE 连接失败：{e}"))?
+        }
+        _ => {
+            let central = state
+                .central
+                .clone()
+                .ok_or_else(|| "蓝牙不可用".to_string())?;
+            central
+                .connect(&device_id)
+                .await
+                .map_err(|e| format!("蓝牙连接失败：{e}"))?
+        }
     };
     let code_clean: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
     let peer = state
@@ -1290,6 +1379,75 @@ fn main() {
                 } else {
                     (None, None, None)
                 };
+            // SimpleBLE 运行时（第三个蓝牙实现，开发者模式可选）：
+            // - 未编译（feature 未开启）：三个字段恒为 None；若设置里选了 simpleble，
+            //   在日志里如实写明并回落（resolve_transport 在扫描/连接时执行回落）。
+            // - 已编译：中心端照常创建（扫描/连出随时可用）；服务端只在启动时
+            //   设置已选 simpleble 才拉起，避免与 BLE 服务端同时抢同一适配器的
+            //   外设角色——切换传输后需重启应用，本机才经 SimpleBLE 被发现。
+            let sble_compiled = bluelink_transport::simpleble::simpleble_compiled();
+            let saved_bt_transport = node
+                .storage
+                .get_setting("bt_transport")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "classic".to_string());
+            if saved_bt_transport == "simpleble" && !sble_compiled {
+                bluelink_services::log_line(
+                    "simpleble",
+                    "设置选择了 SimpleBLE，但此版本未编译 SimpleBLE（构建时未开启 simpleble feature），已回落经典蓝牙",
+                );
+            }
+            let (sble_central, sble_server, sble_server_error) = if sble_compiled {
+                tauri::async_runtime::block_on(async {
+                    let central = bluelink_transport::simpleble::sble_central()
+                        .await
+                        .map(Arc::new)
+                        .map_err(|e| {
+                            bluelink_services::log_line(
+                                "simpleble",
+                                &format!("SimpleBLE 中心端不可用：{e}"),
+                            );
+                            e
+                        })
+                        .ok();
+                    let mut sble_error = None;
+                    let server = if saved_bt_transport == "simpleble" {
+                        match bluelink_transport::simpleble::start_sble_server(&name).await {
+                            Ok((srv, mut inbound)) => {
+                                let node_in = node.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    while let Some(conn) = inbound.recv().await {
+                                        // 宿主侧握手：与 BLE/经典入站同一套校验
+                                        if let Err(e) =
+                                            node_in.attach(conn, true, "").await
+                                        {
+                                            bluelink_services::log_line(
+                                                "simpleble",
+                                                &format!("SimpleBLE 入站连接握手失败：{e}"),
+                                            );
+                                        }
+                                    }
+                                });
+                                Some(Arc::new(srv))
+                            }
+                            Err(e) => {
+                                bluelink_services::log_line(
+                                    "simpleble",
+                                    &format!("SimpleBLE 服务端（广播）启动失败：{e}"),
+                                );
+                                sble_error = Some(e.to_string());
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    (central, server, sble_error)
+                })
+            } else {
+                (None, None, None)
+            };
             app.manage(AppState {
                 node,
                 data_dir,
@@ -1300,6 +1458,9 @@ fn main() {
                 classic_central,
                 classic_server,
                 classic_server_error,
+                sble_central,
+                sble_server,
+                sble_server_error,
                 scan_task: Mutex::new(None),
                 listening: Mutex::new(None),
                 local_api: Mutex::new(local_handle),
