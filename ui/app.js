@@ -1341,6 +1341,10 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
 // ---------- 启动 ----------
 (async function init() {
   applyTheme(localStorage.getItem("bl-theme") || "system");
+  // 版本号以应用包内版本为准（tauri.conf.json），不在页面里写死，避免与安装包版本脱节
+  if (window.__TAURI__.app && window.__TAURI__.app.getVersion) {
+    window.__TAURI__.app.getVersion().then((v) => { $("set-version").textContent = v; }).catch(() => {});
+  }
   await loadCategories();
   state.identity = await invoke("get_identity");
   $("my-code").textContent = state.identity.code_display;

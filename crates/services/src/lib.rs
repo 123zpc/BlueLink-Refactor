@@ -116,28 +116,30 @@ pub fn open_file(path: &Path) -> Result<(), ServiceError> {
 
 /// 在系统文件管理器中定位文件（文件菜单「打开文件位置」）。
 pub fn reveal_file(path: &Path) -> Result<(), ServiceError> {
+    // 各平台定位文件的方式不同，统一收成一个结果返回（不用 return，避免平台分支触发 needless_return）
     #[cfg(target_os = "windows")]
-    {
+    let result = {
         // explorer 对 /select 的成功返回码也不稳定，只负责拉起进程
         let _ = std::process::Command::new("explorer")
             .arg(format!("/select,{}", path.display()))
             .spawn()?;
-        return Ok(());
-    }
+        Ok(())
+    };
     #[cfg(target_os = "macos")]
-    {
+    let result = {
         std::process::Command::new("open")
             .arg("-R")
             .arg(path)
             .spawn()?;
-        return Ok(());
-    }
+        Ok(())
+    };
     #[cfg(all(unix, not(target_os = "macos")))]
-    {
+    let result = {
         let dir = path.parent().unwrap_or(path);
         std::process::Command::new("xdg-open").arg(dir).spawn()?;
         Ok(())
-    }
+    };
+    result
 }
 
 /// 已知压缩格式（这些扩展名的分片直传，不再压缩）。
