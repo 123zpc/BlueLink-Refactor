@@ -315,18 +315,6 @@ const CODE_SIGNALS = [
 /** 识别输入内容是否应转文档：围栏代码块 / 代码特征 / 超长纯文本。返回 {name, kind} 或 null。 */
 function detectDocument(text) {
   const t = text.trim();
-  // 表格数据优先识别（不受 60 字下限约束）：Excel/WPS 复制出来是制表符分隔，
-  // 多数行含制表符且列数一致 → CSV
-  const rawLines = t.split("\n");
-  if (rawLines.length >= 3) {
-    const tabLines = rawLines.filter((l) => l.includes("\t"));
-    if (tabLines.length >= Math.ceil(rawLines.length * 0.6)) {
-      const cols = tabLines.map((l) => l.split("\t").length);
-      if (cols[0] >= 2 && cols.every((c) => c === cols[0])) {
-        return { name: "表格.csv", kind: "table" };
-      }
-    }
-  }
   if (t.length < 60) return null;
   const fence = t.match(/^```([a-zA-Z0-9+#-]*)\s*\n/);
   if (fence) {
@@ -356,15 +344,16 @@ function updateDocBar() {
   if (docSuggestion) {
     $("doc-bar-text").textContent = docSuggestion.kind === "code"
       ? `检测到代码，将作为文件发送：${docSuggestion.name}`
-      : docSuggestion.kind === "table"
-        ? `检测到表格数据，将作为文件发送：${docSuggestion.name}`
-        : `内容较长，将作为文档发送：${docSuggestion.name}`;
+      : `内容较长，将作为文档发送：${docSuggestion.name}`;
     $("doc-bar").classList.remove("hidden");
   } else {
     $("doc-bar").classList.add("hidden");
   }
 }
 $("doc-bar-cancel").addEventListener("click", () => { docDismissed = true; updateDocBar(); });
+// 粘贴格式优先级（重要）：Excel 等复制时剪贴板同时带文字与图片两种格式，
+// 必须优先取文字——粘进来就是文字，不超限直接按文字发送，绝不能变成图片；
+// 将来做图片粘贴时，图片分支也只处理剪贴板里没有文字的纯图片（如截图）。
 $("input").addEventListener("paste", () => setTimeout(updateDocBar, 0));
 
 async function sendCurrent() {
