@@ -22,16 +22,11 @@ pub fn spawn(node: Arc<Node>) -> tokio::task::JoinHandle<()> {
                 return;
             }
         };
-        loop {
-            match listener.accept().await {
-                Ok((sock, _)) => {
-                    let n = node.clone();
-                    tokio::spawn(async move {
-                        let _ = handle(n, sock).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((sock, _)) = listener.accept().await {
+            let n = node.clone();
+            tokio::spawn(async move {
+                let _ = handle(n, sock).await;
+            });
         }
     })
 }
@@ -238,8 +233,7 @@ async fn chat_completions(
     }
 
     // 流式：网关增量经无界通道转出（try_send 不丢片），逐条写成 SSE 分块
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
     let n2 = node.clone();
     let msgs2 = msgs.clone();
     tokio::spawn(async move {

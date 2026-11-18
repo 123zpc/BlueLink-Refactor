@@ -482,6 +482,8 @@ fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfigView, String> {
     })
 }
 
+// 参数即前端 IPC 契约（AI 配置全字段），逐个平铺比打包对象更贴合现有调用方式。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn set_ai_config(
     state: State<'_, AppState>,
@@ -682,7 +684,10 @@ struct FileInfoView {
 }
 
 #[tauri::command]
-fn file_info(state: State<'_, AppState>, message_id: String) -> Result<Option<FileInfoView>, String> {
+fn file_info(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<Option<FileInfoView>, String> {
     Ok(state
         .node
         .file_info(&message_id)
@@ -715,7 +720,11 @@ fn copy_file_as(src: String, dst: String) -> Result<(), String> {
 
 /// 把粘贴的图片落盘暂存，返回路径（前端在点发送时按文件发送；剪贴板图片只在无文字时走这里）。
 #[tauri::command]
-fn stage_pasted_image(state: State<'_, AppState>, data_base64: String, ext: String) -> Result<String, String> {
+fn stage_pasted_image(
+    state: State<'_, AppState>,
+    data_base64: String,
+    ext: String,
+) -> Result<String, String> {
     let ext = match ext.to_lowercase().as_str() {
         "jpg" | "jpeg" => "jpg",
         "gif" => "gif",

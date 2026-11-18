@@ -126,7 +126,10 @@ pub fn reveal_file(path: &Path) -> Result<(), ServiceError> {
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg("-R").arg(path).spawn()?;
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()?;
         return Ok(());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -517,17 +520,13 @@ impl Node {
             }
             Frame::Control(Control::FileCancel { transfer_id }) => {
                 // 若本机正在发送这条传输：置取消标记，发送循环下一片即停
-                self.cancelled
-                    .lock()
-                    .await
-                    .insert(transfer_id.clone());
+                self.cancelled.lock().await.insert(transfer_id.clone());
                 // 对方取消了发送：清掉接收中的半成品（.part 与内存状态）
                 if let Some(st) = self.recv_files.lock().await.remove(&transfer_id) {
                     let _ = std::fs::remove_file(&st.part_path);
-                    let _ = self.storage.update_message_status(
-                        &st.msg_id,
-                        MessageStatus::Failed,
-                    );
+                    let _ = self
+                        .storage
+                        .update_message_status(&st.msg_id, MessageStatus::Failed);
                     self.emit(Event::MessageStatus {
                         id: st.msg_id,
                         status: MessageStatus::Failed,
@@ -632,10 +631,7 @@ impl Node {
 
     /// 取消一条进行中的传输（本机发送或接收都可发起）：置标记并通知对方。
     pub async fn cancel_transfer(&self, transfer_id: &str) {
-        self.cancelled
-            .lock()
-            .await
-            .insert(transfer_id.to_string());
+        self.cancelled.lock().await.insert(transfer_id.to_string());
         if let Ok(s) = self.session().await {
             let _ = s
                 .conn
@@ -1404,10 +1400,9 @@ impl Node {
 
     fn add_proxy_stats(&self, chars: u64) {
         let (n, c) = self.proxy_today_stats();
-        let _ = self.storage.set_setting(
-            &Self::proxy_day_key(),
-            &format!("{},{}", n + 1, c + chars),
-        );
+        let _ = self
+            .storage
+            .set_setting(&Self::proxy_day_key(), &format!("{},{}", n + 1, c + chars));
     }
 
     /// 宿主侧：替无网对端调用本机 AI 并流式回传。
@@ -1430,8 +1425,7 @@ impl Node {
                 .send(&Frame::Control(Control::AiProxyDone {
                     request_id,
                     error: Some(
-                        "对方未开启 AI 转发许可：请让对方在设置的「AI 转发」里打开允许开关"
-                            .into(),
+                        "对方未开启 AI 转发许可：请让对方在设置的「AI 转发」里打开允许开关".into(),
                     ),
                 }))
                 .await?;
@@ -1499,5 +1493,4 @@ impl Node {
             .await?;
         Ok(())
     }
-
 }

@@ -16,8 +16,11 @@ const state = {
   renderedAi: new Set(),
   aiGenerating: false,
   streamEl: null,
-  tagEditId: null,
-  tagEditList: [],
+  categories: [],
+  catEditId: null,
+  stagedImage: null,
+  transferMap: {},
+  quoteFrom: null,
   lastFileBubble: null,
   btDevice: null,
   btDeviceName: null,
@@ -66,13 +69,37 @@ function buildMessageEl(m, opts = {}) {
   row.className = "msg-row" + (m.sender === "me" ? " me" : "");
   row.dataset.mid = m.id;
   row.dataset.sender = m.sender;
+  row.dataset.kind = m.kind;
   const wrap = document.createElement("div");
   wrap.className = "msg";
   const bubble = document.createElement("div");
   bubble.className = "bubble" + (m.kind === "file" ? " file-card" : "");
+  if (m.reply_to && m.kind === "text" && !opts.ai) {
+    const q = document.createElement("div");
+    q.className = "quote-block";
+    q.textContent = "引用加载中…";
+    q.addEventListener("click", () => jumpToQuoted(m));
+    bubble.appendChild(q);
+    fillQuote(q, m);
+  }
   if (m.kind === "file") {
-    bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div><div class="progress hidden"><div></div></div>`;
+    bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div><div class="progress hidden"><div></div></div><div class="progress-meta hidden"></div><button class="progress-cancel hidden">取消</button><button class="transfer-retry hidden">重试</button>`;
     state.lastFileBubble = bubble;
+    bubble.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      openFileMenu(m.id, e.clientX, e.clientY);
+    });
+    bubble.querySelector(".progress-cancel").addEventListener("click", async () => {
+      const tid = state.transferMap[m.id];
+      if (tid) await invoke("cancel_transfer", { transferId: tid });
+    });
+    bubble.querySelector(".transfer-retry").addEventListener("click", async () => {
+      try {
+        await invoke("resend_message", { messageId: m.id });
+        row.remove();
+        state.renderedChat.delete(m.id);
+      } catch (err) { alert("重发失败：" + err); }
+    });
   } else if (opts.ai && m.sender === "ai") {
     bubble.innerHTML = md(m.body);
   } else if (m.body.length > 500 || m.body.split("\n").length > 10) {
@@ -90,7 +117,9 @@ function buildMessageEl(m, opts = {}) {
     bubble.appendChild(textDiv);
     bubble.appendChild(tg);
   } else {
-    bubble.textContent = m.body;
+    const tspan = document.createElement("span");
+    tspan.textContent = m.body;
+    bubble.appendChild(tspan);
   }
   const meta = document.createElement("div");
   meta.className = "msg-meta";
@@ -99,12 +128,12 @@ function buildMessageEl(m, opts = {}) {
   meta.appendChild(tagsSpan);
   const status = document.createElement("span");
   status.className = "msg-status";
-  status.textContent = STATUS_CN[m.status] || "";
+  applyStatus(status, m.id, m.status);
   const time = document.createElement("span");
   time.textContent = fmtTime(m.created_at);
   const actions = document.createElement("span");
   actions.className = "msg-actions";
-  const btns = [["标签", () => openTagEditor(m.id)], ["收藏", () => toggleMark(m.id, "favorite")], ["置顶", () => toggleMark(m.id, "pin")]];
+  const btns = [["彩签", (e) => openCatPop(m.id, e.currentTarget)], ["收藏", () => toggleMark(m.id, "favorite")], ["置顶", () => toggleMark(m.id, "pin")]];
   if (!opts.ai) btns.push(["引用", () => setReply(m)]);
   if (opts.ai && m.sender === "ai") btns.push(["复制", () => navigator.clipboard.writeText(m.body)], ["重新生成", () => regenerateAi()]);
   for (const [label, fn] of btns) {
@@ -116,23 +145,83 @@ function buildMessageEl(m, opts = {}) {
   meta.appendChild(status); meta.appendChild(time); meta.appendChild(actions);
   wrap.appendChild(bubble); wrap.appendChild(meta);
   row.appendChild(wrap);
-  refreshMessageTags(m.id, tagsSpan);
+  refreshMessageCategory(m.id, tagsSpan);
   return row;
 }
 
-async function refreshMessageTags(mid, span) {
+/** 消息状态展示：失败时标红可点重试（文本原地重发；文件重发会生成新气泡并移除旧的）。 */
+function applyStatus(el, mid, status) {
+  el.textContent = STATUS_CN[status] || "";
+  el.classList.toggle("failed", status === "failed");
+  el.title = status === "failed" ? "发送失败，点击重试" : "";
+  el.onclick = status === "failed" ? async () => {
+    try {
+      const rowEl = document.querySelector(`[data-mid="${mid}"]`);
+      await invoke("resend_message", { messageId: mid });
+      if (rowEl && rowEl.dataset.kind === "file") {
+        rowEl.remove();
+        state.renderedChat.delete(mid);
+      }
+    } catch (err) { alert("重试失败：" + err); }
+  } : null;
+}
+
+// ---------- 引用 ----------
+const quoteCache = new Map();
+async function fillQuote(el, m) {
   try {
-    const tags = await invoke("get_message_tags", { messageId: mid });
-    span.innerHTML = "";
-    for (const t of tags) {
-      const chip = document.createElement("span");
-      chip.className = "tag-chip";
-      chip.textContent = t;
-      const chipHex = (state.tagColorMap || {})[t.toLowerCase()];
-      if (chipHex) { chip.style.borderColor = chipHex; chip.style.color = chipHex; }
-      chip.addEventListener("click", () => openTagDrawer(t));
-      span.appendChild(chip);
+    let orig = quoteCache.get(m.reply_to);
+    if (!orig) {
+      orig = await invoke("get_message", { messageId: m.reply_to });
+      if (orig) quoteCache.set(m.reply_to, orig);
     }
+    if (!orig) { el.textContent = "原消息已删除"; return; }
+    const who = orig.sender === "me" ? "我" : orig.sender === "ai" ? "AI" : "对方";
+    el.textContent = `${who}：${orig.body.slice(0, 80)}`;
+  } catch (_) { el.textContent = "引用消息"; }
+}
+
+/** 点引用块跳到原消息，并亮出「回到回复」按钮一键跳回。 */
+function jumpToQuoted(m) {
+  state.quoteFrom = m.id;
+  locateMessage(m.conversation_id, m.reply_to);
+  const btn = $("back-to-reply");
+  btn.classList.remove("hidden");
+  btn.onclick = () => {
+    btn.classList.add("hidden");
+    if (state.quoteFrom) locateMessage(m.conversation_id, state.quoteFrom);
+    state.quoteFrom = null;
+  };
+}
+
+// 彩签分类：颜色即分类，序号 0–8 与存储层 categories.color 对应
+const CAT_COLORS = ["#6B7280", "#E11D48", "#EA580C", "#CA8A04", "#059669", "#0891B2", "#2563EB", "#7C3AED", "#DB2777"];
+const CAT_DEFAULT_NAMES = ["灰色", "红色", "橙色", "黄色", "绿色", "青色", "蓝色", "紫色", "粉色"];
+function catName(color) {
+  const c = state.categories.find((x) => x.color === color);
+  return c ? c.name : CAT_DEFAULT_NAMES[color] || "分类";
+}
+async function loadCategories() {
+  try { state.categories = await invoke("list_categories"); } catch (_) { state.categories = []; }
+  return state.categories;
+}
+
+/** 刷新一条消息的彩签小片：备注优先展示，否则显示分类名；点小片改分类，右键给分类改名。 */
+async function refreshMessageCategory(mid, span) {
+  try {
+    const mc = await invoke("get_message_category", { messageId: mid });
+    span.innerHTML = "";
+    if (!mc) return;
+    const hex = CAT_COLORS[mc.color] || CAT_COLORS[0];
+    const chip = document.createElement("span");
+    chip.className = "tag-chip";
+    chip.textContent = mc.note || catName(mc.color);
+    chip.style.borderColor = hex;
+    chip.style.color = hex;
+    chip.title = `分类：${catName(mc.color)}（点击修改，右键改名）`;
+    chip.addEventListener("click", (e) => openCatPop(mid, e.currentTarget));
+    chip.addEventListener("contextmenu", (e) => { e.preventDefault(); openRenamePop(mc.color, e.currentTarget); });
+    span.appendChild(chip);
   } catch (_) { /* 忽略 */ }
 }
 
@@ -193,7 +282,7 @@ function switchView(view) {
   $("ai-view").classList.toggle("hidden", view !== "ai");
   $("settings-view").classList.toggle("hidden", view !== "settings");
   $("placeholder-view").classList.toggle("hidden", !(view === "tags" || view === "favorites"));
-  if (view === "tags") loadTagList();
+  if (view === "tags") loadCategoryList();
   if (view === "favorites") loadFavList();
   if (view === "ai") loadAiMessages();
   if (view === "settings") loadSettings();
@@ -236,7 +325,7 @@ async function loadConversations() {
 // ---------- 聊天 ----------
 async function loadChatMessages() {
   if (!state.peerConvId) return;
-  await refreshTagRibbon();
+  await refreshRibbon();
   const msgs = await invoke("list_messages", { conversationId: state.peerConvId, limit: 200 });
   const container = $("messages");
   container.innerHTML = "";
@@ -355,11 +444,57 @@ $("doc-bar-cancel").addEventListener("click", () => { docDismissed = true; updat
 // 必须优先取文字——粘进来就是文字，不超限直接按文字发送，绝不能变成图片；
 // 将来做图片粘贴时，图片分支也只处理剪贴板里没有文字的纯图片（如截图）。
 $("input").addEventListener("paste", () => setTimeout(updateDocBar, 0));
+// 粘贴图片：仅当剪贴板里没有文字时才走图片分支（带文字的粘贴永远优先文字，见上方注释）。
+$("input").addEventListener("paste", async (e) => {
+  const cd = e.clipboardData;
+  if (!cd) return;
+  const text = cd.getData("text/plain");
+  if (text && text.trim()) return;
+  const item = Array.from(cd.items || []).find((i) => i.kind === "file" && i.type.startsWith("image/"));
+  if (!item) return;
+  e.preventDefault();
+  const file = item.getAsFile();
+  if (!file) return;
+  try {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+    const path = await invoke("stage_pasted_image", { dataBase64: btoa(bin), ext });
+    state.stagedImage = { path, size: file.size };
+    $("attach-text").textContent = `粘贴的图片.${ext} · ${fmtSize(file.size)}（点发送时一并发给对方）`;
+    $("attach-bar").classList.remove("hidden");
+  } catch (err) { alert("粘贴图片失败：" + err); }
+});
+$("attach-remove").addEventListener("click", () => {
+  state.stagedImage = null;
+  $("attach-bar").classList.add("hidden");
+});
 
 async function sendCurrent() {
   const raw = $("input").value;
   const text = raw.trim();
-  if (!text) return;
+  if (!text && !state.stagedImage) return;
+  // 暂存的粘贴图片先发（文件气泡由后端事件回推，与选文件发送一致）
+  if (state.stagedImage) {
+    const img = state.stagedImage;
+    state.stagedImage = null;
+    $("attach-bar").classList.add("hidden");
+    if (!state.connected) {
+      alert("尚未连接设备，图片未发送");
+    } else {
+      invoke("send_file_path", { path: img.path }).catch((e) => alert("图片发送失败：" + e));
+    }
+    if (!text) {
+      $("input").value = "";
+      docDismissed = false;
+      updateDocBar();
+      return;
+    }
+  }
   const asDoc = docSuggestion;
   const replyTo = state.replyTo;
   $("input").value = "";
@@ -510,33 +645,33 @@ $("btn-bt-connect").addEventListener("click", async () => {
   }
 });
 
-// ---------- 标签 ----------
-async function loadTagList() {
-  const tags = await invoke("list_tags");
+// ---------- 彩签总览 ----------
+async function loadCategoryList() {
+  await loadCategories();
   const list = $("tag-list");
   list.innerHTML = "";
-  if (!tags.length) {
-    list.innerHTML = `<div class="list-item"><div class="li-sub">还没有标签。在任意消息上点“标签”即可添加。</div></div>`;
-    return;
-  }
-  for (const t of tags) {
+  for (const c of state.categories) {
     const item = document.createElement("div");
     item.className = "list-item";
-    item.innerHTML = `<div class="li-title"><span><span class="tag-dot" style="background:${tagColorHex(t.color) || "var(--muted)"}"></span>${esc(t.name)}</span><span class="muted">${t.count}</span></div>`;
-    item.addEventListener("click", () => openTagDrawer(t.name));
+    item.innerHTML = `<div class="li-title"><span><span class="tag-dot" style="background:${CAT_COLORS[c.color]}"></span>${esc(c.name)}</span><span class="muted">${c.count}</span></div>`;
+    item.addEventListener("click", () => openCategoryDrawer(c.color));
     list.appendChild(item);
   }
 }
 
-async function openTagDrawer(tagName) {
-  const msgs = await invoke("list_messages_by_tag", { tag: tagName });
-  $("drawer-title").textContent = `标签：${tagName}（${msgs.length}）`;
+async function openCategoryDrawer(color) {
+  const items = await invoke("list_messages_by_category", { color });
+  $("drawer-title").textContent = `分类：${catName(color)}（${items.length}）`;
   const list = $("drawer-list");
   list.innerHTML = "";
-  for (const m of msgs) {
+  if (!items.length) {
+    list.innerHTML = `<div class="list-item"><div class="li-sub">这个分类下还没有消息。在任意消息上点「彩签」即可归类。</div></div>`;
+  }
+  for (const it of items) {
+    const m = it.message;
     const item = document.createElement("div");
     item.className = "list-item";
-    item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(m.body.slice(0, 80))}</div>`;
+    item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(it.note || m.body.slice(0, 80))}</div>`;
     item.addEventListener("click", () => locateMessage(m.conversation_id, m.id));
     list.appendChild(item);
   }
@@ -571,144 +706,238 @@ async function loadFavList() {
   }
 }
 
-// ---------- 标签编辑浮层 ----------
-async function openTagEditor(mid) {
-  state.tagEditId = mid;
-  state.tagEditList = await invoke("get_message_tags", { messageId: mid });
-  renderTagChips();
-  const pop = $("tag-pop");
+// ---------- 彩签分类选择层 ----------
+async function openCatPop(mid, anchor) {
+  state.catEditId = mid;
+  await loadCategories();
+  const mc = await invoke("get_message_category", { messageId: mid }).catch(() => null);
+  $("cat-note").value = mc && mc.note ? mc.note : "";
+  renderCatGrid(mc ? mc.color : -1);
+  const pop = $("cat-pop");
   pop.classList.remove("hidden");
-  pop.style.top = "80px";
-  pop.style.right = "380px";
-  $("tag-input").value = "";
-  $("tag-input").focus();
+  const r = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+  if (r) {
+    pop.style.top = Math.min(window.innerHeight - 330, r.bottom + 6) + "px";
+    pop.style.left = Math.max(8, Math.min(window.innerWidth - 316, r.left - 120)) + "px";
+  } else {
+    pop.style.top = "80px";
+    pop.style.left = "300px";
+  }
 }
-function renderTagChips() {
-  const box = $("tag-chips");
-  box.innerHTML = "";
-  state.tagEditList.forEach((t, i) => {
-    const chip = document.createElement("span");
-    chip.className = "tag-chip";
-    chip.innerHTML = `${esc(t)} <button>×</button>`;
-    chip.querySelector("button").addEventListener("click", () => {
-      state.tagEditList.splice(i, 1);
-      renderTagChips();
+function renderCatGrid(selected) {
+  const grid = $("cat-grid");
+  grid.innerHTML = "";
+  for (const c of state.categories) {
+    const b = document.createElement("button");
+    b.className = "cat-swatch" + (c.color === selected ? " sel" : "");
+    b.innerHTML = `<span class="cs-dot" style="background:${CAT_COLORS[c.color]}"></span><span class="cs-name">${esc(c.name)}</span>`;
+    b.addEventListener("click", async () => {
+      await invoke("set_message_category", {
+        messageId: state.catEditId,
+        color: c.color,
+        note: $("cat-note").value.trim() || null,
+      });
+      $("cat-pop").classList.add("hidden");
+      refreshAllCategoryUI(state.catEditId);
     });
-    box.appendChild(chip);
-  });
+    grid.appendChild(b);
+  }
 }
-$("tag-input").addEventListener("keydown", (e) => {
-  if (e.key !== "Enter") return;
-  const v = $("tag-input").value.trim();
-  if (!v) return;
-  if (state.tagEditList.length >= 10) { alert("一条消息最多 10 个标签"); return; }
-  if (!state.tagEditList.some((t) => t.toLowerCase() === v.toLowerCase())) state.tagEditList.push(v);
-  $("tag-input").value = "";
-  renderTagChips();
+$("cat-clear").addEventListener("click", async () => {
+  await invoke("set_message_category", { messageId: state.catEditId, color: null, note: null });
+  $("cat-pop").classList.add("hidden");
+  refreshAllCategoryUI(state.catEditId);
 });
-$("tag-cancel").addEventListener("click", () => $("tag-pop").classList.add("hidden"));
-$("tag-save").addEventListener("click", async () => {
-  await invoke("set_message_tags", { messageId: state.tagEditId, tags: state.tagEditList });
-  $("tag-pop").classList.add("hidden");
-  // 刷新该消息的标签展示与标签列表
-  const row = document.querySelector(`[data-mid="${state.tagEditId}"] .msg-tags`);
-  if (row) refreshMessageTags(state.tagEditId, row);
-  if (state.view === "tags") loadTagList();
-  refreshTagRibbon();
+$("cat-cancel").addEventListener("click", () => $("cat-pop").classList.add("hidden"));
+document.addEventListener("click", (e) => {
+  const pop = $("cat-pop");
+  if (pop && !pop.classList.contains("hidden") && !pop.contains(e.target)) pop.classList.add("hidden");
+});
+/** 归类变化后统一刷新：该消息小片、彩签条、总览（在该视图时）。 */
+function refreshAllCategoryUI(mid) {
+  if (mid) {
+    const span = document.querySelector(`[data-mid="${mid}"] .msg-tags`);
+    if (span) refreshMessageCategory(mid, span);
+  }
+  refreshRibbon();
+  if (state.view === "tags") loadCategoryList();
+}
+
+// ---------- 文件菜单 ----------
+async function openFileMenu(mid, x, y) {
+  const menu = $("file-menu");
+  let info = null;
+  try { info = await invoke("file_info", { messageId: mid }); } catch (_) { /* 忽略 */ }
+  const exists = !!(info && info.exists && info.path);
+  menu.innerHTML = "";
+  const items = [
+    ["打开", exists, async () => { await invoke("open_file", { path: info.path }); }, ""],
+    ["打开文件位置", exists, async () => { await invoke("reveal_file", { path: info.path }); }, ""],
+    ["复制文件", exists, async () => {
+      try {
+        const resp = await fetch("file://" + encodeURI(info.path));
+        const blob = await resp.blob();
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type || "application/octet-stream"]: blob })]);
+        showToast("文件已复制到剪贴板");
+      } catch (_) {
+        await navigator.clipboard.writeText(info.path);
+        showToast("此系统不支持复制文件本身，已复制文件路径");
+      }
+    }, ""],
+    ["另存为…", exists, async () => {
+      const dst = await window.__TAURI__.dialog.save({ defaultPath: info.name });
+      if (dst) {
+        await invoke("copy_file_as", { src: info.path, dst });
+        showToast("已另存为");
+      }
+    }, ""],
+    ["删除记录", true, async () => {
+      await invoke("delete_message", { messageId: mid });
+      const row = document.querySelector(`[data-mid="${mid}"]`);
+      if (row) {
+        row.remove();
+        state.renderedChat.delete(mid);
+        state.renderedAi.delete(mid);
+      }
+      showToast("记录已删除（文件本体保留）");
+    }, "fm-danger"],
+  ];
+  for (const [label, enabled, fn, cls] of items) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (cls) b.className = cls;
+    b.disabled = !enabled;
+    b.addEventListener("click", async () => {
+      menu.classList.add("hidden");
+      try { await fn(); } catch (e) { alert("操作失败：" + e); }
+    });
+    menu.appendChild(b);
+  }
+  if (!exists) {
+    const hint = document.createElement("div");
+    hint.className = "li-sub";
+    hint.style.padding = "4px 10px";
+    hint.textContent = "文件尚未接收完成或已被移动";
+    menu.appendChild(hint);
+  }
+  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
+  menu.style.top = Math.min(y, window.innerHeight - 240) + "px";
+  menu.classList.remove("hidden");
+}
+document.addEventListener("click", (e) => {
+  const menu = $("file-menu");
+  if (menu && !menu.classList.contains("hidden") && !menu.contains(e.target)) menu.classList.add("hidden");
 });
 
-// ---------- 聊天页右上角标签彩签 ----------
-// 调色板序号与存储层 tags.color 对应：0 默认，其余为彩签颜色。
-const TAG_PALETTE = [null, "#E11D48", "#EA580C", "#CA8A04", "#059669", "#0891B2", "#2563EB", "#7C3AED", "#DB2777"];
-function tagColorHex(idx) { return TAG_PALETTE[idx || 0] || null; }
-
-state.tagColorMap = {};  // 标签名（小写）→ 颜色 hex 或 null，供消息内标签小签着色
-state.ribbonMsgs = {};   // 标签名 → 本会话内消息 id 数组（时间正序）
-state.ribbonCycle = {};  // 标签名 → 已定位次数（连点轮换）
-
-/** 刷新彩签：只显示当前设备会话里出现过的标签；平时半透明不挡聊天，悬浮时凸显；点签定位，连点往前轮换。 */
-async function refreshTagRibbon() {
+// ---------- 聊天页右上角彩签（分类） ----------
+// 平时半透明贴边；悬停某个彩签弹出该分类在本会话的条目列表（备注优先），点条目定位；
+// 点彩签本体连点轮换定位；右键彩签给分类改名（改名全类同步）。
+state.ribbonMsgs = {};   // 颜色 → 本会话内该分类条目（时间正序）
+state.ribbonCycle = {};  // 颜色 → 已定位次数（连点轮换）
+async function refreshRibbon() {
   const ribbon = $("tag-ribbon");
   if (!ribbon) return;
   ribbon.innerHTML = "";
   state.ribbonMsgs = {};
   if (!state.peerConvId) return;
-  let tags = [];
-  try { tags = await invoke("list_tags"); } catch (_) { return; }
-  state.tagColorMap = {};
-  for (const t of tags) state.tagColorMap[t.name.toLowerCase()] = tagColorHex(t.color);
-  for (const t of tags) {
-    if (!t.count) continue;
-    let msgs = [];
-    try { msgs = await invoke("list_messages_by_tag", { tag: t.name }); } catch (_) { continue; }
-    const ids = msgs.filter((m) => m.conversation_id === state.peerConvId).map((m) => m.id);
-    if (!ids.length) continue;
-    state.ribbonMsgs[t.name] = ids;
-    const hex = tagColorHex(t.color);
+  await loadCategories();
+  for (const c of state.categories) {
+    if (!c.count) continue;
+    let items = [];
+    try { items = await invoke("list_messages_by_category", { color: c.color }); } catch (_) { continue; }
+    const mine = items.filter((it) => it.message.conversation_id === state.peerConvId);
+    if (!mine.length) continue;
+    state.ribbonMsgs[c.color] = mine;
     const tab = document.createElement("div");
     tab.className = "ribbon-tab";
-    if (hex) tab.style.borderLeft = `3px solid ${hex}`;
-    const dot = document.createElement("button");
-    dot.className = "r-dot";
-    dot.title = "设置标签颜色";
-    dot.style.background = hex || "var(--muted)";
-    dot.addEventListener("click", (e) => { e.stopPropagation(); openTagColorPop(t, tab); });
+    tab.style.borderLeft = `3px solid ${CAT_COLORS[c.color]}`;
     const name = document.createElement("span");
     name.className = "r-name";
-    name.textContent = t.name;
+    name.textContent = c.name;
     const count = document.createElement("span");
     count.className = "r-count";
-    count.textContent = ids.length;
-    tab.append(dot, name, count);
-    tab.title = `定位到「${t.name}」标记的消息（连点往前轮换）`;
+    count.textContent = mine.length;
+    tab.append(name, count);
+    tab.title = `「${c.name}」：点击轮换定位，悬停看列表，右键改名`;
     tab.addEventListener("click", () => {
-      const list = state.ribbonMsgs[t.name] || [];
+      const list = state.ribbonMsgs[c.color] || [];
       if (!list.length) return;
-      const n = (state.ribbonCycle[t.name] || 0) + 1;
-      state.ribbonCycle[t.name] = n;
-      const id = list[list.length - 1 - ((n - 1) % list.length)];
-      locateMessage(state.peerConvId, id);
+      const n = (state.ribbonCycle[c.color] || 0) + 1;
+      state.ribbonCycle[c.color] = n;
+      const it = list[list.length - 1 - ((n - 1) % list.length)];
+      locateMessage(state.peerConvId, it.message.id);
     });
+    tab.addEventListener("mouseenter", () => showRibbonList(c.color, tab));
+    tab.addEventListener("mouseleave", () => scheduleHideRibbonList());
+    tab.addEventListener("contextmenu", (e) => { e.preventDefault(); openRenamePop(c.color, tab); });
     ribbon.appendChild(tab);
   }
 }
 
-/** 标签颜色选择弹层：默认 + 8 色，点选即保存，并刷新彩签与已渲染消息的标签着色。 */
-function openTagColorPop(tag, anchor) {
-  const pop = $("tag-color-pop");
-  pop.innerHTML = "";
-  const title = document.createElement("div");
-  title.className = "pop-title";
-  title.textContent = `「${tag.name}」的颜色`;
-  pop.appendChild(title);
-  const row = document.createElement("div");
-  row.className = "swatches";
-  TAG_PALETTE.forEach((hex, idx) => {
-    const b = document.createElement("button");
-    b.className = "swatch" + (idx === (tag.color || 0) ? " sel" : "") + (idx === 0 ? " default" : "");
-    if (hex) b.style.background = hex; else b.textContent = "默";
-    b.title = idx === 0 ? "默认" : hex;
-    b.addEventListener("click", async () => {
-      try { await invoke("set_tag_color", { tag: tag.name, color: idx }); }
-      catch (e) { alert("设置颜色失败：" + e); }
-      pop.classList.add("hidden");
-      refreshTagRibbon();
-      document.querySelectorAll(".msg-row").forEach((r) => {
-        const span = r.querySelector(".msg-tags");
-        if (span && r.dataset.mid) refreshMessageTags(r.dataset.mid, span);
-      });
-    });
-    row.appendChild(b);
-  });
-  pop.appendChild(row);
-  const view = $("chat-view").getBoundingClientRect();
-  const r = anchor.getBoundingClientRect();
-  pop.style.top = Math.max(64, r.top - view.top) + "px";
-  pop.classList.remove("hidden");
+let ribbonHideTimer = null;
+function scheduleHideRibbonList() {
+  ribbonHideTimer = setTimeout(() => $("ribbon-list").classList.add("hidden"), 250);
 }
-// 点到弹层之外时关闭
+function showRibbonList(color, tab) {
+  clearTimeout(ribbonHideTimer);
+  const box = $("ribbon-list");
+  const items = state.ribbonMsgs[color] || [];
+  box.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "rl-head";
+  head.innerHTML = `<span class="cs-dot" style="background:${CAT_COLORS[color]}"></span><b>${esc(catName(color))}</b><span class="muted">${items.length} 条</span>`;
+  box.appendChild(head);
+  for (const it of [...items].reverse()) {
+    const d = document.createElement("div");
+    d.className = "rl-item";
+    d.innerHTML = `<div class="rl-note">${esc(it.note || it.message.body.slice(0, 60))}</div><div class="rl-sub">${fmtDay(it.message.created_at)} ${fmtTime(it.message.created_at)}${it.note ? " · " + esc(it.message.body.slice(0, 40)) : ""}</div>`;
+    d.addEventListener("click", () => {
+      box.classList.add("hidden");
+      locateMessage(it.message.conversation_id, it.message.id);
+    });
+    box.appendChild(d);
+  }
+  const r = tab.getBoundingClientRect();
+  const main = $("main").getBoundingClientRect();
+  box.style.top = Math.max(64, r.top - main.top) + "px";
+  box.classList.remove("hidden");
+}
+$("ribbon-list").addEventListener("mouseenter", () => clearTimeout(ribbonHideTimer));
+$("ribbon-list").addEventListener("mouseleave", () => scheduleHideRibbonList());
+
+// ---------- 分类改名层 ----------
+let renameColor = null;
+function openRenamePop(color, anchor) {
+  renameColor = color;
+  $("rename-input").value = catName(color);
+  const pop = $("rename-pop");
+  pop.classList.remove("hidden");
+  const r = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+  if (r) {
+    pop.style.top = Math.min(window.innerHeight - 180, r.bottom + 6) + "px";
+    pop.style.left = Math.max(8, Math.min(window.innerWidth - 276, r.left - 60)) + "px";
+  }
+  $("rename-input").focus();
+  $("rename-input").select();
+}
+$("rename-cancel").addEventListener("click", () => $("rename-pop").classList.add("hidden"));
+$("rename-save").addEventListener("click", async () => {
+  const name = $("rename-input").value.trim();
+  if (!name) return;
+  try {
+    await invoke("rename_category", { color: renameColor, name });
+    $("rename-pop").classList.add("hidden");
+    await loadCategories();
+    document.querySelectorAll(".msg-row").forEach((r) => {
+      const span = r.querySelector(".msg-tags");
+      if (span && r.dataset.mid) refreshMessageCategory(r.dataset.mid, span);
+    });
+    refreshRibbon();
+    if (state.view === "tags") loadCategoryList();
+  } catch (e) { alert("改名失败：" + e); }
+});
 document.addEventListener("click", (e) => {
-  const pop = $("tag-color-pop");
+  const pop = $("rename-pop");
   if (pop && !pop.classList.contains("hidden") && !pop.contains(e.target)) pop.classList.add("hidden");
 });
 
@@ -741,6 +970,7 @@ async function loadAiMessages() {
   container.innerHTML = "";
   state.renderedAi.clear();
   for (const m of msgs) appendMessage(container, m, state.renderedAi, { ai: true });
+  updateAiState();
 }
 
 async function sendAi() {
@@ -771,11 +1001,52 @@ async function regenerateAi() {
   state.streamEl = null;
   $("btn-ai-stop").classList.add("hidden");
 }
+$("btn-local-api").addEventListener("click", () => {
+  switchView("settings");
+  setTimeout(() => $("local-api-section").scrollIntoView({ behavior: "smooth" }), 60);
+});
+/** AI 页副标题：如实说明当前走哪条路（本机直连 / 经对端转发 / 都不可用）。 */
+async function updateAiState() {
+  try {
+    const cfg = await invoke("get_ai_config");
+    const ready = cfg.has_key && cfg.base_url && cfg.model;
+    $("ai-state").textContent = ready
+      ? "使用本机配置的 AI 接口"
+      : state.connected
+        ? `本机未配置 AI · 经${state.peerName || "对方设备"}转发回答`
+        : "本机未配置 AI，也未连接设备";
+  } catch (_) { /* 忽略 */ }
+}
 $("btn-ai-send").addEventListener("click", sendAi);
 $("ai-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendAi(); }
 });
 $("btn-ai-stop").addEventListener("click", () => invoke("ai_stop"));
+
+// ---------- 通用确认框与轻提示 ----------
+function showConfirm(text, okLabel = "确定") {
+  return new Promise((resolve) => {
+    $("modal-text").textContent = text;
+    $("modal-ok").textContent = okLabel;
+    $("modal").classList.remove("hidden");
+    const done = (v) => {
+      $("modal").classList.add("hidden");
+      $("modal-ok").onclick = null;
+      $("modal-cancel").onclick = null;
+      resolve(v);
+    };
+    $("modal-ok").onclick = () => done(true);
+    $("modal-cancel").onclick = () => done(false);
+  });
+}
+let toastTimer = null;
+function showToast(text) {
+  const t = $("toast");
+  t.textContent = text;
+  t.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add("hidden"), 2600);
+}
 
 // ---------- 设置 ----------
 async function loadSettings() {
@@ -787,15 +1058,54 @@ async function loadSettings() {
   $("ai-base").value = cfg.base_url || "";
   $("ai-model").value = cfg.model || "";
   $("ai-key").placeholder = cfg.has_key ? "已配置（留空不修改）" : "sk-…";
+  $("ai-temp").value = cfg.temperature ?? 0.7;
+  $("ai-temp-val").textContent = Number($("ai-temp").value).toFixed(1);
+  $("ai-max-tokens").value = cfg.max_tokens ?? "";
+  $("ai-prompt").value = cfg.system_prompt || "";
+  $("ai-stream").checked = cfg.stream !== false;
+  await loadGatewaySettings();
+  await loadStorageStats();
+  updateAiState();
 }
+async function loadGatewaySettings() {
+  try {
+    const g = await invoke("get_gateway_settings");
+    $("proxy-allow-toggle").checked = !!g.proxy_allow;
+    $("proxy-stats").textContent = `${g.proxy_count} 次 · 约 ${g.proxy_tokens} tokens`;
+    $("local-api-toggle").checked = !!g.local_enabled;
+    $("local-api-addr").textContent = g.local_addr;
+    $("local-api-status").textContent = g.local_enabled
+      ? (g.local_running ? "运行中" : "启动失败（端口可能被占用）")
+      : "未开启";
+    $("local-api-key").placeholder = g.local_has_key ? "已设置（留空不修改）" : "可留空";
+    $("btn-local-api-clear").classList.toggle("hidden", !g.local_has_key);
+  } catch (_) { /* 忽略 */ }
+}
+async function loadStorageStats() {
+  try {
+    const s = await invoke("storage_stats");
+    $("store-chat").textContent = `${fmtSize(s.chat_bytes)} · ${s.chat_count} 条`;
+    $("store-files").textContent = `${fmtSize(s.files_bytes)} · ${s.files_count} 个`;
+    $("store-cache").textContent = fmtSize(s.cache_bytes);
+  } catch (_) { /* 忽略 */ }
+}
+$("ai-temp").addEventListener("input", () => {
+  $("ai-temp-val").textContent = Number($("ai-temp").value).toFixed(1);
+});
 $("btn-ai-save").addEventListener("click", async () => {
+  const maxTok = parseInt($("ai-max-tokens").value, 10);
   await invoke("set_ai_config", {
     baseUrl: $("ai-base").value.trim(),
     apiKey: $("ai-key").value,
     model: $("ai-model").value.trim(),
+    stream: $("ai-stream").checked,
+    temperature: Number($("ai-temp").value),
+    maxTokens: Number.isFinite(maxTok) && maxTok > 0 ? maxTok : null,
+    systemPrompt: $("ai-prompt").value,
   });
   $("ai-key").value = "";
   $("ai-test-result").textContent = "已保存";
+  updateAiState();
 });
 $("btn-ai-test").addEventListener("click", async () => {
   $("ai-test-result").textContent = "测试中…";
@@ -803,7 +1113,56 @@ $("btn-ai-test").addEventListener("click", async () => {
     $("ai-test-result").textContent = await invoke("test_ai_connection");
   } catch (e) { $("ai-test-result").textContent = String(e); }
 });
-
+$("proxy-allow-toggle").addEventListener("change", async (e) => {
+  await invoke("set_proxy_allow", { on: e.target.checked });
+  showToast(e.target.checked ? "已允许连接设备借用本机 AI" : "已关闭 AI 转发");
+  loadGatewaySettings();
+});
+$("local-api-toggle").addEventListener("change", async (e) => {
+  await invoke("set_local_api", { enabled: e.target.checked, key: null });
+  loadGatewaySettings();
+});
+$("btn-copy-api-addr").addEventListener("click", () => {
+  navigator.clipboard
+    .writeText($("local-api-addr").textContent)
+    .then(() => showToast("接口地址已复制"));
+});
+$("btn-local-api-save").addEventListener("click", async () => {
+  const v = $("local-api-key").value;
+  if (!v) {
+    $("local-api-result").textContent = "密钥为空，未修改（清除请用清除按钮）";
+    return;
+  }
+  await invoke("set_local_api", { enabled: $("local-api-toggle").checked, key: v });
+  $("local-api-key").value = "";
+  $("local-api-result").textContent = "密钥已保存";
+  loadGatewaySettings();
+});
+$("btn-local-api-clear").addEventListener("click", async () => {
+  await invoke("set_local_api", { enabled: $("local-api-toggle").checked, key: "" });
+  $("local-api-result").textContent = "密钥已清除";
+  loadGatewaySettings();
+});
+$("btn-clean-cache").addEventListener("click", async () => {
+  const freed = await invoke("clean_cache");
+  $("store-result").textContent =
+    freed > 0 ? `已清理缓存，释放 ${fmtSize(freed)}` : "没有可清理的缓存";
+  loadStorageStats();
+});
+$("btn-clear-history").addEventListener("click", async () => {
+  const ok = await showConfirm(
+    "确定要清空全部聊天记录吗？消息、彩签归属、收藏与置顶都会一并清除，此操作不可恢复。",
+    "清空"
+  );
+  if (!ok) return;
+  await invoke("clear_chat_history");
+  $("store-result").textContent = "聊天记录已清空";
+  state.renderedChat.clear();
+  $("messages").innerHTML = "";
+  refreshRibbon();
+  loadStorageStats();
+  showToast("聊天记录已清空");
+});
 
 // ---------- 导出 ----------
 /** 导出当前设备会话为 Markdown 文本文件（路径由保存对话框选定）。 */
@@ -830,8 +1189,8 @@ async function refreshPalette(q) {
   if (state.connected) items.push({ label: "断开连接", run: () => $("btn-disconnect").click() });
   if (state.peerConvId) items.push({ label: "导出当前会话", run: () => exportCurrentConv() });
   try {
-    for (const t of await invoke("list_tags"))
-      items.push({ label: `标签：${t.name}（${t.count} 条）`, run: () => { switchView("tags"); openTagDrawer(t.name); } });
+    for (const c of await invoke("list_categories"))
+      items.push({ label: `分类：${c.name}（${c.count} 条）`, run: () => { switchView("tags"); openCategoryDrawer(c.color); } });
   } catch (_) { /* 忽略 */ }
   paletteState.items = items.filter((it) => !q || it.label.includes(q));
   paletteState.sel = 0;
@@ -879,6 +1238,7 @@ async function wireEvents() {
     await loadConversations();
     if (state.connected) { switchView("chat"); loadChatMessages(); }
     else switchView(state.view);
+    updateAiState();
   });
   await listen("message_new", (e) => {
     const m = e.payload;
@@ -887,15 +1247,17 @@ async function wireEvents() {
   });
   await listen("message_status", (e) => {
     const row = document.querySelector(`[data-mid="${e.payload.id}"] .msg-status`);
-    if (row) row.textContent = STATUS_CN[e.payload.status] || "";
+    if (row) applyStatus(row, e.payload.id, e.payload.status);
   });
   await listen("peer_typing", (e) => {
     $("typing-hint").classList.toggle("hidden", !e.payload);
   });
   await listen("transfer_progress", (e) => {
+    const { transfer_id, msg_id, received, total } = e.payload;
+    if (msg_id && transfer_id) state.transferMap[msg_id] = transfer_id;
     let b = null;
-    if (e.payload.msg_id) {
-      const row = document.querySelector(`[data-mid="${e.payload.msg_id}"]`);
+    if (msg_id) {
+      const row = document.querySelector(`[data-mid="${msg_id}"]`);
       if (row) b = row.querySelector(".bubble");
     }
     if (!b) b = state.lastFileBubble;
@@ -904,14 +1266,44 @@ async function wireEvents() {
     const fill = b.querySelector(".progress > div");
     if (bar && fill) {
       bar.classList.remove("hidden");
-      fill.style.width = e.payload.total ? (e.payload.received / e.payload.total) * 100 + "%" : "0";
+      const pct = total ? Math.floor((received / total) * 100) : 0;
+      fill.style.width = pct + "%";
+      const meta = b.querySelector(".progress-meta");
+      if (meta) {
+        meta.classList.remove("hidden");
+        meta.textContent = `${pct}% · ${fmtSize(received)} / ${fmtSize(total)}`;
+      }
+      const cancel = b.querySelector(".progress-cancel");
+      if (cancel && received < total) cancel.classList.remove("hidden");
     }
   });
   await listen("transfer_state", (e) => {
-    const b = state.lastFileBubble;
-    if (b && e.payload.state === "done") {
-      const bar = b.querySelector(".progress");
-      if (bar) setTimeout(() => bar.classList.add("hidden"), 600);
+    const { transfer_id, state: tstate } = e.payload;
+    const mid = Object.keys(state.transferMap).find((k) => state.transferMap[k] === transfer_id);
+    let b = null;
+    if (mid) {
+      const row = document.querySelector(`[data-mid="${mid}"]`);
+      if (row) b = row.querySelector(".bubble");
+    }
+    if (!b) b = state.lastFileBubble;
+    if (!b) return;
+    const bar = b.querySelector(".progress");
+    const meta = b.querySelector(".progress-meta");
+    const cancel = b.querySelector(".progress-cancel");
+    const retry = b.querySelector(".transfer-retry");
+    if (cancel) cancel.classList.add("hidden");
+    if (tstate === "done") {
+      if (meta) meta.textContent = "已完成";
+      setTimeout(() => {
+        if (bar) bar.classList.add("hidden");
+        if (meta) meta.classList.add("hidden");
+      }, 900);
+    } else if (tstate === "cancelled") {
+      if (meta) { meta.classList.remove("hidden"); meta.textContent = "已取消"; }
+      if (retry) retry.classList.remove("hidden");
+    } else if (tstate === "verify_failed") {
+      if (meta) { meta.classList.remove("hidden"); meta.textContent = "校验失败，文件不完整"; }
+      if (retry) retry.classList.remove("hidden");
     }
   });
   await listen("ai_chunk", (e) => {
@@ -949,6 +1341,7 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
 // ---------- 启动 ----------
 (async function init() {
   applyTheme(localStorage.getItem("bl-theme") || "system");
+  await loadCategories();
   state.identity = await invoke("get_identity");
   $("my-code").textContent = state.identity.code_display;
   $("my-name").textContent = state.identity.name;

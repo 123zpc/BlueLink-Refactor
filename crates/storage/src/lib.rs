@@ -123,9 +123,7 @@ impl Storage {
             "SELECT mt.message_id, t.color FROM message_tags mt JOIN tags t ON t.id=mt.tag_id
              ORDER BY mt.message_id, t.created_at ASC, t.id ASC",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         let mut seen = std::collections::HashSet::new();
         let mut winners: Vec<(String, i64)> = Vec::new();
         for row in rows {
@@ -436,9 +434,8 @@ impl Storage {
         message_id: &str,
     ) -> Result<Option<MessageCategory>, StorageError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT color, note FROM message_category WHERE message_id=?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT color, note FROM message_category WHERE message_id=?1")?;
         let mut rows = stmt.query_map(params![message_id], |r| {
             Ok(MessageCategory {
                 color: r.get(0)?,
@@ -566,7 +563,10 @@ impl Storage {
         tx.execute("DELETE FROM message_marks", [])?;
         tx.execute("DELETE FROM messages", [])?;
         // 外部内容 FTS：用 rebuild 按已清空的内容表重建索引（结果为空索引）
-        tx.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')", [])?;
+        tx.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }

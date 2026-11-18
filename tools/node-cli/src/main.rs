@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_url: base,
             api_key: key,
             model,
+            ..Default::default()
         }))
         .await;
         println!("[本机 AI 已配置]");

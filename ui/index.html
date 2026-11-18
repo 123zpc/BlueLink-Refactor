@@ -42,7 +42,7 @@
     <div class="nav-logo" title="BlueLink"><svg viewBox="0 0 24 24" class="logo-mark"><circle cx="12" cy="12" r="7.5"/></svg></div>
     <button class="nav-item active" data-view="chat" title="聊天"><svg class="ico"><use href="#i-chat"/></svg><span>聊天</span></button>
     <button class="nav-item" data-view="ai" title="AI 助手"><svg class="ico"><use href="#i-bot"/></svg><span>AI</span></button>
-    <button class="nav-item" data-view="tags" title="标签"><svg class="ico"><use href="#i-tag"/></svg><span>标签</span></button>
+    <button class="nav-item" data-view="tags" title="彩签"><svg class="ico"><use href="#i-tag"/></svg><span>彩签</span></button>
     <button class="nav-item" data-view="favorites" title="收藏"><svg class="ico"><use href="#i-star"/></svg><span>收藏</span></button>
     <div class="nav-spacer"></div>
     <button class="nav-item" data-view="settings" title="设置"><svg class="ico"><use href="#i-sliders"/></svg><span>设置</span></button>
@@ -141,10 +141,23 @@
       <div id="pin-bar" class="hidden"></div>
       <div id="messages"></div>
       <div id="tag-ribbon"></div>
-      <div id="tag-color-pop" class="hidden"></div>
+      <div id="ribbon-list" class="hidden"></div>
+      <div id="rename-pop" class="hidden">
+        <div class="tag-pop-head">分类改名（全部分类消息同步）</div>
+        <input id="rename-input" type="text" maxlength="20">
+        <div class="row-gap">
+          <button id="rename-save" class="btn primary small-btn">保存</button>
+          <button id="rename-cancel" class="btn small-btn">取消</button>
+        </div>
+      </div>
+      <button id="back-to-reply" class="btn small-btn hidden">回到回复</button>
       <div id="date-rail"></div>
       <div id="typing-hint" class="muted small hidden">对方正在输入…</div>
       <div id="composer">
+        <div id="attach-bar" class="hidden">
+          <span id="attach-text"></span>
+          <button id="attach-remove" class="btn small-btn">移除</button>
+        </div>
         <div id="reply-bar" class="hidden"></div>
         <div id="doc-bar" class="hidden">
           <span id="doc-bar-text"></span>
@@ -167,7 +180,10 @@
             <div id="ai-state" class="muted small">本机配置优先，未配置时经对方电脑代理</div>
           </div>
         </div>
-        <button id="btn-ai-stop" class="btn small-btn hidden"><svg class="ico ico-14"><use href="#i-stop"/></svg>停止</button>
+        <div class="head-actions">
+          <button id="btn-local-api" class="btn small-btn">本地 API</button>
+          <button id="btn-ai-stop" class="btn small-btn hidden"><svg class="ico ico-14"><use href="#i-stop"/></svg>停止</button>
+        </div>
       </header>
       <div id="ai-messages"></div>
       <div id="ai-composer">
@@ -207,10 +223,54 @@
         <label class="field">接口地址<input id="ai-base" type="text" placeholder="https://api.openai.com/v1"></label>
         <label class="field">密钥<input id="ai-key" type="password" placeholder="留空表示不修改"></label>
         <label class="field">模型<input id="ai-model" type="text" placeholder="如 gpt-4o-mini"></label>
+        <div class="setting-row">
+          <span>温度 <b id="ai-temp-val">0.7</b></span>
+          <input id="ai-temp" type="range" min="0" max="2" step="0.1" value="0.7" class="range-input">
+        </div>
+        <label class="field">最大回复长度（tokens，留空不限）<input id="ai-max-tokens" type="number" min="1" placeholder="不限"></label>
+        <label class="field">系统提示词<textarea id="ai-prompt" rows="2" placeholder="如：你是一个简洁的助手，回答尽量短"></textarea></label>
+        <div class="setting-row">
+          <span>流式输出</span>
+          <label class="switch"><input type="checkbox" id="ai-stream" checked><span class="switch-track"></span></label>
+        </div>
         <div class="row-gap">
           <button id="btn-ai-save" class="btn primary">保存</button>
           <button id="btn-ai-test" class="btn">测试连接</button>
           <span id="ai-test-result" class="muted small"></span>
+        </div>
+        <h3 id="local-api-section">本地 API 服务</h3>
+        <p class="muted small">在本机开放 OpenAI 兼容接口，供本机其他软件调用；请求经蓝牙由已连接设备转发到它的 AI（对方需开启「AI 转发」），或用本机配置直连。只监听本机回环地址，不对外。</p>
+        <div class="setting-row">
+          <span>本地 API 服务</span>
+          <label class="switch"><input type="checkbox" id="local-api-toggle"><span class="switch-track"></span></label>
+        </div>
+        <div class="setting-row">
+          <span>接口地址</span>
+          <span><code id="local-api-addr">http://127.0.0.1:8321/v1</code>
+          <button id="btn-copy-api-addr" class="btn small-btn">复制</button></span>
+        </div>
+        <div class="setting-row"><span>服务状态</span><span id="local-api-status" class="muted small">未开启</span></div>
+        <label class="field">本机访问密钥（可空，设置后调用需带此密钥）<input id="local-api-key" type="password" placeholder="留空表示不修改"></label>
+        <div class="row-gap">
+          <button id="btn-local-api-save" class="btn">保存密钥</button>
+          <button id="btn-local-api-clear" class="btn hidden">清除密钥</button>
+          <span id="local-api-result" class="muted small"></span>
+        </div>
+        <h3>AI 转发</h3>
+        <p class="muted small">允许已连接的设备借用本机配置的 AI 接口（花的是本机密钥额度，默认关闭）。</p>
+        <div class="setting-row">
+          <span>允许已连接设备借用本机 AI</span>
+          <label class="switch"><input type="checkbox" id="proxy-allow-toggle"><span class="switch-track"></span></label>
+        </div>
+        <div class="setting-row"><span>今日已转发</span><span id="proxy-stats" class="muted small">0 次 · 约 0 tokens</span></div>
+        <h3>存储</h3>
+        <div class="setting-row"><span>聊天记录</span><span id="store-chat" class="muted small">-</span></div>
+        <div class="setting-row"><span>接收文件</span><span id="store-files" class="muted small">-</span></div>
+        <div class="setting-row"><span>缓存（未完成的传输）</span><span id="store-cache" class="muted small">-</span></div>
+        <div class="row-gap">
+          <button id="btn-clean-cache" class="btn">清理缓存</button>
+          <button id="btn-clear-history" class="btn danger-btn">清空聊天记录</button>
+          <span id="store-result" class="muted small"></span>
         </div>
         <h3>开发者</h3>
         <div class="setting-row">
@@ -219,7 +279,7 @@
         </div>
         <p class="muted small">开启后，连接页会多出局域网测试通道（仅供开发调试）。正式使用请用蓝牙。</p>
         <h3>关于</h3>
-        <p class="muted small">BlueLink <span id="set-version">2.0.0</span> — 离线聊天与文件传输（重构版）。</p>
+        <p class="muted small">BlueLink <span id="set-version">2.2.0</span> — 离线聊天与文件传输（重构版）。</p>
       </div>
     </section>
   </main>
@@ -245,16 +305,31 @@
     <div id="drawer-list"></div>
   </div>
 
-  <!-- 标签编辑浮层 -->
-  <div id="tag-pop" class="hidden">
-    <div class="tag-pop-head">标签（回车添加，点 × 移除）</div>
-    <div id="tag-chips"></div>
-    <input id="tag-input" type="text" placeholder="新标签名，1–20 字" maxlength="20">
+  <!-- 彩签分类选择层：颜色即分类，点颜色即归类；备注优先于分类名展示 -->
+  <div id="cat-pop" class="hidden">
+    <div class="tag-pop-head">选择分类（点颜色即归类，再点同一颜色可更新备注）</div>
+    <div id="cat-grid"></div>
+    <label class="field">备注（可选）<input id="cat-note" type="text" maxlength="30" placeholder="如：终版合同"></label>
     <div class="row-gap">
-      <button id="tag-save" class="btn primary small-btn">保存</button>
-      <button id="tag-cancel" class="btn small-btn">取消</button>
+      <button id="cat-clear" class="btn small-btn">清除分类</button>
+      <button id="cat-cancel" class="btn small-btn">取消</button>
     </div>
   </div>
+
+  <!-- 文件菜单 -->
+  <div id="file-menu" class="hidden"></div>
+
+  <!-- 通用二次确认框 -->
+  <div id="modal" class="hidden">
+    <div class="modal-box">
+      <p id="modal-text"></p>
+      <div class="row-gap modal-btns">
+        <button id="modal-cancel" class="btn">取消</button>
+        <button id="modal-ok" class="btn danger-btn">确定</button>
+      </div>
+    </div>
+  </div>
+  <div id="toast" class="hidden"></div>
 </div>
 <div id="drop-overlay" class="hidden"><div class="drop-inner">释放鼠标，把文件发给对方</div></div>
 <script src="app.js"></script>
