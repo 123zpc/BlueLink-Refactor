@@ -87,6 +87,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 #aside { width: 288px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex: none; }
 .aside-head { padding: 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; }
 .aside-head .search-box { flex: 1; }
+/* 会话列表悬浮开关：圆形浮钮骑在分界线上（left 由 applyAside 按导航宽+列表宽实测设置），
+   不占布局宽度；垂直居中于分界线中段。令牌配色 + 轻阴影，明暗双主题随令牌走。 */
+#btn-aside-float { position: absolute; top: 50%; transform: translate(-50%, -50%); z-index: 25;
+  width: 28px; height: 28px; border-radius: 50%; padding: 0; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); color: var(--text-2);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.14);
+  display: flex; align-items: center; justify-content: center;
+  transition: left 0.18s ease, background-color 0.12s, border-color 0.12s, color 0.12s; }
+#btn-aside-float:hover { background: var(--panel-2); border-color: var(--border-strong); color: var(--text); }
+#btn-aside-float:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .search-box { display: flex; align-items: center; gap: 7px; background: var(--bg);
   border: 1px solid var(--border); border-radius: 8px; padding: 0 10px; color: var(--muted); }
 .search-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); color: var(--accent); }

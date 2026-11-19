@@ -56,11 +56,16 @@
         <svg class="ico ico-16"><use href="#i-search"/></svg>
         <input id="search-input" type="text" placeholder="搜索消息">
       </div>
-      <button id="btn-collapse-aside" class="icon-btn" title="收起列表"><svg class="ico ico-16"><use href="#i-chevrons-left"/></svg></button>
     </div>
     <div id="search-results" class="hidden"></div>
     <div id="conv-list"></div>
   </aside>
+
+  <!-- 会话列表悬浮开关：浮在左导航/列表与内容区的分界线上（不占布局），唯一的展开/收起入口，仅聊天页出现 -->
+  <button id="btn-aside-float" class="hidden" title="展开会话列表">
+    <svg class="ico ico-16 float-ico-open"><use href="#i-chevrons-right"/></svg>
+    <svg class="ico ico-16 float-ico-close hidden"><use href="#i-chevrons-left"/></svg>
+  </button>
 
   <!-- 内容区 -->
   <main id="main">
@@ -70,7 +75,6 @@
       <div class="connect-wrap">
         <div class="connect-head">
           <div class="head-left">
-            <button class="icon-btn btn-expand-aside hidden" title="展开会话列表"><svg class="ico ico-16"><use href="#i-chevrons-right"/></svg></button>
             <h1>连接</h1>
           </div>
           <div class="capsule"><span id="capsule-dot" class="status-dot"></span><span id="capsule-text">正在检测蓝牙…</span></div>
@@ -202,7 +206,6 @@
     <section id="chat-view" class="hidden">
       <header class="chat-head">
         <div class="head-peer">
-          <button class="icon-btn btn-expand-aside hidden" title="展开会话列表"><svg class="ico ico-16"><use href="#i-chevrons-right"/></svg></button>
           <div>
             <div id="peer-name" class="chat-title">未连接</div>
             <div id="peer-state" class="muted small">离线</div>

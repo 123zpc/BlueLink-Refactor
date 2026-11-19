@@ -347,6 +347,7 @@ function switchView(view) {
   $("fav-view").classList.toggle("hidden", view !== "favorites");
   $("settings-view").classList.toggle("hidden", view !== "settings");
   applyAside();
+  syncDrawer();
   // 视图刚变可见时补量一次输入框高度（隐藏期间 autoGrow 会跳过）
   autoGrow($("input"));
   autoGrow($("ai-input"));
@@ -362,8 +363,10 @@ document.querySelectorAll(".nav-item").forEach((b) =>
 // ---------- 会话列表收起/展开（列表只属于聊天页；收起即整列消失，不留残条） ----------
 // 默认收起（用户裁定，两次确认）：每次启动程序都以收起状态进入，不沿用上次退出时的展开状态；
 // 本次运行内用户展开/收起的选择照常生效，重启后回到收起。
-// 状态只许由展开/收起按钮改：页面切换永不自动弹开（v2.4.1 修——旧版导航点「聊天」时
-// 会强制把收起状态改成展开，用户反馈一切换菜单列表就自己弹开；展开改走页头专用按钮）。
+// 状态只许由悬浮开关改：页面切换永不自动弹开（v2.4.1 修——旧版导航点「聊天」时
+// 会强制把收起状态改成展开，用户反馈一切换菜单列表就自己弹开）。
+// 开关形态（v2.4.1 用户定版）：唯一的展开/收起入口是骑在左导航/列表与内容区分界线上的
+// 圆形悬浮按钮（原页头 » 展开按钮与列表头 « 收起按钮已收敛删除），仅聊天页出现。
 let asideBootDone = false;
 function applyAside() {
   if (!asideBootDone) {
@@ -372,19 +375,23 @@ function applyAside() {
   }
   const collapsed = localStorage.getItem("bl-aside") === "collapsed";
   $("aside").classList.toggle("hidden", state.view !== "chat" || collapsed);
-  // 展开入口（连接页/聊天页页头的 » 按钮）只在聊天页且列表收起时出现
-  document.querySelectorAll(".btn-expand-aside").forEach((b) =>
-    b.classList.toggle("hidden", !(state.view === "chat" && collapsed)));
+  // 悬浮开关定位：收起时贴导航右缘、展开时贴列表右缘（按实测宽：导航宽 + 列表实宽，
+  // 列表隐藏时实宽为 0，自然落在导航右缘）；图标随状态翻转。
+  const fb = $("btn-aside-float");
+  const onChat = state.view === "chat";
+  fb.classList.toggle("hidden", !onChat);
+  if (onChat) {
+    fb.style.left = ($("nav").offsetWidth + $("aside").offsetWidth) + "px";
+    fb.querySelector(".float-ico-open").classList.toggle("hidden", !collapsed);
+    fb.querySelector(".float-ico-close").classList.toggle("hidden", collapsed);
+    fb.title = collapsed ? "展开会话列表" : "收起会话列表";
+  }
 }
-$("btn-collapse-aside").addEventListener("click", () => {
-  localStorage.setItem("bl-aside", "collapsed");
+$("btn-aside-float").addEventListener("click", () => {
+  const collapsed = localStorage.getItem("bl-aside") === "collapsed";
+  localStorage.setItem("bl-aside", collapsed ? "open" : "collapsed");
   applyAside();
 });
-document.querySelectorAll(".btn-expand-aside").forEach((b) =>
-  b.addEventListener("click", () => {
-    localStorage.setItem("bl-aside", "open");
-    applyAside();
-  }));
 
 // ---------- 会话列表 ----------
 async function loadConversations() {
@@ -1236,6 +1243,13 @@ async function loadCategoryList() {
   }
 }
 
+// 抽屉只属于彩签页：开关状态（drawerOpen + 选中分类 drawerColor）跨页保持，但可见性
+// 跟随当前页——离开彩签页随页隐藏、切回时原样恢复，绝不漏到其他页面（v2.4.1 修：
+// 此前抽屉挂在顶层且切页不处理，开着切到 AI/设置页会一直盖在那些页面上）。
+let drawerOpen = false;
+function syncDrawer() {
+  $("drawer").classList.toggle("hidden", !(drawerOpen && state.view === "tags"));
+}
 async function openCategoryDrawer(color) {
   const items = await invoke("list_messages_by_category", { color });
   drawerColor = color;
@@ -1254,9 +1268,10 @@ async function openCategoryDrawer(color) {
     item.addEventListener("click", () => locateMessage(m.conversation_id, m.id, CAT_COLORS[color]));
     list.appendChild(item);
   }
-  $("drawer").classList.remove("hidden");
+  drawerOpen = true;
+  syncDrawer();
 }
-function closeDrawer() { $("drawer").classList.add("hidden"); resetCatRenameEdit(); }
+function closeDrawer() { drawerOpen = false; syncDrawer(); resetCatRenameEdit(); }
 $("drawer-close").addEventListener("click", closeDrawer);
 
 async function toggleMark(mid, kind) {
@@ -1525,7 +1540,7 @@ async function refreshAfterCategoryRename() {
   });
   refreshRibbon();
   if (state.view === "tags") loadCategoryList();
-  if (drawerColor !== null && !$("drawer").classList.contains("hidden")) {
+  if (drawerColor !== null && drawerOpen) {
     const items = await invoke("list_messages_by_category", { color: drawerColor });
     $("drawer-title").textContent = `分类：${catName(drawerColor)}（${items.length}）`;
   }
