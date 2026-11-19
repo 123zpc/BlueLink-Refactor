@@ -682,8 +682,8 @@ mod imp {
 
     /// AEP 信号缓存：MAC(u64) → SignalStrength 原始值（未过刻度护栏的原值，
     /// 护栏在合并时应用）。由 AEP 枚举（60 秒节流）刷新，list_found 读取。
-    static AEP_RSSI_CACHE: Mutex<std::collections::HashMap<u64, i32>> =
-        Mutex::new(std::collections::HashMap::new());
+    static AEP_RSSI_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, i32>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
     /// AEP 核心键：逐项与微软官方《Device information properties》的
     /// AssociationEndpoint 属性表核对无误；探针的重点 SignalStrength 在此组，
