@@ -217,14 +217,6 @@
       <div id="messages"></div>
       <div id="tag-ribbon"></div>
       <div id="ribbon-list" class="hidden"></div>
-      <div id="rename-pop" class="hidden">
-        <div class="tag-pop-head">分类改名（全部分类消息同步）</div>
-        <input id="rename-input" type="text" maxlength="20">
-        <div class="row-gap">
-          <button id="rename-save" class="btn primary small-btn">保存</button>
-          <button id="rename-cancel" class="btn small-btn">取消</button>
-        </div>
-      </div>
       <button id="back-to-reply" class="btn small-btn hidden">回到回复</button>
       <button id="btn-bottom" class="btn small-btn hidden">↓ 回到底部</button>
       <div id="date-rail"></div>
@@ -259,7 +251,7 @@
           </div>
         </div>
         <div class="head-actions">
-          <label class="muted small">默认AI
+          <label class="muted small ai-source-label">默认AI
             <select id="ai-source">
               <option value="auto">自动</option>
               <option value="local">本机AI</option>
@@ -387,10 +379,28 @@
     </div>
   </div>
 
+  <!-- 分类改名层：挂在顶层而非聊天页内，否则彩签页等其他页面打开时它被藏在 display:none 的子树里看不见 -->
+  <div id="rename-pop" class="hidden">
+    <div class="tag-pop-head">分类改名（全部分类消息同步）</div>
+    <input id="rename-input" type="text" maxlength="16">
+    <div class="row-gap">
+      <button id="rename-save" class="btn primary small-btn">保存</button>
+      <button id="rename-cancel" class="btn small-btn">取消</button>
+    </div>
+  </div>
+
   <!-- 标签消息抽屉 -->
   <div id="drawer" class="hidden">
     <div class="drawer-head">
-      <b id="drawer-title">标签</b>
+      <div class="drawer-title-area">
+        <b id="drawer-title">标签</b>
+        <button id="btn-cat-rename" class="btn small-btn">重命名</button>
+        <span id="cat-rename-edit" class="hidden">
+          <input id="cat-rename-input" type="text" maxlength="16" placeholder="分类名称">
+          <button id="cat-rename-save" class="btn primary small-btn" title="保存（Enter）"><svg class="ico ico-14"><use href="#i-check"/></svg></button>
+          <button id="cat-rename-cancel" class="btn small-btn" title="取消（Esc）"><svg class="ico ico-14"><use href="#i-x"/></svg></button>
+        </span>
+      </div>
       <button id="drawer-close" class="icon-btn" title="关闭"><svg class="ico"><use href="#i-x"/></svg></button>
     </div>
     <div id="drawer-list"></div>

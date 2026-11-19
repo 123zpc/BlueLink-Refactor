@@ -1231,12 +1231,15 @@ async function loadCategoryList() {
     item.className = "list-item";
     item.innerHTML = `<div class="li-title"><span><span class="tag-dot" style="background:${CAT_COLORS[c.color]}"></span>${esc(c.name)}</span><span class="muted">${c.count}</span></div>`;
     item.addEventListener("click", () => openCategoryDrawer(c.color));
+    item.addEventListener("contextmenu", (e) => { e.preventDefault(); openRenamePop(c.color, item); });
     list.appendChild(item);
   }
 }
 
 async function openCategoryDrawer(color) {
   const items = await invoke("list_messages_by_category", { color });
+  drawerColor = color;
+  resetCatRenameEdit();
   $("drawer-title").textContent = `分类：${catName(color)}（${items.length}）`;
   const list = $("drawer-list");
   list.innerHTML = "";
@@ -1253,7 +1256,7 @@ async function openCategoryDrawer(color) {
   }
   $("drawer").classList.remove("hidden");
 }
-function closeDrawer() { $("drawer").classList.add("hidden"); }
+function closeDrawer() { $("drawer").classList.add("hidden"); resetCatRenameEdit(); }
 $("drawer-close").addEventListener("click", closeDrawer);
 
 async function toggleMark(mid, kind) {
@@ -1510,14 +1513,54 @@ $("rename-save").addEventListener("click", async () => {
   try {
     await invoke("rename_category", { color: renameColor, name });
     $("rename-pop").classList.add("hidden");
-    await loadCategories();
-    document.querySelectorAll(".msg-row").forEach((r) => {
-      const span = r.querySelector(".msg-tags");
-      if (span && r.dataset.mid) refreshMessageCategory(r.dataset.mid, span);
-    });
-    refreshRibbon();
-    if (state.view === "tags") loadCategoryList();
+    await refreshAfterCategoryRename();
   } catch (e) { showToast("改名失败：" + e); }
+});
+// 改名成功后的统一刷新：分类缓存、聊天里的小片、彩签悬浮列表、彩签页列表、打开中的详情标题。
+async function refreshAfterCategoryRename() {
+  await loadCategories();
+  document.querySelectorAll(".msg-row").forEach((r) => {
+    const span = r.querySelector(".msg-tags");
+    if (span && r.dataset.mid) refreshMessageCategory(r.dataset.mid, span);
+  });
+  refreshRibbon();
+  if (state.view === "tags") loadCategoryList();
+  if (drawerColor !== null && !$("drawer").classList.contains("hidden")) {
+    const items = await invoke("list_messages_by_category", { color: drawerColor });
+    $("drawer-title").textContent = `分类：${catName(drawerColor)}（${items.length}）`;
+  }
+}
+
+// ---------- 彩签页详情抽屉内联改名 ----------
+let drawerColor = null;
+function resetCatRenameEdit() {
+  $("cat-rename-edit").classList.add("hidden");
+  $("drawer-title").classList.remove("hidden");
+  $("btn-cat-rename").classList.remove("hidden");
+}
+$("btn-cat-rename").addEventListener("click", () => {
+  if (drawerColor === null) return;
+  $("cat-rename-input").value = catName(drawerColor);
+  $("drawer-title").classList.add("hidden");
+  $("btn-cat-rename").classList.add("hidden");
+  $("cat-rename-edit").classList.remove("hidden");
+  $("cat-rename-input").focus();
+  $("cat-rename-input").select();
+});
+async function saveCatRename() {
+  const name = $("cat-rename-input").value.trim();
+  if (!name) { showToast("分类名不能为空"); $("cat-rename-input").focus(); return; }
+  try {
+    await invoke("rename_category", { color: drawerColor, name });
+    resetCatRenameEdit();
+    await refreshAfterCategoryRename();
+  } catch (e) { showToast("改名失败：" + e); }
+}
+$("cat-rename-save").addEventListener("click", saveCatRename);
+$("cat-rename-cancel").addEventListener("click", resetCatRenameEdit);
+$("cat-rename-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") saveCatRename();
+  else if (e.key === "Escape") resetCatRenameEdit();
 });
 document.addEventListener("click", (e) => {
   const pop = $("rename-pop");
