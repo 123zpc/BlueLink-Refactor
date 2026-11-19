@@ -24,6 +24,7 @@ const state = {
   lastFileBubble: null,
   btDevice: null,
   btDeviceName: null,
+  connectTransport: null, // 本次连接用的传输（自发起时记下，已连接卡副行用；被动连入时为 null）
   devMode: false,
 };
 
@@ -694,6 +695,8 @@ $("btn-file").addEventListener("click", async () => {
 });
 
 $("btn-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
+$("btn-connected-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
+$("btn-goto-chat").addEventListener("click", () => switchView("chat"));
 
 // ---------- 连接（蓝牙） ----------
 // 传输选择（仅开发者模式可用，存设置键 bt_transport）：
@@ -733,7 +736,7 @@ async function switchTransport(t) {
       await invoke("bt_start_scan", { transport: effectiveTransport() });
     } catch (e) {
       scanning = false;
-      $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`;
+      setScanningUI();
       $("connect-error").textContent = String(e);
     }
   }
@@ -742,56 +745,164 @@ $("seg-classic").addEventListener("click", () => switchTransport("classic"));
 $("seg-ble").addEventListener("click", () => switchTransport("ble"));
 $("seg-simpleble").addEventListener("click", () => switchTransport("simpleble"));
 
+/** 传输的中文名（设备行副行、已连接卡、上次连接卡共用）。 */
+function transportName(t) {
+  return t === "classic" ? "经典蓝牙" : t === "simpleble" ? "SimpleBLE" : t === "lan" ? "局域网" : "BLE";
+}
+
+let lastBtState = null;
+
+/** 顶部状态胶囊：已连接 > 扫描中 > 生效传输的服务状态（短文案，详状看右侧状态卡）。 */
+function updateCapsule() {
+  const dot = $("capsule-dot");
+  const txt = $("capsule-text");
+  if (state.connected) {
+    dot.className = "status-dot on";
+    txt.textContent = `已连接 ${state.peerName || ""}`.trim();
+    return;
+  }
+  if (scanning) {
+    dot.className = "status-dot on";
+    txt.textContent = "扫描中…";
+    return;
+  }
+  const s = lastBtState;
+  if (!s) {
+    dot.className = "status-dot";
+    txt.textContent = "正在检测蓝牙…";
+    return;
+  }
+  const t = effectiveTransport();
+  if (t === "classic") {
+    if (s.classic_serving) { dot.className = "status-dot on"; txt.textContent = "经典蓝牙已开启 · 服务运行中"; }
+    else if (!s.classic_available) { dot.className = "status-dot off"; txt.textContent = "经典蓝牙不可用"; }
+    else if (String(s.classic_message).includes("服务启动失败")) { dot.className = "status-dot warn"; txt.textContent = "经典蓝牙服务启动失败"; }
+    else { dot.className = "status-dot warn"; txt.textContent = "经典蓝牙已开启 · 服务未启动"; }
+  } else if (t === "simpleble") {
+    if (s.simpleble_serving) { dot.className = "status-dot on"; txt.textContent = "SimpleBLE 已开启 · 服务运行中"; }
+    else if (!s.simpleble_compiled) { dot.className = "status-dot warn"; txt.textContent = "SimpleBLE 未编译 · 已回落经典蓝牙"; }
+    else if (!s.simpleble_available) { dot.className = "status-dot off"; txt.textContent = "未检测到蓝牙"; }
+    else { dot.className = "status-dot warn"; txt.textContent = "SimpleBLE 已开启 · 广播未启动"; }
+  } else {
+    if (s.advertising) { dot.className = "status-dot on"; txt.textContent = "蓝牙已开启 · 可被发现"; }
+    else if (!s.available) { dot.className = "status-dot off"; txt.textContent = "未检测到蓝牙"; }
+    else { dot.className = "status-dot warn"; txt.textContent = "蓝牙已开启 · 广播未启动"; }
+  }
+}
+
+/** 右侧「连接状态」卡：每个传输一行（圆点+人话文案），异常行橙色并附说明小字。
+ * 原型常态两行（经典 + BLE）；开发者模式下多一行 SimpleBLE。 */
+function renderStatusCard(s) {
+  const lines = [];
+  const line = (dot, text, warn = false, note = "") =>
+    `<div class="status-line${warn ? " warn" : ""}"><span class="status-dot ${dot}"></span><span>${esc(text)}</span></div>${note ? `<p class="status-note">${esc(note)}</p>` : ""}`;
+  // 经典蓝牙行
+  if (s.classic_serving && String(s.classic_message).includes("可被附近设备发现")) {
+    lines.push(line("on", "经典蓝牙：已开启，服务运行中"));
+  } else if (s.classic_serving) {
+    lines.push(line("warn", "经典蓝牙：服务已启动，但 SDP 注册失败，对方可能找不到本机", true));
+  } else if (String(s.classic_message).includes("服务启动失败")) {
+    // 服务启动失败的人话说明：端口占用（WSA 10048）是最常见的一种，给出可操作解释
+    const raw = String(s.classic_message);
+    const note = raw.includes("10048")
+      ? "端口被其他程序占用，关掉另一个 BlueLink 或老版本后重启本应用；你主动连接别人不受影响"
+      : raw.replace(/^经典蓝牙已开启，但服务启动失败：?/, "");
+    lines.push(line("warn", "经典蓝牙：服务启动失败", true, note));
+  } else if (!s.classic_available) {
+    // 后端文案本身已带「经典蓝牙」前缀时（如「经典蓝牙仅支持 Windows」）不重复加前缀
+    lines.push(line("off", String(s.classic_message).startsWith("经典蓝牙") ? s.classic_message : `经典蓝牙：${s.classic_message}`));
+  } else {
+    lines.push(line("warn", "经典蓝牙：已开启，但服务未启动", true));
+  }
+  // BLE 行
+  if (s.advertising) {
+    lines.push(line("on", "BLE：已开启"));
+  } else if (!s.available) {
+    lines.push(line("off", "BLE：未检测到蓝牙适配器或蓝牙未开启"));
+  } else {
+    lines.push(line("warn", `BLE：${String(s.message).replace(/^蓝牙/, "")}`, true));
+  }
+  // SimpleBLE 行（仅开发者模式）
+  if (state.devMode) {
+    if (s.simpleble_serving) lines.push(line("on", "SimpleBLE：已开启"));
+    else if (!s.simpleble_compiled) lines.push(line("warn", "SimpleBLE：未编译进本版本，已回落经典蓝牙", true));
+    else if (!s.simpleble_available) lines.push(line("off", "SimpleBLE：未检测到蓝牙适配器或蓝牙未开启"));
+    else lines.push(line("warn", "SimpleBLE：广播未启动", true, s.simpleble_message));
+  }
+  $("status-lines").innerHTML = lines.join("");
+}
+
 async function refreshBtState() {
   try {
     const s = await invoke("bt_state");
+    lastBtState = s;
     btClassicAvailable = !!s.classic_available;
     btStateLoaded = true;
-    // 传输选择行仅开发者模式显示，普通模式连接页保持干净
-    $("bt-transport-row").classList.toggle("hidden", !(state.devMode && (s.classic_available || s.available || s.simpleble_available)));
     syncTransportSeg();
-    if (effectiveTransport() === "simpleble") {
-      // SimpleBLE 状态如实展示：未编译时后端文案会写明已回落经典蓝牙
-      $("bt-status-text").textContent = s.simpleble_message;
-      $("bt-status-dot").className = "status-dot" + (s.simpleble_serving ? " on" : s.simpleble_available || !s.simpleble_compiled ? " warn" : " off");
-      $("btn-scan").disabled = false;
-      return;
-    }
-    if (effectiveTransport() === "classic") {
-      $("bt-status-text").textContent = s.classic_message;
-      $("bt-status-dot").className = "status-dot" + (s.classic_serving ? " on" : " warn");
-      $("btn-scan").disabled = false;
-      return;
-    }
-    $("bt-status-text").textContent = s.message;
-    $("bt-status-dot").className = "status-dot" + (s.advertising ? " on" : s.available ? " warn" : " off");
-    if (!s.available) {
-      $("btn-scan").disabled = true;
+    renderStatusCard(s);
+    updateCapsule();
+    // 生效传输不可用时禁用扫描按钮（点了也必然失败，不如一开始就明示）
+    const t = effectiveTransport();
+    $("btn-scan").disabled = (t === "classic" && !s.classic_available) || (t === "ble" && !s.available);
+    if (t === "ble" && !s.available) {
       $("bt-empty").textContent = "未检测到可用的蓝牙：请确认设备有蓝牙并已在系统中开启。";
-    } else {
-      $("btn-scan").disabled = false;
     }
   } catch (_) { btStateLoaded = true; }
 }
 
 let scanning = false;
-$("btn-scan").addEventListener("click", async () => {
+let hasScanned = false; // 本次运行扫过至少一轮（决定空列表显示「没有发现设备」还是初始提示）
+let lastDevices = []; // 最近一次 bt_devices 快照（选中行重渲染、上次连接徽标刷新用）
+
+/** 扫描按钮与胶囊随 scanning 状态同步（全页统一入口，别再各处改按钮文案）。 */
+function setScanningUI() {
+  $("btn-scan").textContent = scanning ? "停止" : "扫描";
+  updateCapsule();
+  updateDevicePanelState();
+}
+
+/** 左面板空态区：有设备时全收；扫描中给提示；扫过且为空给大空态；初始给一行提示。 */
+function updateDevicePanelState() {
+  const emptyState = $("bt-empty-state");
+  const hint = $("bt-empty");
+  if (lastDevices.length > 0) {
+    emptyState.classList.add("hidden");
+    if (!lastBtState || effectiveTransport() !== "ble" || lastBtState.available) hint.textContent = "";
+    return;
+  }
+  if (scanning) {
+    emptyState.classList.add("hidden");
+    hint.textContent = "正在扫描附近的设备…";
+  } else if (hasScanned) {
+    emptyState.classList.remove("hidden");
+    hint.textContent = "";
+  } else {
+    emptyState.classList.add("hidden");
+    if (!lastBtState || effectiveTransport() !== "ble" || lastBtState.available) {
+      hint.textContent = "点「扫描」查找附近打开了 BlueLink 的设备。";
+    }
+  }
+}
+
+async function toggleScan() {
   $("connect-error").textContent = "";
   try {
     if (scanning) {
       await invoke("bt_stop_scan");
       scanning = false;
-      $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`;
-      $("bt-empty").textContent = "点「扫描」查找附近打开了 BlueLink 的设备。";
+      hasScanned = true;
+      setScanningUI();
     } else {
       if (!btStateLoaded) await refreshBtState();
       await invoke("bt_start_scan", { transport: effectiveTransport() });
       scanning = true;
-      $("btn-scan").innerHTML = "停止";
-      $("bt-empty").textContent = "正在扫描附近的设备…";
+      hasScanned = true;
+      setScanningUI();
     }
   } catch (e) { $("connect-error").textContent = String(e); }
-});
+}
+$("btn-scan").addEventListener("click", toggleScan);
+$("btn-rescan").addEventListener("click", toggleScan);
 
 /** 信号格数图标：按 RSSI 分 4 格（原型裁定，不用 dBm 文字）。 */
 function sigBars(rssi) {
@@ -801,29 +912,49 @@ function sigBars(rssi) {
   return `<span class="sig" title="信号 ${rssi} dBm">${bars}</span>`;
 }
 
-/** 渲染扫描到的设备列表（bt_devices 事件推送快照）。 */
+/** 渲染扫描到的设备列表（bt_devices 事件推送快照）。
+ * 行结构（定版原型）：蓝牙图标 / 设备名（+上次连接或已连接徽标）/ 副行「传输 · 已配对」/
+ * 信号格（仅有 RSSI 时渲染，经典扫描没有就不画、不造假）/ 连接或断开按钮。
+ * 扫描中在列表尾部挂骨架行，表示还在找。 */
 function renderBtDevices(devices) {
+  lastDevices = devices;
+  if (scanning) hasScanned = true;
   const list = $("bt-device-list");
   list.innerHTML = "";
-  if (devices.length) $("bt-empty").textContent = "";
-  else if (scanning) $("bt-empty").textContent = "正在扫描附近的设备…";
+  $("device-count").textContent = `${devices.length} 台`;
   for (const d of devices) {
+    const isConnectedPeer = state.connected && state.peerName && d.name === state.peerName;
+    const isLastPeer = !isConnectedPeer && state.lastPeer && state.lastPeer.deviceId === d.id;
     const row = document.createElement("div");
     row.className = "bt-device" + (state.btDevice === d.id ? " selected" : "");
-    row.innerHTML = `<span class="bt-device-ico">${iconUse("i-bt", "ico ico-18")}</span>
-      <span class="bt-device-main"><span class="bt-device-name">${esc(d.name)}</span>
-      <span class="bt-device-sub">${d.rssi != null ? `信号 ${d.rssi} dBm` : effectiveTransport() === "classic" ? "经典蓝牙" : "蓝牙设备"}</span></span>
-      <button class="btn small-btn">连接</button>`;
-    row.querySelector("button").addEventListener("click", () => {
-      state.btDevice = d.id;
-      state.btDeviceName = d.name;
-      renderBtDevices(devices);
-      $("bt-code-row").classList.remove("hidden");
-      $("bt-peer-code").focus();
-      $("connect-status").textContent = `已选择「${d.name}」，输入对方屏幕上的连接码后点连接。`;
-    });
+    row.innerHTML = `<span class="bt-device-ico">${iconUse("i-bt", "ico ico-20")}</span>
+      <span class="bt-device-main"><span class="bt-device-name"><span class="nm">${esc(d.name)}</span>${
+        isConnectedPeer ? `<span class="peer-badge connected">已连接</span>`
+          : isLastPeer ? `<span class="peer-badge">上次连接</span>` : ""
+      }</span>
+      <span class="bt-device-sub">${transportName(effectiveTransport())}${d.paired ? " · 已配对" : ""}</span></span>
+      ${d.rssi != null ? sigBars(d.rssi) : ""}
+      ${isConnectedPeer
+        ? `<button class="btn small-btn danger-outline">断开</button>`
+        : `<button class="btn small-btn primary">连接</button>`}`;
+    const btn = row.querySelector("button");
+    if (isConnectedPeer) {
+      btn.addEventListener("click", async () => { await invoke("disconnect"); });
+    } else {
+      btn.addEventListener("click", () => openCodeCard(d));
+    }
     list.appendChild(row);
   }
+  if (scanning) {
+    const skelCount = devices.length ? 1 : 2;
+    for (let i = 0; i < skelCount; i++) {
+      const skel = document.createElement("div");
+      skel.className = "bt-skeleton";
+      skel.innerHTML = `<span class="skel skel-ico"></span><span style="flex:1"><span class="skel skel-line" style="display:block;width:45%;margin-bottom:8px"></span><span class="skel skel-line" style="display:block;width:28%"></span></span>`;
+      list.appendChild(skel);
+    }
+  }
+  updateDevicePanelState();
   // 「上次连接」一键重连（蓝牙）：后台扫描就是为它跑的，名单里出现目标设备就自动发起连接
   if (pendingRemembered) {
     const hit = devices.find((d) => d.id === pendingRemembered.deviceId);
@@ -833,11 +964,12 @@ function renderBtDevices(devices) {
       clearTimeout(rememberedTimer);
       state.btDevice = hit.id;
       state.btDeviceName = hit.name;
+      state.connectTransport = p.transport;
       $("last-peer-status").textContent = `已找到「${hit.name}」，正在连接…`;
       invoke("bt_connect", { deviceId: p.deviceId, code: p.code, transport: p.transport })
         .then(() => saveLastPeer({ transport: p.transport, deviceId: p.deviceId, code: p.code, name: hit.name }))
         .catch((e) => { $("last-peer-status").textContent = ""; $("connect-error").textContent = String(e); });
-      if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`; }
+      if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; setScanningUI(); }
     }
   }
 }
@@ -854,21 +986,32 @@ async function saveLastPeer(p) {
   loadLastPeer();
 }
 
+/** 步骤卡两种形态（定版原型）：有上次连接记录时是简版三步；
+ * 没有记录时换成详细指南版（教对方怎么连本机），提示行也随之换。 */
+function updateStepsCard(hasLastPeer) {
+  $("steps-short").classList.toggle("hidden", !hasLastPeer);
+  $("steps-guide").classList.toggle("hidden", hasLastPeer);
+  $("steps-tip").textContent = hasLastPeer
+    ? "提示：对方连不上时，先确认两边蓝牙都已开启"
+    : "提示：不要把连接码发给陌生人";
+}
+
 async function loadLastPeer() {
   const box = $("last-peer");
   try {
     const raw = await invoke("get_last_peer");
     const p = raw ? JSON.parse(raw) : null;
-    if (!p || !p.name) { box.classList.add("hidden"); return; }
+    if (!p || !p.name) { box.classList.add("hidden"); state.lastPeer = null; updateStepsCard(false); renderBtDevices(lastDevices); return; }
     // 局域网与 SimpleBLE 记录只在开发者模式下可用（与各自的入口一致），关了开发者模式就不显示
-    if ((p.transport === "lan" || p.transport === "simpleble") && !state.devMode) { box.classList.add("hidden"); return; }
+    if ((p.transport === "lan" || p.transport === "simpleble") && !state.devMode) { box.classList.add("hidden"); updateStepsCard(false); return; }
     state.lastPeer = p;
     $("last-peer-name").textContent = p.name;
     const when = p.ts ? (() => { const d = new Date(p.ts); const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`; })() : "";
-    $("last-peer-sub").textContent = `${p.transport === "lan" ? "局域网" : p.transport === "classic" ? "经典蓝牙" : p.transport === "simpleble" ? "SimpleBLE" : "BLE"}${when ? " · 上次 " + when : ""}`;
-    $("last-peer-ico").setAttribute("href", p.transport === "lan" ? "#i-wifi" : "#i-bt");
+    $("last-peer-sub").textContent = `${transportName(p.transport)}${when ? " · " + when : ""}`;
     $("last-peer-status").textContent = "";
     box.classList.remove("hidden");
+    updateStepsCard(true);
+    renderBtDevices(lastDevices);
   } catch (_) { box.classList.add("hidden"); }
 }
 
@@ -876,6 +1019,8 @@ $("last-peer-clear").addEventListener("click", async () => {
   await invoke("set_last_peer", { json: "" }).catch(() => {});
   state.lastPeer = null;
   $("last-peer").classList.add("hidden");
+  updateStepsCard(false);
+  renderBtDevices(lastDevices);
 });
 
 $("last-peer-connect").addEventListener("click", async () => {
@@ -883,6 +1028,7 @@ $("last-peer-connect").addEventListener("click", async () => {
   if (!p) return;
   $("connect-error").textContent = "";
   if (p.transport === "lan") {
+    state.connectTransport = "lan";
     $("last-peer-status").textContent = `正在连接「${p.name}」…`;
     try {
       const name = await invoke("connect_to", { addr: p.addr, code: p.code });
@@ -905,13 +1051,14 @@ $("last-peer-connect").addEventListener("click", async () => {
       if (pendingRemembered) {
         pendingRemembered = null;
         $("last-peer-status").textContent = "未找到该设备，请确认对方已开机并打开 BlueLink 后再试。";
-        if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`; }
+        if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; setScanningUI(); }
       }
     }, 25000);
     try {
       await invoke("bt_start_scan", { transport: t });
       scanning = true;
-      $("btn-scan").innerHTML = "停止";
+      hasScanned = true;
+      setScanningUI();
     } catch (e) {
       pendingRemembered = null;
       clearTimeout(rememberedTimer);
@@ -924,18 +1071,30 @@ $("last-peer-connect").addEventListener("click", async () => {
 // ---------- 开发者模式（局域网测试通道 + 传输切换，正式版默认隐藏） ----------
 function applyDevMode(on) {
   state.devMode = on;
-  $("dev-lan-section").classList.toggle("hidden", !on);
+  // 开发者卡（传输切换 + 局域网入口）只在开发者模式出现在右栏顶部
+  $("dev-card").classList.toggle("hidden", !on);
+  if (!on) {
+    $("dev-lan-section").classList.add("hidden");
+    $("lan-toggle-label").textContent = "进入 ›";
+  }
   const row = $("dev-mode-row");
   if (row) row.classList.toggle("hidden", !on);
-  // 传输选择行与状态行随开发者模式重新计算（选择行只在开发者模式出现）
+  // 状态卡的 SimpleBLE 行、传输选择随开发者模式重新计算
   refreshBtState();
+  // 上次连接卡的可见性与开发者模式相关（局域网/SimpleBLE 记录），一并刷新
+  loadLastPeer();
   // 开关开发者模式时停掉进行中的扫描，避免新旧传输混杂
   if (scanning) {
     invoke("bt_stop_scan").catch(() => {});
     scanning = false;
-    $("btn-scan").innerHTML = `${iconUse("i-search", "ico ico-14")}扫描`;
+    setScanningUI();
   }
 }
+// 局域网测试入口行：点「进入」展开局域网连接区（定版原型开发者卡形态）
+$("btn-lan-toggle").addEventListener("click", () => {
+  const nowHidden = $("dev-lan-section").classList.toggle("hidden");
+  $("lan-toggle-label").textContent = nowHidden ? "进入 ›" : "收起 ›";
+});
 // 开发者模式开关：设置页连点版本号三次（用户 2026-11-18 定版入口，替代原开关）
 let versionClicks = 0;
 let versionClickTimer = null;
@@ -966,6 +1125,7 @@ $("btn-connect").addEventListener("click", async () => {
   const code = $("peer-code").value.trim();
   if (!addr || !code) { $("connect-error").textContent = "请填写对方地址和连接码"; return; }
   $("connect-status").textContent = "正在连接…";
+  state.connectTransport = "lan";
   try {
     const name = await invoke("connect_to", { addr, code });
     saveLastPeer({ transport: "lan", addr, code, name: name || "对方设备" });
@@ -975,21 +1135,80 @@ $("btn-connect").addEventListener("click", async () => {
   }
 });
 
+// ---------- 输码卡（右栏第一张卡：点设备后替换本机设备卡） ----------
+let connecting = false;
+
+/** 打开输码卡：高亮选中行，本机设备卡让位，输入框聚焦。 */
+function openCodeCard(d) {
+  state.btDevice = d.id;
+  state.btDeviceName = d.name;
+  renderBtDevices(lastDevices);
+  $("code-card-title").textContent = `连接到 ${d.name}`;
+  setCodeError("");
+  $("bt-code-card").classList.remove("hidden");
+  $("my-card").classList.add("hidden");
+  $("bt-peer-code").focus();
+}
+
+/** 关闭输码卡：回到本机设备卡，清除选中高亮与错误。 */
+function closeCodeCard() {
+  $("bt-code-card").classList.add("hidden");
+  if (!state.connected) $("my-card").classList.remove("hidden");
+  state.btDevice = null;
+  state.btDeviceName = null;
+  setCodeError("");
+  renderBtDevices(lastDevices);
+}
+
+/** 输码卡内的错误（红字 + 输入框红描边）；连接码不对时用原型定版文案。 */
+function setCodeError(msg) {
+  const e = $("code-error");
+  e.textContent = msg || "";
+  e.classList.toggle("hidden", !msg);
+  $("bt-peer-code").classList.toggle("input-error", !!msg);
+}
+function codeErrorText(err) {
+  const raw = String(err);
+  if (raw.includes("连接码不正确")) return "连接码不对，或对方已离线，请核对后重试";
+  return raw;
+}
+
+/** 连接中态：按钮转圈禁用、取消与输入禁用（原型连接中画板）。 */
+function setConnectingUI(on) {
+  connecting = on;
+  const btn = $("btn-bt-connect");
+  btn.disabled = on;
+  btn.innerHTML = on ? `<span class="spinner"></span>连接中…` : "连接";
+  $("btn-bt-cancel").disabled = on;
+  $("bt-peer-code").disabled = on;
+}
+
+$("btn-bt-cancel").addEventListener("click", () => { if (!connecting) closeCodeCard(); });
+$("bt-peer-code").addEventListener("input", () => setCodeError(""));
+$("bt-peer-code").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("btn-bt-connect").click(); }
+});
+
 $("btn-bt-connect").addEventListener("click", async () => {
-  $("connect-error").textContent = "";
+  if (connecting) return;
   const code = $("bt-peer-code").value.trim();
-  if (!state.btDevice) { $("connect-error").textContent = "请先在列表中选择一台设备"; return; }
-  if (!code) { $("connect-error").textContent = "请输入对方的连接码"; return; }
+  if (!state.btDevice) { setCodeError("请先在列表中选择一台设备"); return; }
+  if (!code) { setCodeError("请输入对方的连接码"); return; }
+  setCodeError("");
+  $("connect-error").textContent = "";
   if (!btStateLoaded) await refreshBtState();
   const t = effectiveTransport();
-  $("connect-status").textContent = `正在通过${t === "classic" ? "经典蓝牙" : t === "simpleble" ? "SimpleBLE" : "蓝牙"}连接「${state.btDeviceName || "对方设备"}」…`;
+  state.connectTransport = t;
+  setConnectingUI(true);
   try {
     await invoke("bt_connect", { deviceId: state.btDevice, code, transport: t });
     saveLastPeer({ transport: t, deviceId: state.btDevice, code, name: state.btDeviceName || "对方设备" });
-    if (scanning) { await invoke("bt_stop_scan").catch(() => {}); scanning = false; }
+    if (scanning) { await invoke("bt_stop_scan").catch(() => {}); scanning = false; setScanningUI(); }
+    setConnectingUI(false);
+    closeCodeCard();
   } catch (e) {
-    $("connect-error").textContent = String(e);
-    $("connect-status").textContent = "";
+    setConnectingUI(false);
+    setCodeError(codeErrorText(e));
   }
 });
 
@@ -1719,6 +1938,20 @@ async function wireEvents() {
     $("peer-name").textContent = state.peerName || "未连接";
     $("peer-state").textContent = state.connected ? "已连接" : "离线";
     $("connect-status").textContent = state.connected ? "" : $("connect-status").textContent;
+    // 连接页的已连接卡与胶囊：连上时已连接卡替换本机设备卡，断开时恢复
+    if (state.connected) {
+      $("connected-name").textContent = state.peerName || "对方设备";
+      $("connected-sub").textContent = state.connectTransport ? transportName(state.connectTransport) : "";
+      $("connected-card").classList.remove("hidden");
+      $("my-card").classList.add("hidden");
+      $("bt-code-card").classList.add("hidden");
+    } else {
+      state.connectTransport = null;
+      $("connected-card").classList.add("hidden");
+      $("my-card").classList.remove("hidden");
+    }
+    updateCapsule();
+    if (lastDevices.length) renderBtDevices(lastDevices);
     await loadConversations();
     if (state.connected) { switchView("chat"); loadChatMessages(); }
     else { loadLastPeer(); switchView(state.view); }
@@ -1860,6 +2093,7 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
   state.identity = await invoke("get_identity");
   $("my-code").textContent = state.identity.code_display;
   $("my-name").textContent = state.identity.name;
+  $("guide-my-name").textContent = state.identity.name;
   refreshBtState();
   invoke("get_dev_mode").then(applyDevMode).catch(() => {});
   invoke("get_bt_transport").then((t) => { btTransport = t; syncTransportSeg(); }).catch(() => {});

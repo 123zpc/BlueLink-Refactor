@@ -140,6 +140,10 @@ pub struct FoundDevice {
     pub name: String,
     /// 信号强度（dBm），平台未提供时为 None。
     pub rssi: Option<i16>,
+    /// 系统里是否已配对/已记住这台设备。目前只有经典蓝牙 Inquiry 能提供
+    /// （BLUETOOTH_DEVICE_INFO 的 fRemembered/fAuthenticated），BLE 与
+    /// SimpleBLE 的扫描结果没有这个信息，恒为 false（表示未知，不显示）。
+    pub paired: bool,
 }
 
 /// SCANPROBE（仅日志）：本轮扫描已 dump 过广播全字段的平台设备 ID 集合，
@@ -299,6 +303,7 @@ impl BleCentral {
                     .clone()
                     .unwrap_or_else(|| "未知设备".to_string()),
                 rssi: props.rssi,
+                paired: false, // BLE 扫描结果不带配对信息
             });
         }
         out.sort_by_key(|d| std::cmp::Reverse(d.rssi.unwrap_or(i16::MIN)));
