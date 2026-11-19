@@ -64,84 +64,132 @@
 
   <!-- 内容区 -->
   <main id="main">
-    <!-- 连接页（未连接时显示）：蓝牙扫描与配对 -->
+    <!-- 连接页（未连接时显示）：桌面两栏布局（2026-11-19 定版原型）——
+         左=设备列表面板（独立滚动），右=320px 信息卡滚动列；两栏结构等高，不靠内容撑高度对齐 -->
     <section id="connect-view">
-      <div class="connect-card">
-        <div class="brand">
-          <svg viewBox="0 0 48 48" class="brand-mark"><g class="ring-me"><rect x="9" y="18.25" width="21" height="11.5" rx="5.75" transform="rotate(-45 19.5 24)"/></g><g class="ring-peer"><rect x="18" y="18.25" width="21" height="11.5" rx="5.75" transform="rotate(-45 28.5 24)"/></g></svg>
-          <h1>BlueLink</h1>
+      <div class="connect-wrap">
+        <div class="connect-head">
+          <h1>连接</h1>
+          <div class="capsule"><span id="capsule-dot" class="status-dot"></span><span id="capsule-text">正在检测蓝牙…</span></div>
         </div>
-        <p class="muted brand-sub">通过蓝牙与附近设备聊天、传文件，无需网络</p>
-
-        <div class="bt-status">
-          <span id="bt-status-dot" class="status-dot"></span>
-          <svg class="ico ico-16"><use href="#i-bt"/></svg>
-          <span id="bt-status-text">正在检测蓝牙…</span>
-        </div>
-
-        <!-- 连接方式：经典蓝牙 / BLE / SimpleBLE（仅开发者模式显示；仅 Windows 有经典通道） -->
-        <div id="bt-transport-row" class="hidden">
-          <div class="seg-group">
-            <button id="seg-classic" class="seg-btn">经典蓝牙</button>
-            <button id="seg-ble" class="seg-btn">BLE</button>
-            <button id="seg-simpleble" class="seg-btn">SimpleBLE</button>
+        <div class="connect-cols">
+          <!-- 左栏：设备列表面板 -->
+          <div class="device-panel">
+            <div class="device-panel-head">
+              <b>附近的设备</b>
+              <span id="device-count" class="muted small"></span>
+              <span class="flex-spacer"></span>
+              <button id="btn-scan" class="btn primary small-btn">扫描</button>
+            </div>
+            <div id="bt-device-list"></div>
+            <div id="bt-empty-state" class="hidden">
+              <span class="empty-ico"><svg class="ico ico-28"><use href="#i-bt"/></svg></span>
+              <div class="empty-title">没有发现附近的设备</div>
+              <p class="muted small">确认对方已打开 BlueLink 并开启蓝牙</p>
+              <button id="btn-rescan" class="btn primary">重新扫描</button>
+            </div>
+            <p id="bt-empty" class="muted small"></p>
+            <p id="connect-status" class="muted small"></p>
+            <p id="connect-error" class="error-text"></p>
+            <p class="panel-foot muted small">连接方式：点选一台设备，在右侧输入对方的连接码即可连接。</p>
           </div>
-          <p class="muted small">开发者模式下可切换传输。经典蓝牙与老版本同款：速度快，首次连接时系统可能弹出配对确认，点允许即可；BLE 免配对，但传输较慢。SimpleBLE 是第三套 BLE 实现（实验）：仅在编译了 SimpleBLE 的版本中可用，未编译的版本选了也会如实回落经典蓝牙；切换到 SimpleBLE 后需重启应用，本机才会被对方发现。</p>
-        </div>
 
-        <div class="my-device">
-          <div class="my-device-main">
-            <div class="muted small">本机设备</div>
-            <div id="my-name" class="my-name">-</div>
-          </div>
-          <div class="my-device-code">
-            <div class="muted small">我的连接码</div>
-            <div id="my-code" class="my-code">--- ---</div>
-          </div>
-        </div>
-        <p class="muted small">对方连接本机时需要输入这个连接码。把连接码告诉对方即可。</p>
+          <!-- 右栏：信息卡滚动列（超高栏内滚动；末卡吃剩余高度） -->
+          <div class="connect-side">
+            <!-- 开发者卡：仅开发者模式显示（传输切换 + 局域网测试入口） -->
+            <div id="dev-card" class="side-card hidden">
+              <div class="side-card-title">开发者模式</div>
+              <div id="bt-transport-row">
+                <div class="seg-group">
+                  <button id="seg-classic" class="seg-btn">经典蓝牙</button>
+                  <button id="seg-ble" class="seg-btn">BLE</button>
+                  <button id="seg-simpleble" class="seg-btn">SimpleBLE</button>
+                </div>
+                <p class="muted small">切换后列表按所选方式扫描。经典蓝牙与老版本同款：速度快，首次连接时系统可能弹出配对确认，点允许即可；BLE 免配对，但传输较慢。SimpleBLE 是第三套 BLE 实现（实验）：未编译进本版本时选了也会如实回落经典蓝牙；切换到 SimpleBLE 后需重启应用，本机才会被对方发现。</p>
+              </div>
+              <div class="side-divider"></div>
+              <button id="btn-lan-toggle" class="lan-row"><span>局域网测试</span><span class="muted" id="lan-toggle-label">进入 ›</span></button>
+              <div id="dev-lan-section" class="hidden">
+                <div class="connect-actions">
+                  <button id="btn-listen" class="btn small-btn">等待连接（TCP）</button>
+                  <span class="muted small">或输入对方地址发起连接</span>
+                </div>
+                <div class="connect-form">
+                  <input id="peer-addr" type="text" placeholder="对方地址，如 192.168.1.10:7800">
+                  <input id="peer-code" type="text" placeholder="对方连接码（6 位）" maxlength="7">
+                  <button id="btn-connect" class="btn small-btn">发起连接</button>
+                </div>
+              </div>
+            </div>
 
-        <!-- 上次连接：记住上次成功连上的设备，点一下直接重连，不必重新扫描/输入 -->
-        <div id="last-peer" class="hidden">
-          <div class="bt-scan-head">
-            <b>上次连接</b>
-            <button id="last-peer-clear" class="btn small-btn">清除</button>
-          </div>
-          <div id="last-peer-row" class="bt-device">
-            <span class="bt-device-ico"><svg class="ico ico-18"><use id="last-peer-ico" href="#i-bt"/></svg></span>
-            <span class="bt-device-main"><span class="bt-device-name" id="last-peer-name">—</span>
-            <span class="bt-device-sub" id="last-peer-sub"></span></span>
-            <button id="last-peer-connect" class="btn small-btn primary">连接</button>
-          </div>
-          <p id="last-peer-status" class="muted small"></p>
-        </div>
+            <!-- 已连接卡：连接成功后替换本机设备卡的位置 -->
+            <div id="connected-card" class="side-card hidden">
+              <div class="side-card-title">已连接</div>
+              <div id="connected-name" class="side-name">—</div>
+              <div id="connected-sub" class="muted small"></div>
+              <div class="card-btns">
+                <button id="btn-goto-chat" class="btn primary">进入聊天</button>
+                <button id="btn-connected-disconnect" class="btn text-btn">断开</button>
+              </div>
+            </div>
 
-        <div class="bt-scan-head">
-          <b>附近的设备</b>
-          <button id="btn-scan" class="btn small-btn"><svg class="ico ico-14"><use href="#i-search"/></svg>扫描</button>
-        </div>
-        <div id="bt-device-list"></div>
-        <p id="bt-empty" class="muted small">点「扫描」查找附近打开了 BlueLink 的设备。</p>
-        <p class="muted small">连接方式：点选上面一台设备，下方会出现连接码输入框，填对方设备上显示的 6 位连接码即可连接。</p>
+            <!-- 输码卡：点设备后替换本机设备卡，输入对方连接码 -->
+            <div id="bt-code-card" class="side-card hidden">
+              <div class="side-card-title strong" id="code-card-title">连接到</div>
+              <input id="bt-peer-code" type="text" placeholder="输入对方的连接码" maxlength="7" inputmode="numeric">
+              <p id="code-error" class="error-text hidden"></p>
+              <div class="card-btns">
+                <button id="btn-bt-connect" class="btn primary">连接</button>
+                <button id="btn-bt-cancel" class="btn text-btn">取消</button>
+              </div>
+              <p class="muted small">输入对方设备屏幕上显示的连接码</p>
+            </div>
 
-        <div id="bt-code-row" class="hidden">
-          <input id="bt-peer-code" type="text" placeholder="输入对方连接码（6 位）" maxlength="7" inputmode="numeric">
-          <button id="btn-bt-connect" class="btn primary">连接</button>
-        </div>
-        <p id="connect-status" class="muted"></p>
-        <p id="connect-error" class="error-text"></p>
+            <!-- 本机设备卡：设备名 + 大号连接码 -->
+            <div id="my-card" class="side-card">
+              <div class="side-card-title">本机设备</div>
+              <div id="my-name" class="side-name">-</div>
+              <div id="my-code" class="my-code-big">--- ---</div>
+              <p class="muted small">对方连接本机时需要输入这个连接码</p>
+            </div>
 
-        <!-- 局域网测试区：仅开发者模式开启时显示 -->
-        <div id="dev-lan-section" class="hidden">
-          <div class="dev-divider"><span>局域网 · 开发者模式</span></div>
-          <div class="connect-actions">
-            <button id="btn-listen" class="btn">等待连接（TCP）</button>
-            <span class="muted small">或输入对方地址发起连接</span>
-          </div>
-          <div class="connect-form">
-            <input id="peer-addr" type="text" placeholder="对方地址，如 192.168.1.10:7800">
-            <input id="peer-code" type="text" placeholder="对方连接码（6 位）" maxlength="7">
-            <button id="btn-connect" class="btn">发起连接</button>
+            <!-- 上次连接卡：记住上次成功连上的设备，点一下直接重连，不必重新扫描/输入 -->
+            <div id="last-peer" class="side-card hidden">
+              <div class="side-card-title">上次连接</div>
+              <div id="last-peer-name" class="side-name">—</div>
+              <div id="last-peer-sub" class="muted small"></div>
+              <div class="card-btns">
+                <button id="last-peer-connect" class="btn primary">连接</button>
+                <button id="last-peer-clear" class="btn text-btn">清除</button>
+              </div>
+              <p id="last-peer-status" class="muted small"></p>
+            </div>
+
+            <!-- 连接状态卡：各传输的服务状态（人话文案，异常时带说明） -->
+            <div class="side-card" id="status-card">
+              <div class="side-card-title">连接状态</div>
+              <div id="status-lines"><p class="muted small">正在检测蓝牙…</p></div>
+            </div>
+
+            <!-- 连接步骤卡（末卡）：吃掉右栏剩余高度，内容排到卡底；
+                 没有上次连接记录时换成详细指南版（教对方怎么连本机） -->
+            <div class="side-card steps-card" id="steps-card">
+              <div class="side-card-title">连接步骤</div>
+              <div id="steps-short" class="steps-list">
+                <div class="step-row"><span class="step-num">1</span><span>对方打开 BlueLink 并点扫描</span></div>
+                <div class="step-row"><span class="step-num">2</span><span>在列表里找到并点本机</span></div>
+                <div class="step-row"><span class="step-num">3</span><span>输入本机连接码</span></div>
+              </div>
+              <div id="steps-guide" class="steps-list hidden">
+                <div class="step-row"><span class="step-num">1</span><div><div class="step-title">让对方打开 BlueLink</div><p class="muted small">对方在他的电脑上打开 BlueLink，进入连接页点「扫描」</p></div></div>
+                <div class="step-row"><span class="step-num">2</span><div><div class="step-title">找到这台电脑</div><p class="muted small">对方在设备列表里找到 <span id="guide-my-name">本机</span>，点「连接」</p></div></div>
+                <div class="step-row"><span class="step-num">3</span><div><div class="step-title">输入本机连接码</div><p class="muted small">对方输入上方本机设备卡里的大号连接码，即可完成连接</p></div></div>
+              </div>
+              <div class="steps-foot">
+                <div class="side-divider"></div>
+                <p class="muted small" id="steps-tip">提示：对方连不上时，先确认两边蓝牙都已开启</p>
+              </div>
+            </div>
           </div>
         </div>
       </div>

@@ -359,6 +359,8 @@ mod imp {
                         name
                     },
                     rssi: None, // 经典 Inquiry 不提供信号强度
+                    // 已配对（fAuthenticated）或系统已记住（fRemembered）的设备
+                    paired: info.fRemembered != 0 || info.fAuthenticated != 0,
                 });
             }
             info = BLUETOOTH_DEVICE_INFO::default();

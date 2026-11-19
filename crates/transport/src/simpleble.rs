@@ -156,6 +156,7 @@ mod imp {
                             id,
                             name,
                             rssi: p.rssi().ok(),
+                            paired: false, // SimpleBLE 扫描结果不带配对信息
                         },
                         p,
                     ));
