@@ -244,9 +244,15 @@ mod imp {
             let generation = self.generation.clone();
             let found = self.found.clone();
             std::thread::spawn(move || {
+                // SCANPROBE（仅日志）：每次扫描只 dump 第一轮 Inquiry 的原始全字段
+                let mut dumped = false;
                 while scanning.load(Ordering::SeqCst) && generation.load(Ordering::SeqCst) == gen {
                     // 单轮失败（适配器忙等）不终止扫描，下一轮重试——与 BLE 轮询容错一致
-                    if let Ok(devs) = run_inquiry() {
+                    if let Ok((devs, dump)) = run_inquiry() {
+                        if !dumped {
+                            dumped = true;
+                            dump.into_iter().for_each(crate::probe::push_line);
+                        }
                         if let Ok(mut slot) = found.lock() {
                             *slot = devs;
                         }
@@ -311,7 +317,7 @@ mod imp {
 
     /// 执行一轮经典 Inquiry（阻塞，约 10 秒），返回本轮发现的全部设备。
     /// 参数照老版本：已认证/已记住/未知/已连接全返回 + 发起 Inquiry，不按服务过滤。
-    fn run_inquiry() -> Result<Vec<FoundDevice>, TransportError> {
+    fn run_inquiry() -> Result<(Vec<FoundDevice>, Vec<String>), TransportError> {
         unsafe {
             let (find_radio, radio) = first_radio()?;
             let result = inquiry_on_radio(radio);
@@ -322,7 +328,9 @@ mod imp {
 
     /// # Safety
     /// radio 必须是有效的蓝牙适配器句柄。
-    unsafe fn inquiry_on_radio(radio: HANDLE) -> Result<Vec<FoundDevice>, TransportError> {
+    unsafe fn inquiry_on_radio(
+        radio: HANDLE,
+    ) -> Result<(Vec<FoundDevice>, Vec<String>), TransportError> {
         let mut params: BLUETOOTH_DEVICE_SEARCH_PARAMS = std::mem::zeroed();
         params.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32;
         params.fReturnAuthenticated = 1;
@@ -338,12 +346,22 @@ mod imp {
         let find = BluetoothFindFirstDevice(&params, &mut info);
         if find.is_null() {
             // 一台设备都没有时返回 NULL，不算故障
-            return Ok(Vec::new());
+            return Ok((
+                Vec::new(),
+                vec![
+                    "SCANPROBE 经典Inquiry 一节开始：本轮 0 台（原始结构全字段）".to_string(),
+                    "SCANPROBE 经典Inquiry 一节结束".to_string(),
+                ],
+            ));
         }
         let mut out: Vec<FoundDevice> = Vec::new();
+        let mut raws: Vec<BLUETOOTH_DEVICE_INFO> = Vec::new();
         loop {
             let mac = info.Address.Anonymous.ullLong;
             let id = device_id(mac);
+            if !raws.iter().any(|r| r.Address.Anonymous.ullLong == mac) {
+                raws.push(info);
+            }
             if !out.iter().any(|d: &FoundDevice| d.id == id) {
                 let end = info
                     .szName
@@ -368,7 +386,61 @@ mod imp {
             }
         }
         BluetoothFindDeviceClose(find);
-        Ok(out)
+        // SCANPROBE（仅日志）：本轮每台设备的原始结构逐字段分段
+        let mut dump = vec![format!(
+            "SCANPROBE 经典Inquiry 一节开始：本轮 {} 台（原始结构全字段）",
+            raws.len()
+        )];
+        for raw in &raws {
+            dump.extend(dump_inquiry_device(raw));
+        }
+        dump.push("SCANPROBE 经典Inquiry 一节结束".to_string());
+        Ok((out, dump))
+    }
+
+    /// 把一台 Inquiry 设备的 BLUETOOTH_DEVICE_INFO 全字段 dump 成 SCANPROBE 分段行。
+    fn dump_inquiry_device(info: &BLUETOOTH_DEVICE_INFO) -> Vec<String> {
+        // Address 是联合体，读 ullLong 需 unsafe（调用方保证结构有效）
+        let mac = mac_to_string(unsafe { info.Address.Anonymous.ullLong });
+        let end = info
+            .szName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szName.len());
+        let name = String::from_utf16_lossy(&info.szName[..end]);
+        let cod = info.ulClassofDevice;
+        let systime = |t: &windows_sys::Win32::Foundation::SYSTEMTIME| -> String {
+            if t.wYear == 0 {
+                "（空）".to_string()
+            } else {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+                )
+            }
+        };
+        vec![
+            format!("SCANPROBE 设备开始 [classic-inquiry] {mac}"),
+            format!("SCANPROBE 地址={mac}"),
+            format!(
+                "SCANPROBE 名称={}",
+                if name.trim().is_empty() {
+                    "（空）".to_string()
+                } else {
+                    name
+                }
+            ),
+            format!("SCANPROBE CoD原始=0x{cod:06X}"),
+            format!("SCANPROBE CoD大类={}", (cod >> 8) & 0x1F),
+            format!("SCANPROBE CoD小类={}", (cod >> 2) & 0x3F),
+            format!("SCANPROBE CoD服务位=0x{:03X}", (cod >> 13) & 0x7FF),
+            format!("SCANPROBE 已认证={}", info.fAuthenticated != 0),
+            format!("SCANPROBE 已记住={}", info.fRemembered != 0),
+            format!("SCANPROBE 已连接={}", info.fConnected != 0),
+            format!("SCANPROBE 最近见过={}", systime(&info.stLastSeen)),
+            format!("SCANPROBE 最近使用={}", systime(&info.stLastUsed)),
+            format!("SCANPROBE 设备结束 [classic-inquiry] {mac}"),
+        ]
     }
 
     // ================= 服务端（RFCOMM 监听 / SDP 注册） =================
@@ -542,6 +614,240 @@ mod imp {
             Ok(())
         }
     }
+
+    // ---------- SCANPROBE：AEP 属性探针（仅日志诊断，不影响扫描结果与界面） ----------
+    // 背景：经典 Inquiry 的结果结构 BLUETOOTH_DEVICE_INFO 没有 RSSI 字段，
+    // 驱动层 BTH_DEVICE_INFO / BTH_RADIO_IN_RANGE 同样没有，WinRT 经典
+    // BluetoothDevice 类也没有信号属性——产品上经典设备行因此不显示信号格。
+    // 唯一未证伪的官方途径是 AEP 属性 System.Devices.Aep.SignalStrength：
+    // 微软文档只写它「仅适用于部分协议」，公开实测只见于 Wi-Fi Direct，
+    // 对经典蓝牙是否填充没有实测记录。本探针在经典扫描开始时用 WinRT
+    // DeviceWatcher 按经典设备选择器枚举，申请标准 AEP 属性全集并逐项
+    // dump 进 SCANPROBE 日志（有值记值、空缺明确标「（空）」），真机回传
+    // 日志后即可定案。仅日志：不动 UI、不动扫描结果；60 秒节流。
+
+    static AEP_PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
+    static AEP_PROBE_LAST_RUN: AtomicU64 = AtomicU64::new(0);
+
+    /// 申请的 AEP 属性全集（重点是 SignalStrength，其余一并摸清家底）。
+    const AEP_PROPS: &[&str] = &[
+        "System.Devices.Aep.SignalStrength",
+        "System.Devices.Aep.IsPaired",
+        "System.Devices.Aep.CanPair",
+        "System.Devices.Aep.IsConnected",
+        "System.Devices.Aep.IsPresent",
+        "System.Devices.Aep.Manufacturer",
+        "System.Devices.Aep.ModelNumber",
+        "System.Devices.Aep.Category",
+        "System.Devices.Aep.ProtocolId",
+        "System.Devices.Aep.DeviceAddress",
+        "System.Devices.Aep.ContainerId",
+        "System.Devices.Aep.AepId",
+        "System.ItemNameDisplay",
+    ];
+
+    /// 启动一次 AEP 探针（后台线程；60 秒内重复调用直接跳过）。
+    pub fn spawn_aep_probe() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if AEP_PROBE_RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if now.saturating_sub(AEP_PROBE_LAST_RUN.load(Ordering::SeqCst)) < 60 {
+            AEP_PROBE_RUNNING.store(false, Ordering::SeqCst);
+            return;
+        }
+        AEP_PROBE_LAST_RUN.store(now, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            match run_aep_probe() {
+                Ok(lines) => lines.into_iter().for_each(crate::probe::push_line),
+                Err(e) => crate::probe::push_line(format!("SCANPROBE WinRT-AEP 枚举失败：{e}")),
+            }
+            AEP_PROBE_RUNNING.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// DeviceWatcher 枚举经典设备并逐项 dump AEP 属性（阻塞，最长约 15 秒）。
+    fn run_aep_probe() -> Result<Vec<String>, String> {
+        use windows::core::{Ref, HSTRING};
+        use windows::Devices::Bluetooth::BluetoothDevice;
+        use windows::Devices::Enumeration::{DeviceInformation, DeviceWatcher};
+        use windows::Foundation::TypedEventHandler;
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+        // WinRT 要求线程先初始化 COM（MTA）；本线程专用，结束时反初始化。
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let body = || -> Result<Vec<String>, String> {
+            let selector = BluetoothDevice::GetDeviceSelector().map_err(|e| e.to_string())?;
+            // 申请附加属性全集：windows 0.61 绑定要 IIterable<HSTRING>，由 Vec 转换
+            let props: windows_collections::IIterable<HSTRING> = AEP_PROPS
+                .iter()
+                .map(|s| HSTRING::from(*s))
+                .collect::<Vec<_>>()
+                .into();
+            let watcher =
+                DeviceInformation::CreateWatcherAqsFilterAndAdditionalProperties(&selector, &props)
+                    .map_err(|e| e.to_string())?;
+            let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let c2 = collected.clone();
+            watcher
+                .Added(&TypedEventHandler::new(
+                    move |_sender: Ref<DeviceWatcher>, info: Ref<DeviceInformation>| {
+                        if let Some(info) = info.as_ref() {
+                            if let Ok(mut g) = c2.lock() {
+                                g.extend(dump_aep_device(info));
+                            }
+                        }
+                        Ok(())
+                    },
+                ))
+                .map_err(|e| e.to_string())?;
+            watcher
+                .EnumerationCompleted(&TypedEventHandler::new(
+                    move |_sender: Ref<DeviceWatcher>, _args: Ref<windows::core::IInspectable>| {
+                        let _ = tx.send(());
+                        Ok(())
+                    },
+                ))
+                .map_err(|e| e.to_string())?;
+            watcher.Start().map_err(|e| e.to_string())?;
+            let timed_out = rx.recv_timeout(std::time::Duration::from_secs(15)).is_err();
+            let _ = watcher.Stop();
+            let mut lines = vec![format!(
+                "SCANPROBE WinRT-AEP 一节开始（经典设备选择器，申请 {} 项属性）",
+                AEP_PROPS.len()
+            )];
+            let count_note;
+            if let Ok(mut g) = collected.lock() {
+                count_note = g.iter().filter(|l| l.contains("设备开始")).count();
+                lines.append(&mut g);
+            } else {
+                count_note = 0;
+            }
+            lines.push(format!(
+                "SCANPROBE WinRT-AEP 一节结束：共 {count_note} 台{}",
+                if timed_out {
+                    "（15 秒超时未完成，以上为已枚举部分）"
+                } else {
+                    ""
+                }
+            ));
+            Ok(lines)
+        };
+        let result = body();
+        unsafe {
+            CoUninitialize();
+        }
+        result
+    }
+
+    /// 把一台 AEP 设备的全部可读信息 dump 成 SCANPROBE 分段行。
+    fn dump_aep_device(info: &windows::Devices::Enumeration::DeviceInformation) -> Vec<String> {
+        let id = info.Id().unwrap_or_default();
+        let mut lines = vec![format!("SCANPROBE 设备开始 [winrt-aep] {id}")];
+        lines.push(format!(
+            "SCANPROBE 名称={}",
+            info.Name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "（空）".to_string())
+        ));
+        lines.push(format!("SCANPROBE AepId={id}"));
+        if let Ok(kind) = info.Kind() {
+            lines.push(format!("SCANPROBE 设备种类={kind:?}"));
+        }
+        if let Ok(pairing) = info.Pairing() {
+            if let Ok(v) = pairing.IsPaired() {
+                lines.push(format!("SCANPROBE Pairing.IsPaired={v}"));
+            }
+            if let Ok(v) = pairing.CanPair() {
+                lines.push(format!("SCANPROBE Pairing.CanPair={v}"));
+            }
+        }
+        for key in AEP_PROPS {
+            lines.push(format!("SCANPROBE 属性 {key}={}", fmt_aep_prop(info, key)));
+        }
+        lines.push(format!("SCANPROBE 设备结束 [winrt-aep] {id}"));
+        lines
+    }
+
+    /// 读一台设备的一个 AEP 属性并格式化：有值按类型记值，缺失/未填充记「（空）」。
+    fn fmt_aep_prop(info: &windows::Devices::Enumeration::DeviceInformation, key: &str) -> String {
+        use windows::core::{Interface, HSTRING};
+        use windows::Foundation::{IPropertyValue, PropertyType};
+        let Ok(map) = info.Properties() else {
+            return "（空）".to_string();
+        };
+        let Ok(val) = map.Lookup(&HSTRING::from(key)) else {
+            return "（空）".to_string();
+        };
+        let Ok(pv) = val.cast::<IPropertyValue>() else {
+            return "（非属性值，无法解析）".to_string();
+        };
+        let Ok(ty) = pv.Type() else {
+            return "（空）".to_string();
+        };
+        match ty {
+            PropertyType::Empty => "（空）".to_string(),
+            PropertyType::Boolean => pv
+                .GetBoolean()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::Int16 => pv
+                .GetInt16()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::Int32 => pv
+                .GetInt32()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::Int64 => pv
+                .GetInt64()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::UInt8 => pv
+                .GetUInt8()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::UInt16 => pv
+                .GetUInt16()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::UInt32 => pv
+                .GetUInt32()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::UInt64 => pv
+                .GetUInt64()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::Single => pv
+                .GetSingle()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::Double => pv
+                .GetDouble()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::String => pv
+                .GetString()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::Guid => pv
+                .GetGuid()
+                .map(|v| format!("{:?}", v))
+                .unwrap_or_else(|_| "（空）".into()),
+            PropertyType::DateTime => pv
+                .GetDateTime()
+                .map(|v| format!("UniversalTime={}", v.UniversalTime))
+                .unwrap_or_else(|_| "（空）".into()),
+            other => format!("（类型 {other:?}，未展开）"),
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -590,6 +896,9 @@ mod imp {
     pub fn start_classic_server() -> Result<(ClassicServer, mpsc::Receiver<Conn>), TransportError> {
         Err(unsupported())
     }
+
+    /// AEP 探针仅 Windows 有实现（WinRT），其他平台为空操作。
+    pub fn spawn_aep_probe() {}
 }
 
 #[cfg(not(windows))]
@@ -597,7 +906,9 @@ fn unsupported() -> TransportError {
     TransportError::Ble("经典蓝牙仅支持 Windows".to_string())
 }
 
-pub use imp::{classic_central, start_classic_server, ClassicCentral, ClassicServer};
+pub use imp::{
+    classic_central, spawn_aep_probe, start_classic_server, ClassicCentral, ClassicServer,
+};
 
 #[cfg(test)]
 mod tests {

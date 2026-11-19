@@ -142,6 +142,105 @@ pub struct FoundDevice {
     pub rssi: Option<i16>,
 }
 
+/// SCANPROBE（仅日志）：本轮扫描已 dump 过广播全字段的平台设备 ID 集合，
+/// start_scan 时清空，保证每台设备每轮扫描只记一次。
+static SCANPROBE_DUMPED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 把一台 BLE 设备的广播全字段 dump 成 SCANPROBE 分段行（仅日志，每轮只记一次）。
+/// 注意在服务过滤之前调用：诊断要看的是适配器听到的全部设备，不只是 BlueLink。
+fn dump_ble_device_once(platform_id: &str, props: &btleplug::api::PeripheralProperties) {
+    let addr = props.address.to_string();
+    {
+        let Ok(mut g) = SCANPROBE_DUMPED.lock() else {
+            return;
+        };
+        if g.iter().any(|id| id == platform_id) {
+            return;
+        }
+        g.push(platform_id.to_string());
+    }
+    let hex = |data: &[u8]| -> String { data.iter().map(|b| format!("{b:02X}")).collect() };
+    let opt =
+        |v: &Option<String>| -> String { v.clone().unwrap_or_else(|| "（空）".to_string()) };
+    let mut lines = vec![
+        format!("SCANPROBE 设备开始 [ble] {addr}"),
+        format!("SCANPROBE 地址={addr}"),
+        format!("SCANPROBE 平台ID={platform_id}"),
+        format!(
+            "SCANPROBE 地址类型={}",
+            props
+                .address_type
+                .map(|t| format!("{t:?}"))
+                .unwrap_or_else(|| "（空）".to_string())
+        ),
+        format!("SCANPROBE 本地名={}", opt(&props.local_name)),
+        format!(
+            "SCANPROBE RSSI={}",
+            props
+                .rssi
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "（空）".to_string())
+        ),
+        format!(
+            "SCANPROBE 发射功率={}",
+            props
+                .tx_power_level
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "（空）".to_string())
+        ),
+        format!(
+            "SCANPROBE 服务UUID={}",
+            if props.services.is_empty() {
+                "（空）".to_string()
+            } else {
+                props
+                    .services
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ),
+        format!(
+            "SCANPROBE 厂商数据={}",
+            if props.manufacturer_data.is_empty() {
+                "（空）".to_string()
+            } else {
+                props
+                    .manufacturer_data
+                    .iter()
+                    .map(|(id, data)| format!("0x{id:04X}:{}", hex(data)))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            }
+        ),
+        format!(
+            "SCANPROBE 服务数据={}",
+            if props.service_data.is_empty() {
+                "（空）".to_string()
+            } else {
+                props
+                    .service_data
+                    .iter()
+                    .map(|(u, data)| format!("{u}:{}", hex(data)))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            }
+        ),
+        format!(
+            "SCANPROBE 设备类class={}",
+            props
+                .class
+                .map(|v| format!("0x{v:06X}"))
+                .unwrap_or_else(|| "（空）".to_string())
+        ),
+        format!("SCANPROBE 设备结束 [ble] {addr}"),
+    ];
+    for line in lines.drain(..) {
+        crate::probe::push_line(line);
+    }
+}
+
 /// BLE 中心端：持有一个系统蓝牙适配器。
 pub struct BleCentral {
     adapter: Adapter,
@@ -163,6 +262,13 @@ impl BleCentral {
     /// 服务 UUID 位于扫描响应包中的广播，导致永远扫不到；改为全量扫描，
     /// 由 list_found 按广播服务严格筛选（见下）。
     pub async fn start_scan(&self) -> Result<(), TransportError> {
+        // SCANPROBE（仅日志）：新一轮扫描重置已 dump 集合并写节头
+        if let Ok(mut g) = SCANPROBE_DUMPED.lock() {
+            g.clear();
+        }
+        crate::probe::push_line(
+            "SCANPROBE BLE广播 一节开始（本轮扫描，每台设备只记一次）".to_string(),
+        );
         self.adapter
             .start_scan(ScanFilter::default())
             .await
@@ -180,6 +286,7 @@ impl BleCentral {
         for p in self.adapter.peripherals().await.map_err(ble_err)? {
             let props = p.properties().await.map_err(ble_err)?;
             let Some(props) = props else { continue };
+            dump_ble_device_once(&p.id().to_string(), &props);
             // 只认广播里带 BlueLink 服务 UUID 的设备。服务列表暂时为空的设备
             // （广播包还没收全）先跳过，后续轮询收到完整广播后自然会出现。
             if !props.services.contains(&SERVICE_UUID) {

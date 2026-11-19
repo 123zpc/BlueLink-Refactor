@@ -7,7 +7,10 @@
 
 pub mod ble;
 pub mod classic;
+mod probe;
 pub mod simpleble;
+
+pub use probe::take_probe_lines;
 
 use bluelink_protocol::{read_frame, write_frame, Frame, ProtocolError};
 use std::sync::Arc;

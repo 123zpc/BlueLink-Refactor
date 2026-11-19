@@ -254,7 +254,18 @@ async fn bt_start_scan(
                 .ok_or_else(|| "蓝牙不可用".to_string())?,
         ),
     };
+    // 上一轮扫描可能有没写完的 SCANPROBE 诊断行，先补写
+    for line in bluelink_transport::take_probe_lines() {
+        bluelink_services::log_line("classic", &line);
+    }
+    let is_classic = matches!(central, ScanCentral::Classic(_));
     central.start_scan().await?;
+    if is_classic {
+        // 经典扫描顺带跑一次 AEP 探针（仅日志：DeviceWatcher 枚举经典设备
+        // 并 dump AEP 属性全集，定案 SignalStrength 对经典是否填充；节流与
+        // 实现在 transport 内，结果由下方轮询逐行写进运行日志）
+        bluelink_transport::classic::spawn_aep_probe();
+    }
     if let Some(h) = state.scan_task.lock().await.take() {
         h.abort();
     }
@@ -263,6 +274,10 @@ async fn bt_start_scan(
         // 偶发读取错误不终止扫描（否则界面还显示「正在扫描」实际已停）；连续失败多次才停
         let mut consecutive_errors = 0u32;
         loop {
+            // SCANPROBE 诊断行随扫描轮询写出（日志里搜「SCANPROBE」可定位）
+            for line in bluelink_transport::take_probe_lines() {
+                bluelink_services::log_line(tag, &line);
+            }
             match central.list_found().await {
                 Ok(devices) => {
                     consecutive_errors = 0;

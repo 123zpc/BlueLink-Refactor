@@ -37,3 +37,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_Devices_Bluetooth",
     "Win32_System_Com",
 ] }
+# RSSI 探针走 WinRT DeviceWatcher（windows-sys 不含 WinRT 绑定，故另用 windows 包）：
+# 仅日志诊断经典设备的 AEP SignalStrength 属性是否填充，见 classic.rs 探针一节。
+windows = { version = "0.61", features = [
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_System_Com",
+] }
+# 探针给 DeviceWatcher 传附加属性列表时要构造 IIterable<HSTRING>（由 Vec 转换），
+# 该类型在 0.61 里住在 windows-collections 包，需直接引用。
+windows-collections = "0.2"
