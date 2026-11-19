@@ -187,3 +187,48 @@ async fn ai代理无网方经有网方提问() {
     assert_eq!(b.proxy_today_stats().0, 1);
     assert_eq!(reply.sender, Sender::Ai);
 }
+
+#[tokio::test]
+async fn 剪贴板同步开关默认关且状态双向通告() {
+    let a = Node::new(&临时目录("ca"), "甲").unwrap();
+    let b = Node::new(&临时目录("cb"), "乙").unwrap();
+    // 默认关（同意模型：没开就绝不动对方剪贴板）
+    assert!(!a.clipboard_local_on());
+    assert!(!b.clipboard_local_on());
+
+    连接两节点(&a, &b).await;
+    // 连接建立后互通状态：双方都没开 → 对方状态均为关
+    assert!(!a.clipboard_peer_on());
+    assert!(!b.clipboard_peer_on());
+
+    // 甲开启 → 乙应收到通告；乙未开 → 甲看到的对方状态仍是关
+    a.set_clipboard_sync(true).await.unwrap();
+    for _ in 0..40 {
+        if b.clipboard_peer_on() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(b.clipboard_peer_on(), "乙未收到甲的开启通告");
+    assert!(!a.clipboard_peer_on());
+
+    // 乙开启 → 甲收到通告，双方都开（同步生效条件达成）
+    b.set_clipboard_sync(true).await.unwrap();
+    for _ in 0..40 {
+        if a.clipboard_peer_on() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(a.clipboard_peer_on(), "甲未收到乙的开启通告");
+
+    // 甲关闭 → 乙看到的对方状态变关
+    a.set_clipboard_sync(false).await.unwrap();
+    for _ in 0..40 {
+        if !b.clipboard_peer_on() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!b.clipboard_peer_on(), "乙未收到甲的关闭通告");
+}

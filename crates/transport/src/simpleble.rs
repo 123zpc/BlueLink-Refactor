@@ -23,7 +23,8 @@ pub fn simpleble_compiled() -> bool {
 mod imp {
     use super::{FoundDevice, TransportError};
     use crate::ble::{
-        channel_stream, StreamEnds, ATT_CHUNK, INBOX_UUID, OUTBOX_UUID, SERVICE_UUID,
+        channel_stream, merge_same_name, StreamEnds, ATT_CHUNK, CONNECT_TIMEOUT, INBOX_UUID,
+        OUTBOX_UUID, SERVICE_UUID,
     };
     use crate::Conn;
     use futures_util::StreamExt;
@@ -32,6 +33,7 @@ mod imp {
         LocalPeripheral, Peripheral, ValueChangedEvent,
     };
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
@@ -77,10 +79,17 @@ mod imp {
 
     // ================= 中心端（扫描 / 主动连接） =================
 
+    /// 已发现设备表：句柄映射 + 首次发现序（列表按序稳定排列，
+    /// 不许按 RSSI 实时重排——与 ble 模块同一口径）。
+    struct FoundMap {
+        order: Vec<String>,
+        map: HashMap<String, Peripheral>,
+    }
+
     /// SimpleBLE 中心端：持有一个系统蓝牙适配器与最近一次扫描命中的设备句柄。
     pub struct SbleCentral {
         adapter: Adapter,
-        found: Arc<Mutex<HashMap<String, Peripheral>>>,
+        found: Arc<Mutex<FoundMap>>,
     }
 
     /// 取得本机第一个蓝牙适配器；没有适配器时返回明确错误。
@@ -96,7 +105,10 @@ mod imp {
         .map_err(|e| TransportError::Ble(format!("蓝牙适配器初始化失败：{e}")))??;
         Ok(SbleCentral {
             adapter,
-            found: Arc::new(Mutex::new(HashMap::new())),
+            found: Arc::new(Mutex::new(FoundMap {
+                order: Vec::new(),
+                map: HashMap::new(),
+            })),
         })
     }
 
@@ -119,7 +131,7 @@ mod imp {
                 .map_err(sble_err)
         }
 
-        /// 当前已发现的 BlueLink 设备列表（按信号从强到弱）。
+        /// 当前已发现的 BlueLink 设备列表（首次发现序，同名合并）。
         /// 过滤口径与 ble 模块一致：只认广播服务里带 BlueLink 服务 UUID 的设备。
         pub async fn list_found(&self) -> Result<Vec<FoundDevice>, TransportError> {
             let adapter = self.adapter.clone();
@@ -167,53 +179,158 @@ mod imp {
             .map_err(|e| TransportError::Ble(format!("扫描读取失败：{e}")))??;
             let mut out = Vec::with_capacity(hits.len());
             {
-                let mut map = self.found.lock().unwrap();
+                let mut found = self.found.lock().unwrap();
                 for (dev, peripheral) in hits {
-                    map.insert(dev.id.clone(), peripheral);
+                    if !found.map.contains_key(&dev.id) {
+                        found.order.push(dev.id.clone());
+                    }
+                    found.map.insert(dev.id.clone(), peripheral);
                     out.push(dev);
                 }
+                // 随机地址持续轮换，序表无界增长时丢最旧的一半
+                if found.order.len() > 512 {
+                    found.order.drain(..256);
+                }
+                let idx = |id: &str| {
+                    found
+                        .order
+                        .iter()
+                        .position(|x| x == id)
+                        .unwrap_or(usize::MAX)
+                };
+                out.sort_by_key(|d| idx(&d.id));
             }
-            out.sort_by_key(|d| std::cmp::Reverse(d.rssi.unwrap_or(i16::MIN)));
-            Ok(out)
+            // 同名合并：同一台机器的多个广播身份合成一条（见 ble::merge_same_name）
+            Ok(merge_same_name(out))
         }
 
         /// 连接指定设备并订阅 OUTBOX 通知，返回可直接交给服务层握手的连接。
         pub async fn connect(&self, device_id: &str) -> Result<Conn, TransportError> {
+            // 连接分步日志（与 ble 路同一口径，步骤1–4/6，5–6 是服务层握手）
+            let t0 = std::time::Instant::now();
+            crate::probe::log(
+                "simpleble",
+                &format!("连接步骤1/6 开始连接：目标 {device_id}"),
+            );
             let peripheral = self
                 .found
                 .lock()
                 .unwrap()
+                .map
                 .get(device_id)
                 .cloned()
-                .ok_or_else(|| TransportError::Ble("设备已不在扫描范围内，请重新扫描".into()))?;
+                .ok_or_else(|| {
+                    crate::probe::log("simpleble", "连接失败于步骤1/6：设备已不在扫描范围内");
+                    TransportError::Ble("设备已不在扫描范围内，请重新扫描".into())
+                })?;
 
             // 连接事件流要在 connect 之前订阅，否则断开事件可能漏掉。
             let mut conn_events = peripheral.on_connection_event();
 
+            // 连接限时（CONNECT_TIMEOUT）：connect 是阻塞 FFI 掐不断，超时先
+            // 判失败返回；阻塞线程若迟到成功，见作废标志立即自行断开，
+            // 不留悬空链路（与 app 层取消令牌同一口径）。
+            let abandoned = Arc::new(AtomicBool::new(false));
+            let flag = abandoned.clone();
             let p_conn = peripheral.clone();
-            tokio::task::spawn_blocking(move || p_conn.connect())
-                .await
-                .map_err(|e| TransportError::Ble(format!("连接失败：{e}")))?
-                .map_err(sble_err)?;
+            let join = tokio::task::spawn_blocking(move || {
+                crate::probe::log("simpleble", "连接步骤2/6 发起无线电连接（阻塞调用）");
+                let tc = std::time::Instant::now();
+                let r = p_conn.connect();
+                crate::probe::log(
+                    "simpleble",
+                    &format!(
+                        "连接步骤2/6 无线电连接返回：{}（本步耗时 {}ms）",
+                        if r.is_ok() { "成功" } else { "失败" },
+                        tc.elapsed().as_millis()
+                    ),
+                );
+                if flag.load(Ordering::SeqCst) {
+                    if r.is_ok() {
+                        let _ = p_conn.disconnect();
+                    }
+                    return Err(TransportError::Ble(
+                        "连接已被放弃（超时迟到，已自动断开）".into(),
+                    ));
+                }
+                r.map_err(sble_err)
+            });
+            match tokio::time::timeout(CONNECT_TIMEOUT, join).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => {
+                    crate::probe::log(
+                        "simpleble",
+                        &format!("连接失败于步骤2/6（无线电连接）：底层错误 {e}"),
+                    );
+                    return Err(e);
+                }
+                Ok(Err(e)) => {
+                    return Err(TransportError::Ble(format!("连接失败：{e}")));
+                }
+                Err(_) => {
+                    abandoned.store(true, Ordering::SeqCst);
+                    crate::probe::log(
+                        "simpleble",
+                        "连接失败于步骤2/6（无线电连接）：超时 20 秒，阻塞调用未返回",
+                    );
+                    return Err(TransportError::Ble(
+                        "连接超时（20 秒）：卡在步骤2/6（无线电连接），对方未响应，可能已不在附近或其广播地址已失效，请重新扫描后再试"
+                            .into(),
+                    ));
+                }
+            }
+            crate::probe::log(
+                "simpleble",
+                &format!(
+                    "连接步骤2/6 完成：无线电已连接（总耗时 {}ms）",
+                    t0.elapsed().as_millis()
+                ),
+            );
 
             // 服务发现：确认对方确实提供 BlueLink 服务与 INBOX/OUTBOX 特征。
             let svc = service_uuid();
             let inbox_s = inbox_uuid();
             let outbox_s = outbox_uuid();
             let services = peripheral.services().map_err(sble_err)?;
+            let svc_list: Vec<String> = services.iter().map(|s| s.uuid()).collect();
+            crate::probe::log(
+                "simpleble",
+                &format!(
+                    "连接步骤3/6 完成：发现 {} 个服务 [{}]（总耗时 {}ms）",
+                    svc_list.len(),
+                    svc_list.join(", "),
+                    t0.elapsed().as_millis()
+                ),
+            );
             let service = services
                 .iter()
                 .find(|s| s.uuid().eq_ignore_ascii_case(&svc))
-                .ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 服务".into()))?;
+                .ok_or_else(|| {
+                    crate::probe::log(
+                        "simpleble",
+                        "连接失败于步骤3/6（服务发现）：对方没有 BlueLink 服务",
+                    );
+                    TransportError::Ble("对方缺少 BlueLink 服务".into())
+                })?;
             let chars = service.characteristics();
             let inbox = chars
                 .iter()
-                .find(|c| c.uuid().eq_ignore_ascii_case(&inbox_s))
-                .ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 写入特征".into()))?;
+                .find(|c| c.uuid().eq_ignore_ascii_case(&inbox_s));
             let outbox = chars
                 .iter()
-                .find(|c| c.uuid().eq_ignore_ascii_case(&outbox_s))
-                .ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 通知特征".into()))?;
+                .find(|c| c.uuid().eq_ignore_ascii_case(&outbox_s));
+            crate::probe::log(
+                "simpleble",
+                &format!(
+                    "连接步骤4/6 特征值检查：写入特征{}、通知特征{}",
+                    if inbox.is_some() { "齐" } else { "缺" },
+                    if outbox.is_some() { "齐" } else { "缺" }
+                ),
+            );
+            let inbox =
+                inbox.ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 写入特征".into()))?;
+            let outbox =
+                outbox.ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 通知特征".into()))?;
             if !outbox.can_notify() {
                 return Err(TransportError::Ble("对方通知特征不可订阅".into()));
             }
@@ -224,6 +341,13 @@ mod imp {
             }
 
             let mut values = peripheral.notify(&svc, &outbox_s).map_err(sble_err)?;
+            crate::probe::log(
+                "simpleble",
+                &format!(
+                    "连接步骤4/6 完成：已订阅通知，链路就绪，等待握手（步骤5-6/6）（总耗时 {}ms）",
+                    t0.elapsed().as_millis()
+                ),
+            );
 
             let (stream, ends) = channel_stream();
             let StreamEnds {
@@ -366,6 +490,13 @@ mod imp {
                 .map_err(sble_err)?;
             local.set_connectable(true).map_err(sble_err)?;
             local.start().map_err(sble_err)?;
+            crate::probe::log(
+                "simpleble",
+                &format!(
+                    "服务端：服务发布与广播启动成功（广播带 BlueLink 服务 {}，可连接）",
+                    service_uuid()
+                ),
+            );
             Ok::<_, TransportError>((
                 local,
                 inbox,
@@ -392,9 +523,17 @@ mod imp {
                 while let Some(event) = client_events.next().await {
                     match event {
                         ClientEvent::Connected(addr) => {
+                            crate::probe::log(
+                                "simpleble",
+                                &format!("服务端：有设备连入（对方 {addr}）"),
+                            );
                             *client_addr.lock().unwrap() = Some(addr);
                         }
-                        ClientEvent::Disconnected(_) => {
+                        ClientEvent::Disconnected(addr) => {
+                            crate::probe::log(
+                                "simpleble",
+                                &format!("服务端：对方断开（对方 {addr}）"),
+                            );
                             *client_addr.lock().unwrap() = None;
                             if let Some(session) = link.lock().unwrap().take() {
                                 session.close();
@@ -415,6 +554,10 @@ mod imp {
                 while let Some(event) = outbox_events.next().await {
                     match event {
                         Ev::Subscribed => {
+                            crate::probe::log(
+                                "simpleble",
+                                "服务端：对方已订阅通知，链路建立，等待握手",
+                            );
                             if link.lock().unwrap().is_some() {
                                 continue; // 已有链路，忽略重复订阅
                             }

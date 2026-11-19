@@ -11,6 +11,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 flate2 = { workspace = true }
+# 系统剪贴板读写（文字 + RGBA 图片）：三平台都有原生后端，纯系统 API、无需运行时服务
+arboard = "3"
 bluelink-domain = { path = "../domain" }
 bluelink-protocol = { path = "../protocol" }
 bluelink-storage = { path = "../storage" }

@@ -793,6 +793,7 @@ function updateCapsule() {
   } else if (t === "simpleble") {
     if (s.simpleble_serving) { dot.className = "status-dot on"; txt.textContent = "SimpleBLE 已开启 · 服务运行中"; }
     else if (!s.simpleble_compiled) { dot.className = "status-dot warn"; txt.textContent = "SimpleBLE 未编译 · 已回落经典蓝牙"; }
+    else if (String(s.simpleble_message).includes("启动失败")) { dot.className = "status-dot warn"; txt.textContent = "SimpleBLE 启动失败 · 已回落经典蓝牙"; }
     else if (!s.simpleble_available) { dot.className = "status-dot off"; txt.textContent = "未检测到蓝牙"; }
     else { dot.className = "status-dot warn"; txt.textContent = "SimpleBLE 已开启 · 广播未启动"; }
   } else {
@@ -842,6 +843,7 @@ function renderStatusCard(s) {
   if (state.devMode) {
     if (s.simpleble_serving) lines.push(line("on", "SimpleBLE：已开启"));
     else if (!s.simpleble_compiled) lines.push(line("warn", "SimpleBLE：未编译进本版本，已回落经典蓝牙", true));
+    else if (String(s.simpleble_message).includes("启动失败")) lines.push(line("warn", "SimpleBLE：启动失败，已回落经典蓝牙", true, s.simpleble_message));
     else if (!s.simpleble_available) lines.push(line("off", "SimpleBLE：未检测到蓝牙适配器或蓝牙未开启"));
     else lines.push(line("warn", "SimpleBLE：广播未启动", true, s.simpleble_message));
   }
@@ -932,9 +934,35 @@ function sigBars(rssi) {
  * 行结构（定版原型）：蓝牙图标 / 设备名（+上次连接或已连接徽标）/ 副行「传输 · 已配对」/
  * 信号格（仅有 RSSI 时渲染，经典扫描没有就不画、不造假）/ 连接或断开按钮。
  * 扫描中在列表尾部挂骨架行，表示还在找。 */
+let lastRenderSig = "";
 function renderBtDevices(devices) {
   lastDevices = devices;
   if (scanning) hasScanned = true;
+  // 「上次连接」自动连检查必须每次快照都跑（不许被下面的渲染节流跳过：
+  // 目标已在列表里时，快照可能与上次完全相同）
+  if (pendingRemembered) {
+    const hit = devices.find((d) => d.id === pendingRemembered.deviceId);
+    if (hit) {
+      const p = pendingRemembered;
+      pendingRemembered = null;
+      clearTimeout(rememberedTimer);
+      state.btDevice = hit.id;
+      state.btDeviceName = hit.name;
+      state.connectTransport = p.transport;
+      $("last-peer-status").textContent = `已找到「${hit.name}」，正在连接…`;
+      invoke("bt_connect", { deviceId: p.deviceId, code: p.code, transport: p.transport, name: hit.name || "", rssi: hit.rssi ?? null })
+        .then(() => saveLastPeer({ transport: p.transport, deviceId: p.deviceId, code: p.code, name: hit.name }))
+        .catch((e) => { $("last-peer-status").textContent = ""; $("connect-error").textContent = String(e); });
+      if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; setScanningUI(); }
+    }
+  }
+  // 渲染节流：快照与上次实质相同（设备/顺序/信号格/选中/连接徽标都没变）就
+  // 不重建 DOM——后端每秒推一帧，RSSI 数值小抖若每次都重建，列表会闪、
+  // 行上的按钮焦点也会丢。信号格按格数档位进签名，格数变了照样刷新。
+  const sig = devices.map((d) => `${d.id}|${d.name}|${d.paired ? 1 : 0}|${d.rssi == null ? "-" : Math.round(d.rssi / 10)}`).join(";")
+    + `#${state.btDevice || ""}|${state.connected ? 1 : 0}|${state.peerName || ""}|${state.lastPeer ? state.lastPeer.deviceId : ""}|${scanning ? 1 : 0}|${effectiveTransport()}`;
+  if (sig === lastRenderSig) return;
+  lastRenderSig = sig;
   const list = $("bt-device-list");
   list.innerHTML = "";
   $("device-count").textContent = `${devices.length} 台`;
@@ -971,23 +999,6 @@ function renderBtDevices(devices) {
     }
   }
   updateDevicePanelState();
-  // 「上次连接」一键重连（蓝牙）：后台扫描就是为它跑的，名单里出现目标设备就自动发起连接
-  if (pendingRemembered) {
-    const hit = devices.find((d) => d.id === pendingRemembered.deviceId);
-    if (hit) {
-      const p = pendingRemembered;
-      pendingRemembered = null;
-      clearTimeout(rememberedTimer);
-      state.btDevice = hit.id;
-      state.btDeviceName = hit.name;
-      state.connectTransport = p.transport;
-      $("last-peer-status").textContent = `已找到「${hit.name}」，正在连接…`;
-      invoke("bt_connect", { deviceId: p.deviceId, code: p.code, transport: p.transport })
-        .then(() => saveLastPeer({ transport: p.transport, deviceId: p.deviceId, code: p.code, name: hit.name }))
-        .catch((e) => { $("last-peer-status").textContent = ""; $("connect-error").textContent = String(e); });
-      if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; setScanningUI(); }
-    }
-  }
 }
 
 // ---------- 上次连接（一键重连） ----------
@@ -1135,26 +1146,52 @@ $("btn-listen").addEventListener("click", async () => {
     $("connect-status").textContent = `正在等待局域网连接（${addr}）…`;
   } catch (e) { $("connect-error").textContent = String(e); }
 });
+let lanConnecting = false;
 $("btn-connect").addEventListener("click", async () => {
+  if (lanConnecting) return;
   $("connect-error").textContent = "";
   const addr = $("peer-addr").value.trim();
   const code = $("peer-code").value.trim();
   if (!addr || !code) { $("connect-error").textContent = "请填写对方地址和连接码"; return; }
+  lanConnecting = true;
+  const my = ++connectAttempt;
   $("connect-status").textContent = "正在连接…";
+  $("btn-connect").disabled = true;
+  $("btn-lan-cancel").classList.remove("hidden");
   state.connectTransport = "lan";
   try {
     const name = await invoke("connect_to", { addr, code });
+    if (my !== connectAttempt) return; // 已取消：后端会自行收尾迟到的连接
     saveLastPeer({ transport: "lan", addr, code, name: name || "对方设备" });
   } catch (e) {
+    if (my !== connectAttempt) return; // 取消引发的失败不弹错
     $("connect-error").textContent = String(e);
     $("connect-status").textContent = "";
+  } finally {
+    if (my === connectAttempt) {
+      lanConnecting = false;
+      $("btn-connect").disabled = false;
+      $("btn-lan-cancel").classList.add("hidden");
+    }
   }
+});
+$("btn-lan-cancel").addEventListener("click", () => {
+  if (!lanConnecting) return;
+  // 立即收尾不等底层：作废尝试号 + 通知后端作废令牌，界面当场恢复
+  connectAttempt++;
+  lanConnecting = false;
+  $("btn-connect").disabled = false;
+  $("btn-lan-cancel").classList.add("hidden");
+  $("connect-status").textContent = "";
+  invoke("cancel_connect").catch(() => {});
 });
 
 // ---------- 输码卡（右栏第一张卡：点设备后替换本机设备卡） ----------
 let connecting = false;
 
-/** 打开输码卡：高亮选中行，本机设备卡让位，输入框聚焦。 */
+/** 打开输码卡：高亮选中行，输码卡排在本机设备卡正上方，输入框聚焦。
+ * 本机设备卡保持可见（用户 2026-11-19 裁定）：输码/连接中/失败时也要能
+ * 一眼看到自己的连接码，不许被挤出第一屏、更不许藏掉。 */
 function openCodeCard(d) {
   state.btDevice = d.id;
   state.btDeviceName = d.name;
@@ -1162,7 +1199,6 @@ function openCodeCard(d) {
   $("code-card-title").textContent = `连接到 ${d.name}`;
   setCodeError("");
   $("bt-code-card").classList.remove("hidden");
-  $("my-card").classList.add("hidden");
   $("bt-peer-code").focus();
 }
 
@@ -1189,17 +1225,33 @@ function codeErrorText(err) {
   return raw;
 }
 
-/** 连接中态：按钮转圈禁用、取消与输入禁用（原型连接中画板）。 */
+/** 连接尝试号（前端侧）：每次发起连接 +1，点取消再 +1 作废；
+ * invoke 的迟到结果回来时先对号，作废的那次不许再动 UI（后端另有令牌
+ * 保证迟到连接会被自行断开、不进会话、不写上次连接记录）。
+ * 与局域网连接共用一个计数（同一时刻只会有一笔连接在飞）。 */
+let connectAttempt = 0;
+
+/** 连接中态：连接按钮转圈禁用、输入禁用；取消按钮必须保持可用——
+ * 旧版把取消一并禁用，连接干等时点取消毫无反应（用户真机实证的缺陷）。 */
 function setConnectingUI(on) {
   connecting = on;
   const btn = $("btn-bt-connect");
   btn.disabled = on;
   btn.innerHTML = on ? `<span class="spinner"></span>连接中…` : "连接";
-  $("btn-bt-cancel").disabled = on;
   $("bt-peer-code").disabled = on;
 }
 
-$("btn-bt-cancel").addEventListener("click", () => { if (!connecting) closeCodeCard(); });
+$("btn-bt-cancel").addEventListener("click", () => {
+  if (connecting) {
+    // 立即退回浏览态不等底层返回：作废尝试号 + 后端令牌，关卡复位
+    connectAttempt++;
+    setConnectingUI(false);
+    closeCodeCard();
+    invoke("cancel_connect").catch(() => {});
+  } else {
+    closeCodeCard();
+  }
+});
 $("bt-peer-code").addEventListener("input", () => setCodeError(""));
 $("bt-peer-code").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); $("btn-bt-connect").click(); }
@@ -1215,14 +1267,17 @@ $("btn-bt-connect").addEventListener("click", async () => {
   if (!btStateLoaded) await refreshBtState();
   const t = effectiveTransport();
   state.connectTransport = t;
+  const my = ++connectAttempt;
   setConnectingUI(true);
   try {
-    await invoke("bt_connect", { deviceId: state.btDevice, code, transport: t });
+    await invoke("bt_connect", { deviceId: state.btDevice, code, transport: t, name: state.btDeviceName || "", rssi: (lastDevices.find((d) => d.id === state.btDevice) || {}).rssi ?? null });
+    if (my !== connectAttempt) return; // 已取消：迟到的成功由后端自行断开
     saveLastPeer({ transport: t, deviceId: state.btDevice, code, name: state.btDeviceName || "对方设备" });
     if (scanning) { await invoke("bt_stop_scan").catch(() => {}); scanning = false; setScanningUI(); }
     setConnectingUI(false);
     closeCodeCard();
   } catch (e) {
+    if (my !== connectAttempt) return; // 取消引发的失败不弹错（卡片已关）
     setConnectingUI(false);
     setCodeError(codeErrorText(e));
   }
@@ -1808,6 +1863,7 @@ async function loadSettings() {
   $("ai-prompt").value = cfg.system_prompt || "";
   $("ai-stream").checked = cfg.stream !== false;
   await loadGatewaySettings();
+  await loadClipboardSync();
   await loadStorageStats();
   updateAiState();
 }
@@ -1823,6 +1879,19 @@ async function loadGatewaySettings() {
       : "未开启";
     $("local-api-key").placeholder = g.local_has_key ? "已设置（留空不修改）" : "可留空";
     $("btn-local-api-clear").classList.toggle("hidden", !g.local_has_key);
+  } catch (_) { /* 忽略 */ }
+}
+function clipStatusText(v) {
+  if (!v || !v.local) return "未开启（双方都开启后才会同步）";
+  if (!v.connected) return "已开启，等待连接";
+  if (!v.peer) return "对方未开启";
+  return "已同步";
+}
+async function loadClipboardSync() {
+  try {
+    const v = await invoke("get_clipboard_sync");
+    $("clip-sync-toggle").checked = !!v.local;
+    $("clip-sync-status").textContent = clipStatusText(v);
   } catch (_) { /* 忽略 */ }
 }
 async function loadStorageStats() {
@@ -1885,6 +1954,11 @@ $("proxy-allow-toggle").addEventListener("change", async (e) => {
   await invoke("set_proxy_allow", { on: e.target.checked });
   showToast(e.target.checked ? "已允许连接设备借用本机 AI" : "已关闭 AI 转发");
   loadGatewaySettings();
+});
+$("clip-sync-toggle").addEventListener("change", async (e) => {
+  await invoke("set_clipboard_sync", { on: e.target.checked });
+  showToast(e.target.checked ? "剪贴板同步已开启（对方也开启后生效）" : "剪贴板同步已关闭");
+  loadClipboardSync();
 });
 $("local-api-toggle").addEventListener("change", async (e) => {
   await invoke("set_local_api", { enabled: e.target.checked, key: null });
@@ -2043,6 +2117,15 @@ async function wireEvents() {
     $("typing-hint").classList.toggle("hidden", !e.payload);
     if (e.payload) ringPulse("peer");
   });
+  await listen("clipboard_state", (e) => {
+    const v = e.payload || {};
+    $("clip-sync-toggle").checked = !!v.local;
+    $("clip-sync-status").textContent = clipStatusText(v);
+  });
+  await listen("clipboard_synced", (e) => {
+    const kind = e.payload && e.payload.kind === "image" ? "图片" : "文字";
+    $("clip-sync-status").textContent = `已同步（刚刚收到${kind}）`;
+  });
   await listen("transfer_progress", (e) => {
     const { transfer_id, msg_id, received, total } = e.payload;
     if (msg_id && transfer_id) state.transferMap[msg_id] = transfer_id;
@@ -2193,3 +2276,4 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
     switchView("chat");
   }
 })();
+

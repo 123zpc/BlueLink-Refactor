@@ -69,6 +69,32 @@ fn mac_from_device_id(id: &str) -> Option<u64> {
     parse_mac(id.strip_prefix(ID_PREFIX).unwrap_or(id))
 }
 
+/// AEP 信号的刻度护栏：≤ -25 视为绝对 dBm（与 BLE 的 RSSI 同刻度，UI 走现行
+/// 格数阈值 -55/-65/-75/-85）；> -25（如已连接设备报出的 5）疑为连接态相对
+/// 刻度（HCI Read RSSI 相对黄金接收范围的小数值），两种刻度未分清前不画格，
+/// 只继续记 SCANPROBE 日志攒样本（用户 2026-11-19 真机日志定案后定的护栏）。
+pub const AEP_RSSI_ABSOLUTE_MAX: i32 = -25;
+
+/// 把 AEP 枚举到的 SignalStrength 按蓝牙地址并入经典设备列表：只补 rssi
+/// 为空的条目，且只并入通过刻度护栏的绝对 dBm 值。AEP 只覆盖已关联/已配对
+/// 设备，Inquiry 里的陌生设备查不到就保持无信号（不画格、不造数）。
+/// lookup 按 MAC(u64) 查缓存（imp 的 AEP 枚举负责填充），抽出来便于单测。
+pub fn merge_aep_rssi(devices: &mut [FoundDevice], lookup: &dyn Fn(u64) -> Option<i32>) {
+    for d in devices.iter_mut() {
+        if d.rssi.is_some() {
+            continue;
+        }
+        let Some(mac) = mac_from_device_id(&d.id) else {
+            continue;
+        };
+        if let Some(v) = lookup(mac) {
+            if v <= AEP_RSSI_ABSOLUTE_MAX {
+                d.rssi = Some(v as i16);
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     // Win32 FFI 结构体（SOCKADDR_BTH / WSAQUERYSETW 等）惯例是先全零再逐字段赋值，
@@ -246,13 +272,24 @@ mod imp {
             std::thread::spawn(move || {
                 // SCANPROBE（仅日志）：每次扫描只 dump 第一轮 Inquiry 的原始全字段
                 let mut dumped = false;
+                // 首次发现序：跨轮保持列表顺序稳定，新设备追加在后，
+                // 不许每轮按 Inquiry 返回序重排导致列表跳动（与 BLE 同口径）
+                let mut order: Vec<String> = Vec::new();
                 while scanning.load(Ordering::SeqCst) && generation.load(Ordering::SeqCst) == gen {
                     // 单轮失败（适配器忙等）不终止扫描，下一轮重试——与 BLE 轮询容错一致
-                    if let Ok((devs, dump)) = run_inquiry() {
+                    if let Ok((mut devs, dump)) = run_inquiry() {
                         if !dumped {
                             dumped = true;
                             dump.into_iter().for_each(crate::probe::push_line);
                         }
+                        for d in &devs {
+                            if !order.contains(&d.id) {
+                                order.push(d.id.clone());
+                            }
+                        }
+                        let idx =
+                            |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
+                        devs.sort_by_key(|d| idx(&d.id));
                         if let Ok(mut slot) = found.lock() {
                             *slot = devs;
                         }
@@ -269,9 +306,17 @@ mod imp {
         }
 
         /// 最新一轮 Inquiry 的设备快照（不过滤：全部经典设备，与老版本一致；
-        /// 是不是 BlueLink 由连接后的服务层握手判定）。
+        /// 是不是 BlueLink 由连接后的服务层握手判定）。返回前把 AEP 枚举缓存
+        /// 里的信号按地址并入（仅已配对设备、仅绝对 dBm 刻度，见 merge_aep_rssi）。
         pub fn list_found(&self) -> Result<Vec<FoundDevice>, TransportError> {
-            Ok(self.found.lock().map(|f| f.clone()).unwrap_or_default())
+            let mut devs = self.found.lock().map(|f| f.clone()).unwrap_or_default();
+            super::merge_aep_rssi(&mut devs, &|mac| {
+                AEP_RSSI_CACHE
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.get(&mac).copied())
+            });
+            Ok(devs)
         }
 
         /// 连接指定设备：SOCKADDR_BTH 填 MAC + SPP UUID + port = 0，
@@ -617,22 +662,28 @@ mod imp {
         }
     }
 
-    // ---------- SCANPROBE：AEP 属性探针（仅日志诊断，不影响扫描结果与界面） ----------
+    // ---------- SCANPROBE：AEP 属性探针 + 经典信号数据通路 ----------
     // 背景：经典 Inquiry 的结果结构 BLUETOOTH_DEVICE_INFO 没有 RSSI 字段，
     // 驱动层 BTH_DEVICE_INFO / BTH_RADIO_IN_RANGE 同样没有，WinRT 经典
-    // BluetoothDevice 类也没有信号属性——产品上经典设备行因此不显示信号格。
-    // 唯一未证伪的官方途径是 AEP 属性 System.Devices.Aep.SignalStrength：
-    // 微软文档只写它「仅适用于部分协议」，公开实测只见于 Wi-Fi Direct，
-    // 对经典蓝牙是否填充没有实测记录。本探针在经典扫描开始时用 WinRT
-    // DeviceWatcher 按经典设备选择器枚举，申请 AEP 属性并逐项
-    // dump 进 SCANPROBE 日志（有值记值、空缺明确标「（空）」），真机回传
-    // 日志后即可定案。仅日志：不动 UI、不动扫描结果；60 秒节流。
+    // BluetoothDevice 类也没有信号属性。唯一出路是 AEP 属性
+    // System.Devices.Aep.SignalStrength——2026-11-19 用户真机日志已定案：
+    // 已配对电脑确实带值（未连接时 -42 为标准 dBm 刻度；已连接时报 5，
+    // 疑为连接态相对刻度）。自 v2.5.0 起本节从「仅日志探针」转正为数据
+    // 通路：枚举时把 (DeviceAddress, SignalStrength) 原始值写入
+    // AEP_RSSI_CACHE，list_found 按地址并入（刻度护栏在 merge_aep_rssi）。
+    // SCANPROBE 全字段 dump 保留：>-25 的相对刻度样本靠它继续积累，
+    // 也便于日后复查 AEP 还给了什么。60 秒节流沿用，不拖慢扫描出表。
     // 属性申请走防御式（choose_aep_props + 枚举降级链）：v2.4.0 首测时整组
     // 申请被一个不存在的键 ModelNumber 拖垮（0x8002802B），本轮起坏键只会被
     // 逐个剔除并记日志，AEP 一节必有产出。
 
     static AEP_PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
     static AEP_PROBE_LAST_RUN: AtomicU64 = AtomicU64::new(0);
+
+    /// AEP 信号缓存：MAC(u64) → SignalStrength 原始值（未过刻度护栏的原值，
+    /// 护栏在合并时应用）。由 AEP 枚举（60 秒节流）刷新，list_found 读取。
+    static AEP_RSSI_CACHE: Mutex<std::collections::HashMap<u64, i32>> =
+        Mutex::new(std::collections::HashMap::new());
 
     /// AEP 核心键：逐项与微软官方《Device information properties》的
     /// AssociationEndpoint 属性表核对无误；探针的重点 SignalStrength 在此组，
@@ -831,6 +882,17 @@ mod imp {
             .Added(&TypedEventHandler::new(
                 move |_sender: Ref<DeviceWatcher>, info: Ref<DeviceInformation>| {
                     if let Some(info) = info.as_ref() {
+                        // 数据通路：地址 + 信号原始值进缓存，供 list_found 按址并入
+                        if let (Some(addr), Some(sig)) = (
+                            aep_prop_string(info, "System.Devices.Aep.DeviceAddress"),
+                            aep_prop_i32(info, "System.Devices.Aep.SignalStrength"),
+                        ) {
+                            if let Some(mac) = super::parse_mac(&addr) {
+                                if let Ok(mut cache) = AEP_RSSI_CACHE.lock() {
+                                    cache.insert(mac, sig);
+                                }
+                            }
+                        }
                         if let Ok(mut g) = c2.lock() {
                             g.extend(dump_aep_device(info, &dump_props));
                         }
@@ -994,6 +1056,50 @@ mod imp {
             other => format!("（类型 {other:?}，未展开）"),
         }
     }
+
+    /// 读一个 AEP 属性的原始 IPropertyValue（缓存填充用，与 fmt_aep_prop 同读法）。
+    fn aep_prop_value(
+        info: &windows::Devices::Enumeration::DeviceInformation,
+        key: &str,
+    ) -> Option<windows::Foundation::IPropertyValue> {
+        use windows::core::{Interface, HSTRING};
+        let map = info.Properties().ok()?;
+        let val = map.Lookup(&HSTRING::from(key)).ok()?;
+        val.cast::<windows::Foundation::IPropertyValue>().ok()
+    }
+
+    /// 读字符串型 AEP 属性（如 DeviceAddress="c8:94:02:47:20:62"）。
+    fn aep_prop_string(
+        info: &windows::Devices::Enumeration::DeviceInformation,
+        key: &str,
+    ) -> Option<String> {
+        let pv = aep_prop_value(info, key)?;
+        if pv.Type().ok()? != windows::Foundation::PropertyType::String {
+            return None;
+        }
+        pv.GetString().ok().map(|s| s.to_string())
+    }
+
+    /// 读整数型 AEP 属性（如 SignalStrength）：按实际数值类型取 i32。
+    fn aep_prop_i32(
+        info: &windows::Devices::Enumeration::DeviceInformation,
+        key: &str,
+    ) -> Option<i32> {
+        use windows::Foundation::PropertyType;
+        let pv = aep_prop_value(info, key)?;
+        match pv.Type().ok()? {
+            PropertyType::Int16 => pv.GetInt16().ok().map(i32::from),
+            PropertyType::Int32 => pv.GetInt32().ok(),
+            PropertyType::Int64 => pv
+                .GetInt64()
+                .ok()
+                .map(|v| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+            PropertyType::UInt8 => pv.GetUInt8().ok().map(i32::from),
+            PropertyType::UInt16 => pv.GetUInt16().ok().map(i32::from),
+            PropertyType::UInt32 => pv.GetUInt32().ok().map(|v| v.min(i32::MAX as u32) as i32),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -1091,5 +1197,44 @@ mod tests {
             assert!(classic_central().is_err());
             assert!(start_classic_server().is_err());
         }
+    }
+
+    fn cdev(mac: u64, rssi: Option<i16>) -> FoundDevice {
+        FoundDevice {
+            id: device_id(mac),
+            name: "LAPTOP-X".to_string(),
+            rssi,
+            paired: true,
+        }
+    }
+
+    /// AEP 合并：绝对 dBm（-42）并入；相对刻度（5）被护栏挡住不画格；
+    /// 查不到的设备保持无信号；已有信号不被覆盖。地址对齐靠 MAC 数值，
+    /// AEP 的小写地址与经典 id 的大写形式经 parse_mac 归一（互逆测试已覆盖）。
+    #[test]
+    fn aep信号合并与刻度护栏() {
+        let mac_a = 0xC894_0247_2062; // 真机样本 LAPTOP-QN3CQGC7，未连接 -42
+        let mac_b = 0x34C9_3DAC_1E57; // 真机样本 LAPTOP-VE2P2MLC，已连接 5
+        let mac_c = 0x0011_2233_4455; // AEP 里没有的陌生设备
+        let cache: std::collections::HashMap<u64, i32> =
+            [(mac_a, -42), (mac_b, 5)].into_iter().collect();
+        let mut devs = vec![
+            cdev(mac_a, None),
+            cdev(mac_b, None),
+            cdev(mac_c, None),
+            cdev(mac_a, Some(-60)),
+        ];
+        merge_aep_rssi(&mut devs, &|mac| cache.get(&mac).copied());
+        assert_eq!(devs[0].rssi, Some(-42));
+        assert_eq!(devs[1].rssi, None); // 5 > -25：护栏挡住
+        assert_eq!(devs[2].rssi, None); // 无数据：保持无信号
+        assert_eq!(devs[3].rssi, Some(-60)); // 已有值不覆盖
+                                             // 护栏边界：-25 并入、-24 挡住
+        let cache2: std::collections::HashMap<u64, i32> =
+            [(mac_a, -25), (mac_b, -24)].into_iter().collect();
+        let mut devs2 = vec![cdev(mac_a, None), cdev(mac_b, None)];
+        merge_aep_rssi(&mut devs2, &|mac| cache2.get(&mac).copied());
+        assert_eq!(devs2[0].rssi, Some(-25));
+        assert_eq!(devs2[1].rssi, None);
     }
 }

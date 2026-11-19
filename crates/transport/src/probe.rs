@@ -26,3 +26,26 @@ pub fn take_probe_lines() -> Vec<String> {
         .map(|mut g| std::mem::take(&mut *g))
         .unwrap_or_default()
 }
+
+/// 传输层诊断日志出口：由应用在启动时注入（接上 services 的运行日志）。
+/// 连接分步日志这类即时性强的诊断走这里，时间戳就是步骤发生的时刻；
+/// SCANPROBE 的攒行队列是另一条通道（扫描轮询时批量落盘）。
+pub type LogSink = fn(&str, &str);
+
+static SINK: Mutex<Option<LogSink>> = Mutex::new(None);
+
+/// 注入日志出口（应用启动时调用一次）。
+pub fn set_log_sink(f: LogSink) {
+    if let Ok(mut g) = SINK.lock() {
+        *g = Some(f);
+    }
+}
+
+/// 写一行传输层诊断日志（未注入出口时静默丢弃，不影响功能）。
+pub(crate) fn log(tag: &str, msg: &str) {
+    if let Ok(g) = SINK.lock() {
+        if let Some(f) = *g {
+            f(tag, msg);
+        }
+    }
+}

@@ -10,12 +10,12 @@ pub mod classic;
 mod probe;
 pub mod simpleble;
 
-pub use probe::take_probe_lines;
+pub use probe::{set_log_sink, take_probe_lines};
 
 use bluelink_protocol::{read_frame, write_frame, Frame, ProtocolError};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
@@ -57,6 +57,14 @@ impl Conn {
         let mut w = self.writer.lock().await;
         write_frame(&mut **w, frame).await?;
         Ok(())
+    }
+
+    /// 主动关闭连接：关掉写端——对端会读到 EOF 从而结束会话，
+    /// 各平台的出站泵也随之拆链（BLE 断开外设、经典关 socket）。
+    /// 本端接收任务在对端关闭或进程退出时结束。
+    pub async fn close(&self) {
+        let mut w = self.writer.lock().await;
+        let _ = w.shutdown().await;
     }
 
     /// 接收一帧；对端正常关闭返回 Closed 错误。
@@ -121,6 +129,16 @@ mod tests {
             Frame::Control(Control::ChatText { text, .. }) => assert_eq!(text, "嗨"),
             _ => panic!("帧类型不对"),
         }
+    }
+
+    #[tokio::test]
+    async fn 关闭后对端读到结束() {
+        let (a, b) = loopback_pair();
+        a.close().await;
+        // a 的写端已关：b 再收应得 Closed；a 仍可收 b 发来的帧（半关闭）
+        b.send(&Frame::Control(Control::Ping)).await.unwrap();
+        assert_eq!(a.recv().await.unwrap(), Frame::Control(Control::Ping));
+        assert!(matches!(b.recv().await, Err(TransportError::Closed)));
     }
 
     #[tokio::test]

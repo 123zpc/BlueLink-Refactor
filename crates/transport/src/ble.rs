@@ -58,7 +58,8 @@ pub struct StreamEnds {
 pub struct ChannelStream {
     incoming: mpsc::Receiver<Vec<u8>>,
     read_buf: VecDeque<u8>,
-    outgoing: mpsc::UnboundedSender<Vec<u8>>,
+    /// 写端发送通道；shutdown 时置 None 关掉，平台出站泵随之结束并拆链。
+    outgoing: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 pub fn channel_stream() -> (ChannelStream, StreamEnds) {
@@ -68,7 +69,7 @@ pub fn channel_stream() -> (ChannelStream, StreamEnds) {
         ChannelStream {
             incoming: in_rx,
             read_buf: VecDeque::new(),
-            outgoing: out_tx,
+            outgoing: Some(out_tx),
         },
         StreamEnds {
             incoming_tx: in_tx,
@@ -111,7 +112,11 @@ impl AsyncWrite for ChannelStream {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.outgoing.send(buf.to_vec()) {
+        let sent = match self.outgoing.as_ref() {
+            Some(tx) => tx.send(buf.to_vec()),
+            None => Err(mpsc::error::SendError(buf.to_vec())),
+        };
+        match sent {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(_) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -124,7 +129,9 @@ impl AsyncWrite for ChannelStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // 关掉发送通道：平台出站泵读到通道结束即拆链（BLE 断开、经典关 socket）
+        self.outgoing = None;
         Poll::Ready(Ok(()))
     }
 }
@@ -144,6 +151,46 @@ pub struct FoundDevice {
     /// （BLUETOOTH_DEVICE_INFO 的 fRemembered/fAuthenticated），BLE 与
     /// SimpleBLE 的扫描结果没有这个信息，恒为 false（表示未知，不显示）。
     pub paired: bool,
+}
+
+/// 蓝牙连接尝试的统一超时：超过即判失败，不许无限干等（用户真机实证：
+/// 点了连接既连不上又取消不掉）。经典路的阻塞 connect 在系统调用里掐不断，
+/// 由 app 层令牌作废兜底；BLE/SimpleBLE 在此直接超时返回。
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// 同名设备合并（BLE 与 SimpleBLE 共用）：同一台物理设备会以多个广播身份
+/// 出现——Windows 的 GATT 服务端广播用轮换的随机地址，旧地址身份不会被
+/// 扫描栈淘汰，于是同一台机器在列表里出现多条（用户真机实证：同名两条，
+/// 一条满格一条 0 格，0 格那条是早已轮换走的旧地址、信号停在最后一次的值）。
+/// 合并键 = 设备名：同名条目合成一条，位置取首次出现处，代表身份取信号
+/// 最强的一条（最可能还活着、连得上），信号取该代表的最新值。
+/// 「未知设备」（名字还没随扫描响应到达）不参与合并：无法证明它们与某个
+/// 已命名设备是同一台，贸然合并可能把第二台真设备藏掉；名字到达后自然并入。
+pub fn merge_same_name(devices: Vec<FoundDevice>) -> Vec<FoundDevice> {
+    let mut out: Vec<FoundDevice> = Vec::with_capacity(devices.len());
+    for d in devices {
+        if d.name == "未知设备" {
+            out.push(d);
+            continue;
+        }
+        match out.iter_mut().find(|e| e.name == d.name) {
+            Some(slot) => {
+                // 信号更强的身份接替代表（含代表尚无信号的情况）；paired 取并集
+                let stronger = match (d.rssi, slot.rssi) {
+                    (Some(a), Some(b)) => a > b,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if stronger {
+                    slot.id = d.id;
+                    slot.rssi = d.rssi;
+                }
+                slot.paired = slot.paired || d.paired;
+            }
+            None => out.push(d),
+        }
+    }
+    out
 }
 
 /// SCANPROBE（仅日志）：本轮扫描已 dump 过广播全字段的平台设备 ID 集合，
@@ -248,6 +295,10 @@ fn dump_ble_device_once(platform_id: &str, props: &btleplug::api::PeripheralProp
 /// BLE 中心端：持有一个系统蓝牙适配器。
 pub struct BleCentral {
     adapter: Adapter,
+    /// 首次发现序（平台 ID）：列表顺序按它稳定排列，RSSI 只原地更新数值，
+    /// 不许按信号实时重排（用户真机实证：按 RSSI 每秒重排时列表上下抖动剧烈）。
+    /// btleplug 的 peripherals() 顺序本身不稳定，必须自己记序。
+    seen_order: std::sync::Mutex<Vec<String>>,
 }
 
 /// 取得本机第一个蓝牙适配器；没有适配器时返回明确错误。
@@ -258,7 +309,10 @@ pub async fn ble_central() -> Result<BleCentral, TransportError> {
         .into_iter()
         .next()
         .ok_or_else(|| TransportError::Ble("未检测到蓝牙适配器".into()))?;
-    Ok(BleCentral { adapter })
+    Ok(BleCentral {
+        adapter,
+        seen_order: std::sync::Mutex::new(Vec::new()),
+    })
 }
 
 impl BleCentral {
@@ -284,12 +338,16 @@ impl BleCentral {
         self.adapter.stop_scan().await.map_err(ble_err)
     }
 
-    /// 当前已发现的 BlueLink 设备列表（按信号从强到弱）。
+    /// 当前已发现的 BlueLink 设备列表（首次发现序，同名合并，见 merge_same_name）。
     pub async fn list_found(&self) -> Result<Vec<FoundDevice>, TransportError> {
         let mut out = Vec::new();
         for p in self.adapter.peripherals().await.map_err(ble_err)? {
-            let props = p.properties().await.map_err(ble_err)?;
-            let Some(props) = props else { continue };
+            // 单台设备的属性读取失败只跳过它自己，不许连累整张列表
+            let props = match p.properties().await {
+                Ok(Some(props)) => props,
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
             dump_ble_device_once(&p.id().to_string(), &props);
             // 只认广播里带 BlueLink 服务 UUID 的设备。服务列表暂时为空的设备
             // （广播包还没收全）先跳过，后续轮询收到完整广播后自然会出现。
@@ -306,12 +364,37 @@ impl BleCentral {
                 paired: false, // BLE 扫描结果不带配对信息
             });
         }
-        out.sort_by_key(|d| std::cmp::Reverse(d.rssi.unwrap_or(i16::MIN)));
-        Ok(out)
+        // 稳定排序：按首次发现序排列（新发现的追加在后），信号只更新数值不改顺序
+        {
+            let mut order = self.seen_order.lock().unwrap();
+            for d in &out {
+                if !order.contains(&d.id) {
+                    order.push(d.id.clone());
+                }
+            }
+            // 随机地址会持续轮换，序表无界增长时丢最旧的一半（不影响已显示设备）
+            if order.len() > 512 {
+                order.drain(..256);
+            }
+            let idx = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
+            out.sort_by_key(|d| idx(&d.id));
+        }
+        Ok(merge_same_name(out))
     }
 
     /// 连接指定设备并完成 GATT 发现，返回可直接交给服务层握手的连接。
+    ///
+    /// 全程分步日志（步骤1–4/6，5–6 是服务层握手）：每步记完成耗时，
+    /// 失败/超时记「卡在第几步、等了多久、底层错误原文」——真机连不上时
+    /// 凭日志就能指认卡死点，不靠猜。各步共享 CONNECT_TIMEOUT 总截止：
+    /// 对着已轮换走的旧广播地址或不应答的设备，底层 connect 可能长时间
+    /// 不返回，超时直接判失败并给出人话原因，不许无限干等。
     pub async fn connect(&self, device_id: &str) -> Result<Conn, TransportError> {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let total = || t0.elapsed().as_millis();
+        let step_ms = |t: Instant| t.elapsed().as_millis();
+        crate::probe::log("ble", &format!("连接步骤1/6 开始连接：目标 {device_id}"));
         let peripherals = self.adapter.peripherals().await.map_err(ble_err)?;
         let mut target: Option<CentralPeripheral> = None;
         for p in peripherals {
@@ -320,24 +403,147 @@ impl BleCentral {
                 break;
             }
         }
-        let peripheral =
-            target.ok_or_else(|| TransportError::Ble("设备已不在扫描范围内，请重新扫描".into()))?;
+        let peripheral = target.ok_or_else(|| {
+            crate::probe::log("ble", "连接失败于步骤1/6：设备已不在扫描范围内");
+            TransportError::Ble("设备已不在扫描范围内，请重新扫描".into())
+        })?;
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+
+        // 步骤2：无线电连接
+        let t = Instant::now();
         if !peripheral.is_connected().await.map_err(ble_err)? {
-            peripheral.connect().await.map_err(ble_err)?;
+            match tokio::time::timeout_at(deadline, peripheral.connect()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let e = ble_err(e);
+                    crate::probe::log(
+                        "ble",
+                        &format!(
+                            "连接失败于步骤2/6（无线电连接）：底层错误 {e}（本步耗时 {}ms）",
+                            step_ms(t)
+                        ),
+                    );
+                    return Err(e);
+                }
+                Err(_) => {
+                    crate::probe::log(
+                        "ble",
+                        &format!(
+                            "连接失败于步骤2/6（无线电连接）：超时，已等 {}ms 无响应",
+                            step_ms(t)
+                        ),
+                    );
+                    return Err(TransportError::Ble(
+                        "BLE 连接超时：卡在步骤2/6（无线电连接），对方未响应，可能已不在附近或其广播地址已失效，请重新扫描后再试"
+                            .into(),
+                    ));
+                }
+            }
         }
-        peripheral.discover_services().await.map_err(ble_err)?;
+        crate::probe::log(
+            "ble",
+            &format!(
+                "连接步骤2/6 完成：无线电已连接（本步耗时 {}ms，总耗时 {}ms）",
+                step_ms(t),
+                total()
+            ),
+        );
+
+        // 步骤3：服务发现（把找到的服务 UUID 全记下来，对端开没开 BlueLink 服务一看便知）
+        let t = Instant::now();
+        match tokio::time::timeout_at(deadline, peripheral.discover_services()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let e = ble_err(e);
+                crate::probe::log(
+                    "ble",
+                    &format!(
+                        "连接失败于步骤3/6（服务发现）：底层错误 {e}（本步耗时 {}ms）",
+                        step_ms(t)
+                    ),
+                );
+                return Err(e);
+            }
+            Err(_) => {
+                crate::probe::log(
+                    "ble",
+                    &format!(
+                        "连接失败于步骤3/6（服务发现）：超时，已等 {}ms 无响应",
+                        step_ms(t)
+                    ),
+                );
+                return Err(TransportError::Ble(
+                    "BLE 连接超时：卡在步骤3/6（服务发现），对方未响应".into(),
+                ));
+            }
+        }
+        let svc_list: Vec<String> = peripheral
+            .services()
+            .iter()
+            .map(|s| s.uuid.to_string())
+            .collect();
+        crate::probe::log(
+            "ble",
+            &format!(
+                "连接步骤3/6 完成：发现 {} 个服务 [{}]（本步耗时 {}ms，总耗时 {}ms）",
+                svc_list.len(),
+                svc_list.join(", "),
+                step_ms(t),
+                total()
+            ),
+        );
+
+        // 步骤4：特征值检查 + 订阅通知
+        let t = Instant::now();
         let chars = peripheral.characteristics();
-        let inbox = chars
-            .iter()
-            .find(|c| c.uuid == INBOX_UUID)
-            .cloned()
-            .ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 写入特征".into()))?;
-        let outbox = chars
-            .iter()
-            .find(|c| c.uuid == OUTBOX_UUID)
-            .cloned()
-            .ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 通知特征".into()))?;
-        peripheral.subscribe(&outbox).await.map_err(ble_err)?;
+        let inbox = chars.iter().find(|c| c.uuid == INBOX_UUID).cloned();
+        let outbox = chars.iter().find(|c| c.uuid == OUTBOX_UUID).cloned();
+        crate::probe::log(
+            "ble",
+            &format!(
+                "连接步骤4/6 特征值检查：写入特征{}、通知特征{}",
+                if inbox.is_some() { "齐" } else { "缺" },
+                if outbox.is_some() { "齐" } else { "缺" }
+            ),
+        );
+        let inbox =
+            inbox.ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 写入特征".into()))?;
+        let outbox =
+            outbox.ok_or_else(|| TransportError::Ble("对方缺少 BlueLink 通知特征".into()))?;
+        match tokio::time::timeout_at(deadline, peripheral.subscribe(&outbox)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let e = ble_err(e);
+                crate::probe::log(
+                    "ble",
+                    &format!(
+                        "连接失败于步骤4/6（订阅通知）：底层错误 {e}（本步耗时 {}ms）",
+                        step_ms(t)
+                    ),
+                );
+                return Err(e);
+            }
+            Err(_) => {
+                crate::probe::log(
+                    "ble",
+                    &format!(
+                        "连接失败于步骤4/6（订阅通知）：超时，已等 {}ms 无响应",
+                        step_ms(t)
+                    ),
+                );
+                return Err(TransportError::Ble(
+                    "BLE 连接超时：卡在步骤4/6（订阅通知），对方未响应".into(),
+                ));
+            }
+        }
+        crate::probe::log(
+            "ble",
+            &format!(
+                "连接步骤4/6 完成：已订阅通知，链路就绪，等待握手（步骤5-6/6）（本步耗时 {}ms，总耗时 {}ms）",
+                step_ms(t),
+                total()
+            ),
+        );
 
         let (stream, ends) = channel_stream();
         let StreamEnds {
@@ -452,10 +658,53 @@ pub async fn start_ble_server(
         })
         .await
         .map_err(ble_err)?;
+    crate::probe::log(
+        "ble",
+        &format!(
+            "服务端：服务发布成功（服务 {SERVICE_UUID}，写入特征 {INBOX_UUID}、通知特征 {OUTBOX_UUID}）"
+        ),
+    );
     peripheral
         .start_advertising(local_name, &[SERVICE_UUID])
         .await
         .map_err(ble_err)?;
+    crate::probe::log(
+        "ble",
+        &format!(
+            "服务端：广播启动请求已接受（可连接、可发现）；广播内容：服务 {SERVICE_UUID}、本机名 {local_name}（广播包由系统按已发布服务自动生成）"
+        ),
+    );
+
+    // 广播真状态验证（2026-11-19 真机定案后加）：库的 start_advertising 只
+    // 发起请求，不等 Windows 把广播状态转到 Started；广播被系统中止时库也
+    // 只写一行自己的 debug 日志、不通知应用——不验证的话状态行会「报喜不
+    // 报忧」（显示已开启、空中其实没有广播）。这里轮询 is_advertising 确认
+    // 真在广播（5 秒内每 500ms 一次），确认不了就如实报错，检查过程留日志。
+    let mut advertising = false;
+    for i in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match peripheral.is_advertising().await {
+            Ok(true) => {
+                advertising = true;
+                crate::probe::log(
+                    "ble",
+                    &format!("服务端广播状态确认：已在广播（启动后第 {} 次检查）", i + 1),
+                );
+                break;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                crate::probe::log("ble", &format!("服务端广播状态检查出错：{}", ble_err(e)));
+                break;
+            }
+        }
+    }
+    if !advertising {
+        crate::probe::log("ble", "服务端广播状态确认失败：启动后 5 秒仍未进入广播状态");
+        return Err(TransportError::Ble(
+            "广播启动后未能确认处于广播状态（系统可能拒绝了广播请求），对方将无法发现本机".into(),
+        ));
+    }
 
     let peripheral = Arc::new(Mutex::new(peripheral));
     let (inbound_tx, inbound_rx) = mpsc::channel::<Conn>(4);
@@ -496,6 +745,13 @@ pub async fn start_ble_server(
                                 }
                             }
                         });
+                        crate::probe::log(
+                            "ble",
+                            &format!(
+                                "服务端：有设备连入并订阅通知（对方 {}），链路建立，等待握手",
+                                request.client
+                            ),
+                        );
                         let conn = Conn::new(stream, format!("ble:{}", request.client));
                         if inbound_tx.send(conn).await.is_err() {
                             break;
@@ -505,6 +761,10 @@ pub async fn start_ble_server(
                         .map(|(c, _)| c == &request.client)
                         .unwrap_or(false)
                     {
+                        crate::probe::log(
+                            "ble",
+                            &format!("服务端：对方取消订阅，链路断开（对方 {}）", request.client),
+                        );
                         link = None; // 发送端随之丢弃，读端收到 EOF，服务层结束会话
                     }
                 }
@@ -551,6 +811,47 @@ pub async fn start_ble_server(
 mod tests {
     use super::*;
     use bluelink_protocol::{Control, Frame};
+
+    fn dev(id: &str, name: &str, rssi: Option<i16>) -> FoundDevice {
+        FoundDevice {
+            id: id.to_string(),
+            name: name.to_string(),
+            rssi,
+            paired: false,
+        }
+    }
+
+    /// 同名多身份合并：同台机器的轮换随机地址合成一条，代表取信号最强者，
+    /// 位置留在首次出现处；未知设备不合并；不同名互不影响。
+    #[test]
+    fn 同名设备合并取最强信号() {
+        let merged = merge_same_name(vec![
+            dev("addr-old", "LAPTOP-A", Some(-92)), // 旧地址：信号停在弱值（0 格）
+            dev("addr-x", "未知设备", Some(-50)),
+            dev("addr-new", "LAPTOP-A", Some(-45)), // 当前地址：满格
+            dev("addr-y", "未知设备", Some(-60)),
+            dev("addr-b", "LAPTOP-B", Some(-70)),
+        ]);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0].name, "LAPTOP-A");
+        assert_eq!(merged[0].id, "addr-new");
+        assert_eq!(merged[0].rssi, Some(-45));
+        assert_eq!(merged[1].name, "未知设备");
+        assert_eq!(merged[2].name, "未知设备");
+        assert_eq!(merged[3].name, "LAPTOP-B");
+    }
+
+    /// 合并时代表无信号而新身份有信号：新身份接替（不许把有信号的吞成无信号）。
+    #[test]
+    fn 同名合并无信号被有信号接替() {
+        let merged = merge_same_name(vec![
+            dev("a1", "LAPTOP-A", None),
+            dev("a2", "LAPTOP-A", Some(-80)),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "a2");
+        assert_eq!(merged[0].rssi, Some(-80));
+    }
 
     /// 通道字节流经定长分片泵后仍能无损承载协议帧（含 300KB 大帧）。
     #[tokio::test]

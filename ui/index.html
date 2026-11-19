@@ -124,7 +124,10 @@
                 <div class="connect-form">
                   <input id="peer-addr" type="text" placeholder="对方地址，如 192.168.1.10:7800">
                   <input id="peer-code" type="text" placeholder="对方连接码（6 位）" maxlength="7">
-                  <button id="btn-connect" class="btn small-btn">发起连接</button>
+                  <div class="card-btns">
+                    <button id="btn-connect" class="btn small-btn">发起连接</button>
+                    <button id="btn-lan-cancel" class="btn small-btn hidden">取消</button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -140,7 +143,7 @@
               </div>
             </div>
 
-            <!-- 输码卡：点设备后替换本机设备卡，输入对方连接码 -->
+            <!-- 输码卡：点设备后出现在本机设备卡正上方（本机卡保持可见），输入对方连接码 -->
             <div id="bt-code-card" class="side-card hidden">
               <div class="side-card-title strong" id="code-card-title">连接到</div>
               <input id="bt-peer-code" type="text" placeholder="输入对方的连接码" maxlength="7" inputmode="numeric">
@@ -346,6 +349,13 @@
           <label class="switch"><input type="checkbox" id="proxy-allow-toggle"><span class="switch-track"></span></label>
         </div>
         <div class="setting-row"><span>今日已转发</span><span id="proxy-stats" class="muted small">0 次 · 约 0 tokens</span></div>
+        <h3>剪贴板同步</h3>
+        <p class="muted small">开启后与已连接的设备双向同步剪贴板（文字与图片）：在一台上复制，另一台就能直接粘贴。必须双方都开启才生效；单份内容上限 2MB，超限跳过。默认关闭，关闭时不会读取你的剪贴板。</p>
+        <div class="setting-row">
+          <span>剪贴板同步</span>
+          <label class="switch"><input type="checkbox" id="clip-sync-toggle"><span class="switch-track"></span></label>
+        </div>
+        <div class="setting-row"><span>同步状态</span><span id="clip-sync-status" class="muted small">未开启</span></div>
         <h3>存储</h3>
         <div class="setting-row"><span>聊天记录</span><span id="store-chat" class="muted small">-</span></div>
         <div class="setting-row"><span>接收文件</span><span id="store-files" class="muted small">-</span></div>

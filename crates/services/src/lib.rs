@@ -6,13 +6,14 @@ pub use log::log_line;
 
 use bluelink_ai::{AiClient, AiConfig, ChatMessage};
 use bluelink_domain::*;
-use bluelink_protocol::{Control, FileChunk, Frame, CHUNK_SIZE};
+use bluelink_protocol::{ClipboardImage, Control, FileChunk, Frame, CHUNK_SIZE};
 use bluelink_storage::Storage;
 use bluelink_transport::Conn;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -72,6 +73,16 @@ pub enum Event {
         error: String,
     },
     PeerTyping(bool),
+    /// 剪贴板同步状态变化（本机开关/对方开关/连接状态任一变化时发，前端据此刷新状态文案）。
+    ClipboardState {
+        local: bool,
+        peer: bool,
+        connected: bool,
+    },
+    /// 刚把对方的一份剪贴板内容写入本机（kind 为 "text" 或 "image"）。
+    ClipboardSynced {
+        kind: String,
+    },
 }
 
 /// AI 来源：Auto = 本机优先、否则经对端转发；Local = 只用本机配置；Peer = 只用连接设备的 AI。
@@ -220,6 +231,116 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>, ServiceError> {
     Ok(out)
 }
 
+/// 无条件 zlib 压缩（剪贴板图片用；压不动时调用方自行回落直传）。
+fn zlib_compress(data: &[u8]) -> Option<Vec<u8>> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(data).ok()?;
+    enc.finish().ok()
+}
+
+/// 剪贴板单份内容上限（2MB）：文字按字节数、图片按压缩后实际发送大小算，
+/// 超限跳过同步并记日志（不打扰用户）。
+pub const CLIPBOARD_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 一份剪贴板内容（本轮只同步文字与位图，文件列表不做）。
+#[derive(Debug, Clone, PartialEq)]
+enum ClipContent {
+    Text(String),
+    Image {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+}
+
+impl ClipContent {
+    fn kind(&self) -> &'static str {
+        match self {
+            ClipContent::Text(_) => "text",
+            ClipContent::Image { .. } => "image",
+        }
+    }
+
+    /// 内容哈希（防回环与去重都用它）：文字哈希原文，图片哈希宽高 + RGBA。
+    fn hash(&self) -> String {
+        let mut h = Sha256::new();
+        match self {
+            ClipContent::Text(t) => {
+                h.update(b"text:");
+                h.update(t.as_bytes());
+            }
+            ClipContent::Image {
+                width,
+                height,
+                rgba,
+            } => {
+                h.update(b"image:");
+                h.update(width.to_le_bytes());
+                h.update(height.to_le_bytes());
+                h.update(rgba);
+            }
+        }
+        format!("{:x}", h.finalize())
+    }
+}
+
+/// 图片内容的原始 SHA-256 摘要（帧里携带的 hash 字段，与 ClipContent::hash 同算法）。
+fn clip_image_digest(width: u32, height: u32, rgba: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"image:");
+    h.update(width.to_le_bytes());
+    h.update(height.to_le_bytes());
+    h.update(rgba);
+    h.finalize().into()
+}
+
+/// 读系统剪贴板：与粘贴规则同口径——先文字，纯图片才取图片；空剪贴板返回 None。
+/// 句柄由 Node 长驻持有（见 clip_handle 字段注释），不要在这里新建临时句柄。
+fn clip_read_with(cb: &mut arboard::Clipboard) -> Option<ClipContent> {
+    if let Ok(t) = cb.get_text() {
+        if !t.is_empty() {
+            return Some(ClipContent::Text(t));
+        }
+    }
+    if let Ok(img) = cb.get_image() {
+        return Some(ClipContent::Image {
+            width: img.width as u32,
+            height: img.height as u32,
+            rgba: img.bytes.into_owned(),
+        });
+    }
+    None
+}
+
+/// 写系统剪贴板（句柄由 Node 长驻持有，理由同上）。
+fn clip_write_with(cb: &mut arboard::Clipboard, content: &ClipContent) -> Result<(), String> {
+    match content {
+        ClipContent::Text(t) => cb.set_text(t.clone()).map_err(|e| e.to_string()),
+        ClipContent::Image {
+            width,
+            height,
+            rgba,
+        } => cb
+            .set_image(arboard::ImageData {
+                width: *width as usize,
+                height: *height as usize,
+                bytes: std::borrow::Cow::Borrowed(rgba.as_slice()),
+            })
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// 剪贴板同步的防回环状态：last_seen 是最近见过的本机剪贴板内容哈希
+/// （自己复制后发出的、或从对方写入的都算），suppress 是最近一次从对方
+/// 写入的内容哈希——监视到它时绝不回发，避免两台机器来回震荡。
+#[derive(Default)]
+struct ClipGuard {
+    last_seen: Option<String>,
+    suppress: Option<String>,
+}
+
 /// 接收中的文件状态。
 struct RecvState {
     name: String,
@@ -257,6 +378,14 @@ pub struct Node {
     proxy_waiters: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<String, String>>>>,
     /// 被用户取消的发送中传输 ID（发送循环逐片检查）。
     cancelled: Mutex<HashSet<String>>,
+    /// 对方剪贴板同步开关状态（连接建立后由对方通告，断开时复位）。
+    clip_peer_on: AtomicBool,
+    /// 剪贴板同步防回环状态（监视任务与接收处理共用）。
+    clip_guard: Mutex<ClipGuard>,
+    /// 全进程长驻的系统剪贴板句柄：arboard 在 X11 上由后台线程持有选择内容，
+    /// 最后一个句柄被释放后内容立即失效——所以句柄必须常驻、绝不随单次读写销毁。
+    /// 用 std Mutex：只在阻塞线程里短暂持有，不跨 await。
+    clip_handle: std::sync::Mutex<Option<arboard::Clipboard>>,
 }
 
 impl Node {
@@ -315,6 +444,9 @@ impl Node {
             recv_files: Mutex::new(HashMap::new()),
             proxy_waiters: Mutex::new(HashMap::new()),
             cancelled: Mutex::new(HashSet::new()),
+            clip_peer_on: AtomicBool::new(false),
+            clip_guard: Mutex::new(ClipGuard::default()),
+            clip_handle: std::sync::Mutex::new(None),
         }))
     }
 
@@ -381,16 +513,17 @@ impl Node {
         self.peer.lock().await.is_some()
     }
 
-    /// 在已建立的字节流上完成握手并接管连接（宿主侧 host=true 时校验对方给出的连接码）。
-    pub async fn attach(
-        self: &Arc<Self>,
-        conn: Conn,
+    /// 握手本体（attach 的限时区）：宿主侧等 Hello 并校验连接码，
+    /// 发起侧发 Hello 等 Ack。块内的 return 即握手失败出口。
+    async fn handshake(
+        &self,
+        conn: &Conn,
         host: bool,
         code_from_peer_or_target: &str,
     ) -> Result<Device, ServiceError> {
-        let conn = Arc::new(conn);
         let peer = if host {
             // 宿主侧：等对方 Hello，校验连接码
+            log::log_line("conn", "握手步骤5/6：等待对方 Hello");
             match conn.recv().await? {
                 Frame::Control(Control::Hello {
                     device_id,
@@ -398,6 +531,10 @@ impl Node {
                     code,
                     ..
                 }) => {
+                    log::log_line(
+                        "conn",
+                        &format!("握手步骤5/6：收到 Hello（对方 {device_name}），校验连接码"),
+                    );
                     if code != self.my_code() {
                         let _ = conn
                             .send(&Frame::Control(Control::HelloAck {
@@ -416,6 +553,10 @@ impl Node {
                         reason: None,
                     }))
                     .await?;
+                    log::log_line(
+                        "conn",
+                        &format!("握手步骤6/6：连接码校验通过，已回 HelloAck，握手完成（对方 {device_name}）"),
+                    );
                     Device {
                         device_id,
                         name: device_name,
@@ -427,6 +568,10 @@ impl Node {
             }
         } else {
             // 发起侧：发 Hello（带目标连接码），等 Ack
+            log::log_line(
+                "conn",
+                &format!("握手步骤5/6：发出 Hello（本机名 {}）", self.device_name),
+            );
             conn.send(&Frame::Control(Control::Hello {
                 device_id: self.device_id.clone(),
                 device_name: self.device_name.clone(),
@@ -442,8 +587,13 @@ impl Node {
                     ..
                 }) => {
                     if !accepted {
+                        log::log_line("conn", "握手失败于步骤6/6：对方拒绝（连接码不正确）");
                         return Err(ServiceError::Rejected);
                     }
+                    log::log_line(
+                        "conn",
+                        &format!("握手步骤6/6：收到 HelloAck，握手完成（对方 {device_name}）"),
+                    );
                     Device {
                         device_id,
                         name: device_name,
@@ -454,6 +604,25 @@ impl Node {
                 _ => return Err(ServiceError::Other("握手失败：未收到 HelloAck".into())),
             }
         };
+        Ok(peer)
+    }
+
+    /// 在已建立的字节流上完成握手并接管连接（宿主侧 host=true 时校验对方给出的连接码）。
+    pub async fn attach(
+        self: &Arc<Self>,
+        conn: Conn,
+        host: bool,
+        code_from_peer_or_target: &str,
+    ) -> Result<Device, ServiceError> {
+        let conn = Arc::new(conn);
+        // 握手限时：连上不应答的端点（接受连接但不说协议）时 recv 会无限等，
+        // 20 秒未完成握手即判失败（连接侧的取消也依赖尝试能自己收尾）。
+        let peer = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            self.handshake(&conn, host, code_from_peer_or_target),
+        )
+        .await
+        .map_err(|_| ServiceError::Other("握手超时：对方未在 20 秒内响应".into()))??;
 
         // 落库设备与会话（会话 ID 以对端设备 ID 派生，稳定唯一）
         let mut peer_dev = peer.clone();
@@ -484,17 +653,36 @@ impl Node {
         // 接收循环
         let peer_out = session.peer.clone();
         let node = self.clone();
-        tokio::spawn(async move { node.recv_loop(session).await });
+        let recv_session = session.clone();
+        tokio::spawn(async move { node.recv_loop(recv_session).await });
+
+        // 剪贴板同步：连接建立后先把本机开关状态通告对方（对方也会发来它的），
+        // 再启动本机剪贴板监视任务（任务里再按「双方都开」决定是否真正读写）
+        let _ = session
+            .conn
+            .send(&Frame::Control(Control::ClipboardState {
+                enabled: self.clipboard_local_on(),
+            }))
+            .await;
+        self.emit_clipboard_state(true);
+        self.spawn_clipboard_poll(session);
         Ok(peer_out)
     }
 
-    /// 断开当前连接。
+    /// 断开当前连接：先关底层连接（对端读到 EOF 随之结束会话），再清本机会话。
+    /// 只清指针不关连接的话，对端会一直以为还连着（2026-11-19 取消迟到成功实测撞出）。
     pub async fn disconnect(&self) {
-        *self.peer.lock().await = None;
+        let session = self.peer.lock().await.take();
+        if let Some(s) = &session {
+            s.conn.close().await;
+        }
+        drop(session);
+        self.clip_peer_on.store(false, Ordering::Relaxed);
         self.emit(Event::ConnectionChanged {
             connected: false,
             peer_name: None,
         });
+        self.emit_clipboard_state(false);
     }
 
     async fn recv_loop(self: Arc<Self>, session: Arc<PeerSession>) {
@@ -508,10 +696,12 @@ impl Node {
         if let Some(cur) = &*guard {
             if Arc::ptr_eq(cur, &session) {
                 *guard = None;
+                self.clip_peer_on.store(false, Ordering::Relaxed);
                 self.emit(Event::ConnectionChanged {
                     connected: false,
                     peer_name: None,
                 });
+                self.emit_clipboard_state(false);
             }
         }
     }
@@ -530,6 +720,25 @@ impl Node {
             | Frame::Control(Control::HelloAck { .. }) => {}
             Frame::Control(Control::Typing { typing }) => {
                 self.emit(Event::PeerTyping(typing));
+            }
+            Frame::Control(Control::ClipboardState { enabled }) => {
+                let prev = self.clip_peer_on.swap(enabled, Ordering::Relaxed);
+                if prev != enabled {
+                    log::log_line(
+                        "clipboard",
+                        &format!(
+                            "对方剪贴板同步开关：{}",
+                            if enabled { "已开启" } else { "未开启" }
+                        ),
+                    );
+                }
+                self.emit_clipboard_state(true);
+            }
+            Frame::Control(Control::ClipboardText { text, .. }) => {
+                self.apply_remote_clipboard(ClipContent::Text(text)).await;
+            }
+            Frame::ClipboardImage(img) => {
+                self.apply_remote_clipboard_image(img).await;
             }
             Frame::Control(Control::ChatText {
                 msg_id,
@@ -794,6 +1003,281 @@ impl Node {
                 .conn
                 .send(&Frame::Control(Control::Typing { typing }))
                 .await;
+        }
+    }
+
+    // ---------- 剪贴板同步 ----------
+    /// 本机剪贴板同步开关（设置键 clipboard_sync，默认关）。
+    pub fn clipboard_local_on(&self) -> bool {
+        self.storage
+            .get_setting("clipboard_sync")
+            .map(|v| v.as_deref() == Some("1"))
+            .unwrap_or(false)
+    }
+
+    /// 对方剪贴板同步开关（对方经 ClipboardState 通告，断开时复位为关）。
+    pub fn clipboard_peer_on(&self) -> bool {
+        self.clip_peer_on.load(Ordering::Relaxed)
+    }
+
+    /// 剪贴板同步三态快照（本机开关、对方开关、是否已连接），供界面展示状态。
+    pub async fn clipboard_status(&self) -> (bool, bool, bool) {
+        (
+            self.clipboard_local_on(),
+            self.clipboard_peer_on(),
+            self.is_connected().await,
+        )
+    }
+
+    /// 取长驻剪贴板句柄执行闭包（句柄不存在时懒创建；系统剪贴板不可用返回 None）。
+    /// 只在阻塞线程里调用：std Mutex 不跨 await。
+    fn with_clipboard<R>(&self, f: impl FnOnce(&mut arboard::Clipboard) -> R) -> Option<R> {
+        let mut guard = self.clip_handle.lock().ok()?;
+        if guard.is_none() {
+            *guard = arboard::Clipboard::new().ok();
+        }
+        guard.as_mut().map(f)
+    }
+
+    fn emit_clipboard_state(&self, connected: bool) {
+        self.emit(Event::ClipboardState {
+            local: self.clipboard_local_on(),
+            peer: self.clipboard_peer_on(),
+            connected,
+        });
+    }
+
+    /// 切换剪贴板同步开关：落库、即时生效（不用重启）；已连接时立刻通告对方。
+    pub async fn set_clipboard_sync(&self, on: bool) -> Result<(), ServiceError> {
+        self.storage
+            .set_setting("clipboard_sync", if on { "1" } else { "0" })?;
+        log::log_line(
+            "clipboard",
+            &format!("本机剪贴板同步开关：{}", if on { "开启" } else { "关闭" }),
+        );
+        if let Ok(s) = self.session().await {
+            let _ = s
+                .conn
+                .send(&Frame::Control(Control::ClipboardState { enabled: on }))
+                .await;
+            self.emit_clipboard_state(true);
+        }
+        Ok(())
+    }
+
+    /// 本机剪贴板监视任务（随会话启动、会话结束自动退出）：每 700ms 轮询一次。
+    /// 隐私底线：本机开关关闭时连读都不读；对方未开启时读了也不发，同样不读。
+    fn spawn_clipboard_poll(self: &Arc<Self>, session: Arc<PeerSession>) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(700));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                // 会话已断开或已被新会话替换：退出监视
+                let alive = {
+                    let guard = node.peer.lock().await;
+                    matches!(&*guard, Some(cur) if Arc::ptr_eq(cur, &session))
+                };
+                if !alive {
+                    break;
+                }
+                if !node.clipboard_local_on() || !node.clipboard_peer_on() {
+                    continue;
+                }
+                node.clipboard_poll_once(&session).await;
+            }
+        });
+    }
+
+    /// 一次监视：读本机剪贴板，内容变了且不是刚从对方写入的才发送。
+    async fn clipboard_poll_once(self: &Arc<Self>, session: &Arc<PeerSession>) {
+        // 剪贴板读取是同步系统调用，放阻塞线程执行，避免卡住异步运行时
+        let node = self.clone();
+        let content =
+            tokio::task::spawn_blocking(move || node.with_clipboard(clip_read_with).flatten())
+                .await
+                .ok()
+                .flatten();
+        let Some(content) = content else { return };
+        let hash = content.hash();
+        {
+            let mut g = self.clip_guard.lock().await;
+            if g.last_seen.as_deref() == Some(hash.as_str()) {
+                return; // 没变化
+            }
+            g.last_seen = Some(hash.clone());
+            if g.suppress.as_deref() == Some(hash.as_str()) {
+                // 这是刚从对方同步写入本机的内容，绝不回发（防回环）
+                return;
+            }
+        }
+        match content {
+            ClipContent::Text(text) => {
+                if text.len() > CLIPBOARD_MAX_BYTES {
+                    log::log_line(
+                        "clipboard",
+                        &format!("剪贴板文字 {} 字节，超过 2MB 上限，跳过同步", text.len()),
+                    );
+                    return;
+                }
+                let n = text.len();
+                if session
+                    .conn
+                    .send(&Frame::Control(Control::ClipboardText { hash, text }))
+                    .await
+                    .is_ok()
+                {
+                    log::log_line("clipboard", &format!("剪贴板同步：已发送文字（{n} 字节）"));
+                }
+            }
+            ClipContent::Image {
+                width,
+                height,
+                rgba,
+            } => {
+                // 位图先 zlib 压缩（截图类内容压缩率高），上限按实际发送大小算
+                let digest = clip_image_digest(width, height, &rgba);
+                let compressed = zlib_compress(&rgba).filter(|c| c.len() < rgba.len());
+                let (data, was_compressed) = match &compressed {
+                    Some(c) => (c.clone(), true),
+                    None => (rgba, false),
+                };
+                if data.len() > CLIPBOARD_MAX_BYTES {
+                    log::log_line(
+                        "clipboard",
+                        &format!(
+                            "剪贴板图片 {width}x{height}（发送大小 {} 字节），超过 2MB 上限，跳过同步",
+                            data.len()
+                        ),
+                    );
+                    return;
+                }
+                let n = data.len();
+                let frame = Frame::ClipboardImage(ClipboardImage {
+                    hash: digest,
+                    width,
+                    height,
+                    compressed: was_compressed,
+                    data,
+                });
+                if session.conn.send(&frame).await.is_ok() {
+                    log::log_line(
+                        "clipboard",
+                        &format!("剪贴板同步：已发送图片（{width}x{height}，{n} 字节）"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// 收到对方剪贴板图片帧：校验尺寸、解压成 RGBA 后走统一应用路径。
+    async fn apply_remote_clipboard_image(self: &Arc<Self>, img: ClipboardImage) {
+        let ClipboardImage {
+            width,
+            height,
+            compressed,
+            data,
+            ..
+        } = img;
+        if data.len() > CLIPBOARD_MAX_BYTES {
+            log::log_line(
+                "clipboard",
+                &format!(
+                    "收到对方剪贴板图片（{} 字节），超过 2MB 上限，已忽略",
+                    data.len()
+                ),
+            );
+            return;
+        }
+        // RGBA 长度必须与宽高严格对应，且给解压结果设 64MB 安全上限防异常帧
+        let expect = (width as u64)
+            .checked_mul(height as u64)
+            .and_then(|n| n.checked_mul(4));
+        let rgba = if compressed {
+            match tokio::task::spawn_blocking(move || {
+                use flate2::read::ZlibDecoder;
+                let mut dec = ZlibDecoder::new(&data[..]);
+                let mut out = Vec::new();
+                let mut limited = (&mut dec).take(64 * 1024 * 1024 + 1);
+                limited.read_to_end(&mut out).map(|_| out)
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                _ => {
+                    log::log_line("clipboard", "收到对方剪贴板图片，解压失败，已忽略");
+                    return;
+                }
+            }
+        } else {
+            data
+        };
+        if expect != Some(rgba.len() as u64) || rgba.len() > 64 * 1024 * 1024 {
+            log::log_line(
+                "clipboard",
+                &format!(
+                    "收到对方剪贴板图片，尺寸不符（{width}x{height} 期望 {expect:?} 字节，实际 {}），已忽略",
+                    rgba.len()
+                ),
+            );
+            return;
+        }
+        self.apply_remote_clipboard(ClipContent::Image {
+            width,
+            height,
+            rgba,
+        })
+        .await;
+    }
+
+    /// 把对方的一份剪贴板内容写入本机剪贴板（本机没开同步则绝不写），
+    /// 并登记其哈希：本机监视到这份内容时不会再把它发回去。
+    async fn apply_remote_clipboard(self: &Arc<Self>, content: ClipContent) {
+        if !self.clipboard_local_on() {
+            log::log_line("clipboard", "收到对方剪贴板内容，但本机未开启同步，已忽略");
+            return;
+        }
+        if let ClipContent::Text(t) = &content {
+            if t.len() > CLIPBOARD_MAX_BYTES {
+                log::log_line(
+                    "clipboard",
+                    &format!("收到对方剪贴板文字 {} 字节，超过 2MB 上限，已忽略", t.len()),
+                );
+                return;
+            }
+        }
+        let hash = content.hash();
+        let kind = content.kind();
+        let desc = match &content {
+            ClipContent::Text(t) => format!("文字（{} 字节）", t.len()),
+            ClipContent::Image { width, height, .. } => format!("图片（{width}x{height}）"),
+        };
+        let written = content.clone();
+        let node = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            node.with_clipboard(|cb| clip_write_with(cb, &written))
+                .unwrap_or_else(|| Err("系统剪贴板不可用".to_string()))
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                {
+                    let mut g = self.clip_guard.lock().await;
+                    g.suppress = Some(hash.clone());
+                    g.last_seen = Some(hash);
+                }
+                log::log_line("clipboard", &format!("剪贴板同步：已写入对方{desc}"));
+                self.emit(Event::ClipboardSynced {
+                    kind: kind.to_string(),
+                });
+            }
+            Ok(Err(e)) => {
+                log::log_line("clipboard", &format!("写入本机剪贴板失败：{e}"));
+            }
+            Err(e) => {
+                log::log_line("clipboard", &format!("写入本机剪贴板失败：{e}"));
+            }
         }
     }
 

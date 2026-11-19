@@ -558,3 +558,24 @@ section { display: flex; flex-direction: column; height: 100%; }
 
 /* 设置页路径文本截断 */
 .path-text { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 按钮/标题不换行护栏（全尺寸生效，防个别窄处把「停止」挤成竖排两行） */
+#btn-scan, .card-btns .btn, .device-panel-head b, #device-count { white-space: nowrap; }
+#btn-scan { flex: none; }
+
+/* 窄窗布局（≤1100px，用户 2026-11-19 真机截图裁定）：四列抢宽时两处收敛——
+   ①会话列表改浮层抽屉：absolute 盖在内容上（带阴影），不再占布局宽度；
+   悬浮开关的位置由 applyAside 按实测宽计算（收起 64 / 展开 64+288），
+   浮层模式下数值不变、行为不变。②连接页改单栏堆叠：右栏卡片流到设备
+   列表下方，整页纵向滚动。宽窗（>1100px）布局与定版原型完全一致。 */
+@media (max-width: 1100px) {
+  #aside { position: absolute; left: 64px; top: 0; bottom: 0; z-index: 30;
+    box-shadow: 10px 0 28px rgba(0, 0, 0, 0.20); }
+  #connect-view { overflow-y: auto; }
+  .connect-wrap { height: auto; min-height: 100%; }
+  .connect-cols { grid-template-columns: minmax(0, 1fr); flex: none; }
+  .device-panel { flex: none; }
+  #bt-device-list { max-height: 44vh; }
+  .connect-side { overflow: visible; }
+  .steps-card { flex: none; }
+}

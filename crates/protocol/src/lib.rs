@@ -85,6 +85,16 @@ pub enum Control {
         request_id: String,
         error: Option<String>,
     },
+    /// 剪贴板同步开关状态通告：连接建立后双方互发，开关被切换时再发。
+    /// 只有双方都开启才真正同步内容。
+    ClipboardState {
+        enabled: bool,
+    },
+    /// 剪贴板文字内容（hash 为内容 SHA-256 十六进制，接收方据此抑制回环）。
+    ClipboardText {
+        hash: String,
+        text: String,
+    },
     Ping,
     Pong,
 }
@@ -106,6 +116,8 @@ impl Control {
             Control::AiProxyRequest { .. } => 0x20,
             Control::AiProxyChunk { .. } => 0x21,
             Control::AiProxyDone { .. } => 0x22,
+            Control::ClipboardState { .. } => 0x06,
+            Control::ClipboardText { .. } => 0x07,
             Control::Ping => 0x30,
             Control::Pong => 0x31,
         }
@@ -121,11 +133,24 @@ pub struct FileChunk {
     pub data: Vec<u8>,
 }
 
+/// 剪贴板图片帧（类型码 0x1A，二进制承载）：RGBA 位图，可选 zlib 压缩
+/// （压缩/解压由服务层负责，协议层只搬字节，与文件分片同口径）。
+/// hash 为未压缩 RGBA 内容（含宽高）的 SHA-256，接收方据此抑制回环。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipboardImage {
+    pub hash: [u8; 32],
+    pub width: u32,
+    pub height: u32,
+    pub compressed: bool,
+    pub data: Vec<u8>,
+}
+
 /// 一帧的解码结果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Control(Control),
     Chunk(FileChunk),
+    ClipboardImage(ClipboardImage),
 }
 
 /// 把一帧编码为字节（长度前缀 + 类型 + payload）。
@@ -140,6 +165,15 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
             p.push(if ch.compressed { 1 } else { 0 });
             p.extend_from_slice(&ch.data);
             (0x12u8, p)
+        }
+        Frame::ClipboardImage(img) => {
+            let mut p = Vec::with_capacity(32 + 4 + 4 + 1 + img.data.len());
+            p.extend_from_slice(&img.hash);
+            p.extend_from_slice(&img.width.to_le_bytes());
+            p.extend_from_slice(&img.height.to_le_bytes());
+            p.push(if img.compressed { 1 } else { 0 });
+            p.extend_from_slice(&img.data);
+            (0x1Au8, p)
         }
     };
     if payload.len() as u64 + 1 > MAX_PAYLOAD as u64 {
@@ -217,6 +251,29 @@ pub async fn read_frame(
         };
         return Ok(Some(Frame::Chunk(chunk)));
     }
+    if code == 0x1A {
+        if body.len() < 41 {
+            return Err(ProtocolError::BadChunk);
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&body[..32]);
+        let image = ClipboardImage {
+            hash,
+            width: u32::from_le_bytes(
+                body[32..36]
+                    .try_into()
+                    .map_err(|_| ProtocolError::BadChunk)?,
+            ),
+            height: u32::from_le_bytes(
+                body[36..40]
+                    .try_into()
+                    .map_err(|_| ProtocolError::BadChunk)?,
+            ),
+            compressed: body[40] & 1 == 1,
+            data: body[41..].to_vec(),
+        };
+        return Ok(Some(Frame::ClipboardImage(image)));
+    }
     let control: Control = serde_json::from_slice(body)?;
     Ok(Some(Frame::Control(control)))
 }
@@ -256,6 +313,34 @@ mod tests {
                 received: vec![(0, 100), (300, 400)],
             }),
             Frame::Control(Control::Ping),
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        for f in &frames {
+            buf.extend_from_slice(&encode(f).unwrap());
+        }
+        let mut cursor = std::io::Cursor::new(buf);
+        for f in &frames {
+            let got = read_frame(&mut cursor).await.unwrap().unwrap();
+            assert_eq!(&got, f);
+        }
+        assert!(read_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn 剪贴板帧往返一致() {
+        let frames = vec![
+            Frame::Control(Control::ClipboardState { enabled: true }),
+            Frame::Control(Control::ClipboardText {
+                hash: "ab12".into(),
+                text: "同步的文字".into(),
+            }),
+            Frame::ClipboardImage(ClipboardImage {
+                hash: [9u8; 32],
+                width: 3,
+                height: 2,
+                compressed: true,
+                data: vec![1, 2, 3, 4, 5],
+            }),
         ];
         let mut buf: Vec<u8> = Vec::new();
         for f in &frames {
