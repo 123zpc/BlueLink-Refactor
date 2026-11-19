@@ -776,7 +776,7 @@ function updateCapsule() {
   if (t === "classic") {
     if (s.classic_serving) { dot.className = "status-dot on"; txt.textContent = "经典蓝牙已开启 · 服务运行中"; }
     else if (!s.classic_available) { dot.className = "status-dot off"; txt.textContent = "经典蓝牙不可用"; }
-    else if (String(s.classic_message).includes("服务启动失败")) { dot.className = "status-dot warn"; txt.textContent = "经典蓝牙服务启动失败"; }
+    else if (String(s.classic_message).includes("服务启动失败") || String(s.classic_message).includes("服务未能启动")) { dot.className = "status-dot warn"; txt.textContent = "经典蓝牙服务启动失败"; }
     else { dot.className = "status-dot warn"; txt.textContent = "经典蓝牙已开启 · 服务未启动"; }
   } else if (t === "simpleble") {
     if (s.simpleble_serving) { dot.className = "status-dot on"; txt.textContent = "SimpleBLE 已开启 · 服务运行中"; }
@@ -801,12 +801,16 @@ function renderStatusCard(s) {
     lines.push(line("on", "经典蓝牙：已开启，服务运行中"));
   } else if (s.classic_serving) {
     lines.push(line("warn", "经典蓝牙：服务已启动，但 SDP 注册失败，对方可能找不到本机", true));
-  } else if (String(s.classic_message).includes("服务启动失败")) {
-    // 服务启动失败的人话说明：端口占用（WSA 10048）是最常见的一种，给出可操作解释
+  } else if (String(s.classic_message).includes("服务启动失败") || String(s.classic_message).includes("服务未能启动")) {
+    // 服务启动失败的人话说明：端口占用（WSA 10048）是最常见的一种，给出可操作解释。
+    // v2.3.1 后端对 10048 已直接给出人话整句（「经典蓝牙服务未能启动：端口被其他程序占用…」），
+    // 优先取其冒号后的说明原文（与后端文案保持一致）；后端未人话时按同一句式兜底。
     const raw = String(s.classic_message);
-    const note = raw.includes("10048")
-      ? "端口被其他程序占用，关掉另一个 BlueLink 或老版本后重启本应用；你主动连接别人不受影响"
-      : raw.replace(/^经典蓝牙已开启，但服务启动失败：?/, "");
+    const note = raw.includes("端口被其他程序占用")
+      ? raw.slice(raw.indexOf("端口被其他程序占用"))
+      : raw.includes("10048")
+        ? "端口被其他程序占用（多半是另一个 BlueLink 或老版本正在运行），关掉它再重启本应用；你主动连接别人不受影响"
+        : raw.replace(/^经典蓝牙已开启，但服务启动失败：?/, "").replace(/^经典蓝牙服务未能启动：?/, "");
     lines.push(line("warn", "经典蓝牙：服务启动失败", true, note));
   } else if (!s.classic_available) {
     // 后端文案本身已带「经典蓝牙」前缀时（如「经典蓝牙仅支持 Windows」）不重复加前缀

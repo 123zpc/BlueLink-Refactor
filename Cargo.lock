@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-ai"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "futures-util",
  "reqwest 0.12.28",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-app"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "bluelink-ai",
  "bluelink-domain",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-domain"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "serde",
  "sha2 0.10.9",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-node"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "bluelink-ai",
  "bluelink-domain",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-protocol"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "bluelink-domain",
  "serde",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-services"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "bluelink-ai",
  "bluelink-domain",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-storage"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "bluelink-domain",
  "rusqlite",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-transport"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "ble-peripheral-rust",
  "bluelink-protocol",
