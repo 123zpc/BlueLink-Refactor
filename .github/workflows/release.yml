@@ -24,6 +24,12 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libdbus-1-dev
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
+      # 仅 Windows：先校验 SimpleBLE 确实进入构建图（cargo tree 反查不到就红灯），
+      # 再由下方 tauri-action 以 --features simpleble 打包。Linux/macOS 不启用
+      # （不引入 CMake/D-Bus 原生依赖），其包内 SimpleBLE 入口会如实回落经典蓝牙。
+      - name: 校验 Windows 构建包含 SimpleBLE
+        if: runner.os == 'Windows'
+        run: cargo tree -p bluelink-app --features simpleble -i simplersble
       - name: 打包并上传到 Release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -33,3 +39,4 @@ jobs:
           releaseName: "BlueLink ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
+          args: ${{ runner.os == 'Windows' && '--features simpleble' || '' }}

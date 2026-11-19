@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
+# 单实例：托盘常驻时再点图标只唤出已有窗口，不起第二进程（防双开抢占经典蓝牙端口 7）
+tauri-plugin-single-instance = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

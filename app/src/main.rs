@@ -120,7 +120,14 @@ async fn bt_state(state: State<'_, AppState>) -> Result<BtState, String> {
             "经典蓝牙服务已启动，但 SDP 注册失败，对方可能找不到本机".to_string()
         }
     } else if let Some(err) = &state.classic_server_error {
-        format!("经典蓝牙已开启，但服务启动失败：{err}")
+        if err.contains("10048") {
+            // 端口 7 已被占用（多半是另一个 BlueLink 或老版本在运行）：给人话说明，
+            // 原始错误已在启动日志里完整记录（setup 里的「经典蓝牙服务端启动失败」一行）。
+            "经典蓝牙服务未能启动：端口被其他程序占用（多半是另一个 BlueLink 或老版本正在运行），关掉它再重启本应用；你主动连接别人不受影响"
+                .to_string()
+        } else {
+            format!("经典蓝牙已开启，但服务启动失败：{err}")
+        }
     } else {
         "经典蓝牙已开启，但服务未启动".to_string()
     };
@@ -1275,6 +1282,16 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
 
 fn main() {
     tauri::Builder::default()
+        // 单实例必须最先注册：第二次启动直接退出，只把已有窗口唤到前台，
+        // 避免双开进程抢占经典蓝牙服务端端口（WSA 10048 的主要来源之一）。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager as _;
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
