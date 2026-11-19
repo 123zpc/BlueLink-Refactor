@@ -624,27 +624,43 @@ mod imp {
     // 唯一未证伪的官方途径是 AEP 属性 System.Devices.Aep.SignalStrength：
     // 微软文档只写它「仅适用于部分协议」，公开实测只见于 Wi-Fi Direct，
     // 对经典蓝牙是否填充没有实测记录。本探针在经典扫描开始时用 WinRT
-    // DeviceWatcher 按经典设备选择器枚举，申请标准 AEP 属性全集并逐项
+    // DeviceWatcher 按经典设备选择器枚举，申请 AEP 属性并逐项
     // dump 进 SCANPROBE 日志（有值记值、空缺明确标「（空）」），真机回传
     // 日志后即可定案。仅日志：不动 UI、不动扫描结果；60 秒节流。
+    // 属性申请走防御式（choose_aep_props + 枚举降级链）：v2.4.0 首测时整组
+    // 申请被一个不存在的键 ModelNumber 拖垮（0x8002802B），本轮起坏键只会被
+    // 逐个剔除并记日志，AEP 一节必有产出。
 
     static AEP_PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
     static AEP_PROBE_LAST_RUN: AtomicU64 = AtomicU64::new(0);
 
-    /// 申请的 AEP 属性全集（重点是 SignalStrength，其余一并摸清家底）。
-    const AEP_PROPS: &[&str] = &[
+    /// AEP 核心键：逐项与微软官方《Device information properties》的
+    /// AssociationEndpoint 属性表核对无误；探针的重点 SignalStrength 在此组，
+    /// 降级重试时以此组保底。
+    const AEP_PROPS_CORE: &[&str] = &[
         "System.Devices.Aep.SignalStrength",
         "System.Devices.Aep.IsPaired",
         "System.Devices.Aep.CanPair",
         "System.Devices.Aep.IsConnected",
         "System.Devices.Aep.IsPresent",
-        "System.Devices.Aep.Manufacturer",
-        "System.Devices.Aep.ModelNumber",
-        "System.Devices.Aep.Category",
-        "System.Devices.Aep.ProtocolId",
         "System.Devices.Aep.DeviceAddress",
-        "System.Devices.Aep.ContainerId",
+    ];
+
+    /// AEP 扩展键：同样逐项核对官方属性表，与核心键分开申请，单个坏键只会被
+    /// 剔除、不会连累整组枚举。
+    /// 注：v2.4.0 及之前曾申请 `System.Devices.Aep.ModelNumber`——官方属性表里
+    /// 根本没有这个键（型号只有 ModelId（GUID）/ ModelName（String）两个键），
+    /// 它就是让整组枚举报「Property key syntax error」(0x8002802B)、AEP 一节
+    /// 一条没产出的坏键（用户 2026-11-19 真机日志实证），本轮已剔除并改用
+    /// ModelId / ModelName。
+    const AEP_PROPS_EXT: &[&str] = &[
         "System.Devices.Aep.AepId",
+        "System.Devices.Aep.Category",
+        "System.Devices.Aep.ContainerId",
+        "System.Devices.Aep.Manufacturer",
+        "System.Devices.Aep.ModelId",
+        "System.Devices.Aep.ModelName",
+        "System.Devices.Aep.ProtocolId",
         "System.ItemNameDisplay",
     ];
 
@@ -671,12 +687,66 @@ mod imp {
         });
     }
 
-    /// DeviceWatcher 枚举经典设备并逐项 dump AEP 属性（阻塞，最长约 15 秒）。
+    /// 试建一个带给定附加属性的 DeviceWatcher（不启动）：创建期即解析属性键，
+    /// 键不合法时在此报错——用来逐键/逐组校验，避免坏键连累整组枚举。
+    fn aep_watcher_creates(selector: &windows::core::HSTRING, keys: &[&str]) -> Result<(), String> {
+        use windows::core::HSTRING;
+        use windows::Devices::Enumeration::DeviceInformation;
+        let props: windows_collections::IIterable<HSTRING> = keys
+            .iter()
+            .map(|s| HSTRING::from(*s))
+            .collect::<Vec<_>>()
+            .into();
+        DeviceInformation::CreateWatcherAqsFilterAndAdditionalProperties(selector, &props)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 防御式选定本轮申请的属性集：先整组（核心+扩展）试建；不行则核心组打底、
+    /// 扩展键逐个增补校验；再不行则全部键逐个校验。被判无效的键逐个记一行
+    /// 「SCANPROBE AEP 属性键无效：<键>」，保证坏键永远只影响它自己。
+    /// 返回 (最终属性集, 说明行)。
+    fn choose_aep_props(selector: &windows::core::HSTRING) -> (Vec<&'static str>, Vec<String>) {
+        let mut notes = Vec::new();
+        let all: Vec<&'static str> = AEP_PROPS_CORE
+            .iter()
+            .chain(AEP_PROPS_EXT.iter())
+            .copied()
+            .collect();
+        // 第一级：整组试建，成功就整组用
+        if aep_watcher_creates(selector, &all).is_ok() {
+            return (all, notes);
+        }
+        // 第二级：核心组打底，扩展键逐个增补
+        if aep_watcher_creates(selector, AEP_PROPS_CORE).is_ok() {
+            let mut accepted: Vec<&'static str> = AEP_PROPS_CORE.to_vec();
+            for key in AEP_PROPS_EXT {
+                let mut trial = accepted.clone();
+                trial.push(key);
+                if aep_watcher_creates(selector, &trial).is_ok() {
+                    accepted.push(key);
+                } else {
+                    notes.push(format!("SCANPROBE AEP 属性键无效：{key}"));
+                }
+            }
+            return (accepted, notes);
+        }
+        // 第三级：核心组整组都建不出来——全部键逐个校验，只留能用的
+        let mut accepted: Vec<&'static str> = Vec::new();
+        for key in all {
+            if aep_watcher_creates(selector, &[key]).is_ok() {
+                accepted.push(key);
+            } else {
+                notes.push(format!("SCANPROBE AEP 属性键无效：{key}"));
+            }
+        }
+        (accepted, notes)
+    }
+
+    /// 探针主流程：选定属性集 → 枚举；枚举失败则逐级降级（已选集 → 核心键组
+    /// → 空属性集），保证 AEP 一节必有产出；只有连裸枚举都失败才整体报错。
     fn run_aep_probe() -> Result<Vec<String>, String> {
-        use windows::core::{Ref, HSTRING};
         use windows::Devices::Bluetooth::BluetoothDevice;
-        use windows::Devices::Enumeration::{DeviceInformation, DeviceWatcher};
-        use windows::Foundation::TypedEventHandler;
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
         // WinRT 要求线程先初始化 COM（MTA）；本线程专用，结束时反初始化。
@@ -685,61 +755,46 @@ mod imp {
         }
         let body = || -> Result<Vec<String>, String> {
             let selector = BluetoothDevice::GetDeviceSelector().map_err(|e| e.to_string())?;
-            // 申请附加属性全集：windows 0.61 绑定要 IIterable<HSTRING>，由 Vec 转换
-            let props: windows_collections::IIterable<HSTRING> = AEP_PROPS
-                .iter()
-                .map(|s| HSTRING::from(*s))
-                .collect::<Vec<_>>()
-                .into();
-            let watcher =
-                DeviceInformation::CreateWatcherAqsFilterAndAdditionalProperties(&selector, &props)
-                    .map_err(|e| e.to_string())?;
-            let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            let c2 = collected.clone();
-            watcher
-                .Added(&TypedEventHandler::new(
-                    move |_sender: Ref<DeviceWatcher>, info: Ref<DeviceInformation>| {
-                        if let Some(info) = info.as_ref() {
-                            if let Ok(mut g) = c2.lock() {
-                                g.extend(dump_aep_device(info));
+            let (props, mut out) = choose_aep_props(&selector);
+            match enumerate_aep(&selector, &props) {
+                Ok(lines) => {
+                    out.extend(lines);
+                    Ok(out)
+                }
+                Err(e) => {
+                    if props.is_empty() {
+                        return Err(e);
+                    }
+                    out.push(format!("SCANPROBE WinRT-AEP 枚举失败：{e}"));
+                    // 降级一：只用核心键（与已选集取交集，已选集本身即核心子集时跳过）
+                    let core: Vec<&'static str> = props
+                        .iter()
+                        .copied()
+                        .filter(|k| AEP_PROPS_CORE.contains(k))
+                        .collect();
+                    if core.len() < props.len() {
+                        out.push("SCANPROBE WinRT-AEP 降级：改用核心键组重试".to_string());
+                        match enumerate_aep(&selector, &core) {
+                            Ok(lines) => {
+                                out.extend(lines);
+                                return Ok(out);
+                            }
+                            Err(e2) => {
+                                out.push(format!("SCANPROBE WinRT-AEP 核心键组枚举失败：{e2}"))
                             }
                         }
-                        Ok(())
-                    },
-                ))
-                .map_err(|e| e.to_string())?;
-            watcher
-                .EnumerationCompleted(&TypedEventHandler::new(
-                    move |_sender: Ref<DeviceWatcher>, _args: Ref<windows::core::IInspectable>| {
-                        let _ = tx.send(());
-                        Ok(())
-                    },
-                ))
-                .map_err(|e| e.to_string())?;
-            watcher.Start().map_err(|e| e.to_string())?;
-            let timed_out = rx.recv_timeout(std::time::Duration::from_secs(15)).is_err();
-            let _ = watcher.Stop();
-            let mut lines = vec![format!(
-                "SCANPROBE WinRT-AEP 一节开始（经典设备选择器，申请 {} 项属性）",
-                AEP_PROPS.len()
-            )];
-            let count_note;
-            if let Ok(mut g) = collected.lock() {
-                count_note = g.iter().filter(|l| l.contains("设备开始")).count();
-                lines.append(&mut g);
-            } else {
-                count_note = 0;
-            }
-            lines.push(format!(
-                "SCANPROBE WinRT-AEP 一节结束：共 {count_note} 台{}",
-                if timed_out {
-                    "（15 秒超时未完成，以上为已枚举部分）"
-                } else {
-                    ""
+                    }
+                    // 降级二：空属性集裸枚举，无论如何要把一节产出来
+                    out.push("SCANPROBE WinRT-AEP 降级：改用空属性集重试".to_string());
+                    match enumerate_aep(&selector, &[]) {
+                        Ok(lines) => {
+                            out.extend(lines);
+                            Ok(out)
+                        }
+                        Err(e3) => Err(format!("全部降级均失败，最后错误：{e3}")),
+                    }
                 }
-            ));
-            Ok(lines)
+            }
         };
         let result = body();
         unsafe {
@@ -748,8 +803,81 @@ mod imp {
         result
     }
 
+    /// 用给定属性集跑一轮 DeviceWatcher 枚举并逐项 dump（阻塞，最长约 15 秒）。
+    fn enumerate_aep(
+        selector: &windows::core::HSTRING,
+        props: &[&'static str],
+    ) -> Result<Vec<String>, String> {
+        use windows::core::{Ref, HSTRING};
+        use windows::Devices::Enumeration::{DeviceInformation, DeviceWatcher};
+        use windows::Foundation::TypedEventHandler;
+
+        // 申请附加属性：windows 0.61 绑定要 IIterable<HSTRING>，由 Vec 转换
+        let props_param: windows_collections::IIterable<HSTRING> = props
+            .iter()
+            .map(|s| HSTRING::from(*s))
+            .collect::<Vec<_>>()
+            .into();
+        let watcher = DeviceInformation::CreateWatcherAqsFilterAndAdditionalProperties(
+            selector,
+            &props_param,
+        )
+        .map_err(|e| e.to_string())?;
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let c2 = collected.clone();
+        let dump_props: Vec<&'static str> = props.to_vec();
+        watcher
+            .Added(&TypedEventHandler::new(
+                move |_sender: Ref<DeviceWatcher>, info: Ref<DeviceInformation>| {
+                    if let Some(info) = info.as_ref() {
+                        if let Ok(mut g) = c2.lock() {
+                            g.extend(dump_aep_device(info, &dump_props));
+                        }
+                    }
+                    Ok(())
+                },
+            ))
+            .map_err(|e| e.to_string())?;
+        watcher
+            .EnumerationCompleted(&TypedEventHandler::new(
+                move |_sender: Ref<DeviceWatcher>, _args: Ref<windows::core::IInspectable>| {
+                    let _ = tx.send(());
+                    Ok(())
+                },
+            ))
+            .map_err(|e| e.to_string())?;
+        watcher.Start().map_err(|e| e.to_string())?;
+        let timed_out = rx.recv_timeout(std::time::Duration::from_secs(15)).is_err();
+        let _ = watcher.Stop();
+        let mut lines = vec![format!(
+            "SCANPROBE WinRT-AEP 一节开始（经典设备选择器，申请 {} 项属性）",
+            props.len()
+        )];
+        let count_note;
+        if let Ok(mut g) = collected.lock() {
+            count_note = g.iter().filter(|l| l.contains("设备开始")).count();
+            lines.append(&mut g);
+        } else {
+            count_note = 0;
+        }
+        lines.push(format!(
+            "SCANPROBE WinRT-AEP 一节结束：共 {count_note} 台{}",
+            if timed_out {
+                "（15 秒超时未完成，以上为已枚举部分）"
+            } else {
+                ""
+            }
+        ));
+        Ok(lines)
+    }
+
     /// 把一台 AEP 设备的全部可读信息 dump 成 SCANPROBE 分段行。
-    fn dump_aep_device(info: &windows::Devices::Enumeration::DeviceInformation) -> Vec<String> {
+    /// props 为本轮实际申请到的属性集，逐项 dump（有值记值、缺失标「（空）」）。
+    fn dump_aep_device(
+        info: &windows::Devices::Enumeration::DeviceInformation,
+        props: &[&str],
+    ) -> Vec<String> {
         let id = info.Id().unwrap_or_default();
         let mut lines = vec![format!("SCANPROBE 设备开始 [winrt-aep] {id}")];
         lines.push(format!(
@@ -770,7 +898,7 @@ mod imp {
                 lines.push(format!("SCANPROBE Pairing.CanPair={v}"));
             }
         }
-        for key in AEP_PROPS {
+        for key in props {
             lines.push(format!("SCANPROBE 属性 {key}={}", fmt_aep_prop(info, key)));
         }
         lines.push(format!("SCANPROBE 设备结束 [winrt-aep] {id}"));
@@ -839,6 +967,22 @@ mod imp {
                 .GetString()
                 .map(|v| v.to_string())
                 .unwrap_or_else(|_| "（空）".into()),
+            // Category 是 String[]，展开成一行分号分隔，别落进「未展开」
+            // （windows 0.61 的 GetStringArray 是出参式签名）
+            PropertyType::StringArray => {
+                let mut arr = windows::core::Array::<HSTRING>::new();
+                match pv.GetStringArray(&mut arr) {
+                    Ok(()) => {
+                        let items: Vec<String> = arr.iter().map(|s| s.to_string()).collect();
+                        if items.is_empty() {
+                            "（空）".to_string()
+                        } else {
+                            items.join("; ")
+                        }
+                    }
+                    Err(_) => "（空）".to_string(),
+                }
+            }
             PropertyType::Guid => pv
                 .GetGuid()
                 .map(|v| format!("{:?}", v))

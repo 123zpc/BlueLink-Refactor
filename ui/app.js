@@ -357,16 +357,13 @@ function switchView(view) {
 }
 
 document.querySelectorAll(".nav-item").forEach((b) =>
-  b.addEventListener("click", () => {
-    if (b.dataset.view === "chat" && localStorage.getItem("bl-aside") === "collapsed") {
-      localStorage.setItem("bl-aside", "open");
-    }
-    switchView(b.dataset.view);
-  }));
+  b.addEventListener("click", () => switchView(b.dataset.view)));
 
 // ---------- 会话列表收起/展开（列表只属于聊天页；收起即整列消失，不留残条） ----------
 // 默认收起（用户裁定，两次确认）：每次启动程序都以收起状态进入，不沿用上次退出时的展开状态；
 // 本次运行内用户展开/收起的选择照常生效，重启后回到收起。
+// 状态只许由展开/收起按钮改：页面切换永不自动弹开（v2.4.1 修——旧版导航点「聊天」时
+// 会强制把收起状态改成展开，用户反馈一切换菜单列表就自己弹开；展开改走页头专用按钮）。
 let asideBootDone = false;
 function applyAside() {
   if (!asideBootDone) {
@@ -375,11 +372,19 @@ function applyAside() {
   }
   const collapsed = localStorage.getItem("bl-aside") === "collapsed";
   $("aside").classList.toggle("hidden", state.view !== "chat" || collapsed);
+  // 展开入口（连接页/聊天页页头的 » 按钮）只在聊天页且列表收起时出现
+  document.querySelectorAll(".btn-expand-aside").forEach((b) =>
+    b.classList.toggle("hidden", !(state.view === "chat" && collapsed)));
 }
 $("btn-collapse-aside").addEventListener("click", () => {
   localStorage.setItem("bl-aside", "collapsed");
   applyAside();
 });
+document.querySelectorAll(".btn-expand-aside").forEach((b) =>
+  b.addEventListener("click", () => {
+    localStorage.setItem("bl-aside", "open");
+    applyAside();
+  }));
 
 // ---------- 会话列表 ----------
 async function loadConversations() {

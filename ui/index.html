@@ -69,7 +69,10 @@
     <section id="connect-view">
       <div class="connect-wrap">
         <div class="connect-head">
-          <h1>连接</h1>
+          <div class="head-left">
+            <button class="icon-btn btn-expand-aside hidden" title="展开会话列表"><svg class="ico ico-16"><use href="#i-chevrons-right"/></svg></button>
+            <h1>连接</h1>
+          </div>
           <div class="capsule"><span id="capsule-dot" class="status-dot"></span><span id="capsule-text">正在检测蓝牙…</span></div>
         </div>
         <div class="connect-cols">
@@ -199,6 +202,7 @@
     <section id="chat-view" class="hidden">
       <header class="chat-head">
         <div class="head-peer">
+          <button class="icon-btn btn-expand-aside hidden" title="展开会话列表"><svg class="ico ico-16"><use href="#i-chevrons-right"/></svg></button>
           <div>
             <div id="peer-name" class="chat-title">未连接</div>
             <div id="peer-state" class="muted small">离线</div>
