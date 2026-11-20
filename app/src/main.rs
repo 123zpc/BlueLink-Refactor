@@ -644,6 +644,54 @@ async fn send_file_path(state: State<'_, AppState>, path: String) -> Result<Stri
         .map_err(|e| e.to_string())
 }
 
+/// 发送图片组（v2.6.0）：多张图片合并为一条消息发送，返回组消息 ID。
+#[tauri::command]
+async fn send_image_group(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<String, String> {
+    let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    state
+        .node
+        .send_image_group(&paths)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 图片组成员文件信息（组气泡缩略图/查看器/保存全部用），顺序与组内一致。
+#[tauri::command]
+fn group_files(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<Vec<FileInfoView>, String> {
+    Ok(state
+        .node
+        .group_files(&message_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|f| FileInfoView {
+            name: f.name,
+            size: f.size,
+            path: f.path,
+            exists: f.exists,
+        })
+        .collect())
+}
+
+/// 「保存全部图片」：组内图片按序复制到目标目录（1、2、3…保留扩展名）。
+/// 返回（成功数， 总数），前端据此提示。
+#[tauri::command]
+fn save_group_images(
+    state: State<'_, AppState>,
+    message_id: String,
+    dir: String,
+) -> Result<(usize, usize), String> {
+    state
+        .node
+        .save_group_images(&message_id, std::path::Path::new(&dir))
+        .map_err(|e| e.to_string())
+}
+
 /// 把一段文本（代码/长文）落成本地文档后按文件发送：前端负责识别类型与命名，
 /// 这里消毒文件名防路径穿越，写入数据目录的 outbox 再走文件引擎发送。
 #[tauri::command]
@@ -1240,6 +1288,73 @@ fn open_file(path: String) -> Result<(), String> {
     bluelink_services::open_file(std::path::Path::new(&path)).map_err(|e| e.to_string())
 }
 
+/// 文本查看器的数据上限：超过 10MB 不整载（定版内存口径），
+/// 前端收到 TOO_LARGE 后回退系统程序打开。
+const TEXT_VIEWER_MAX: u64 = 10 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct TextFileView {
+    size: u64,
+    base64: String,
+}
+
+/// 文本查看器数据源（v2.6.0）：读文件原始字节回前端（base64）。
+/// 编码识别与解码由前端 TextDecoder 做（UTF-8 严格校验，失败回退
+/// GBK）——WebView 自带解码器，后端零新增依赖、零体积增量。
+#[tauri::command]
+fn read_text_file(path: String) -> Result<TextFileView, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| format!("文件不存在或不可读（{e}）"))?;
+    if !meta.is_file() {
+        return Err("不是文件".into());
+    }
+    if meta.len() > TEXT_VIEWER_MAX {
+        return Err(format!("TOO_LARGE:{}", meta.len()));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取失败（{e}）"))?;
+    Ok(TextFileView {
+        size: bytes.len() as u64,
+        base64: base64_encode(&bytes),
+    })
+}
+
+/// 把一个本地文件登记进 asset 协议可见范围（v2.6.0 查看器用）：
+/// 图片/音视频经 convertFileSrc 直读本地文件，不经内存拷贝。
+/// 协议范围默认不开大口子，这里按文件逐个放行。
+#[tauri::command]
+fn allow_asset_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri::Manager as _;
+    app.asset_protocol_scope()
+        .allow_file(std::path::Path::new(&path))
+        .map_err(|e| e.to_string())
+}
+
+/// 标准 base64 编码（与既有 base64_decode 对称，手写避免新增依赖）。
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0] as u32,
+            *chunk.get(1).unwrap_or(&0) as u32,
+            *chunk.get(2).unwrap_or(&0) as u32,
+        ];
+        let n = (b[0] << 16) | (b[1] << 8) | b[2];
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[tauri::command]
 fn reveal_file(path: String) -> Result<(), String> {
     bluelink_services::reveal_file(std::path::Path::new(&path)).map_err(|e| e.to_string())
@@ -1592,6 +1707,9 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
                 Ok(Event::MessageNew(m)) => {
                     maybe_notify_new_message(&app, &node, &m);
                     let _ = app.emit("message_new", m);
+                }
+                Ok(Event::MessageUpdated(m)) => {
+                    let _ = app.emit("message_updated", m);
                 }
                 Ok(Event::MessageStatus { id, status }) => {
                     let _ = app.emit(
@@ -2059,6 +2177,7 @@ fn main() {
             disconnect,
             send_text,
             send_file_path,
+            send_image_group,
             send_document,
             send_typing,
             list_conversations,
@@ -2103,6 +2222,10 @@ fn main() {
             clean_cache,
             clear_chat_history,
             file_info,
+            group_files,
+            save_group_images,
+            read_text_file,
+            allow_asset_file,
             open_file,
             reveal_file,
             copy_file_as,

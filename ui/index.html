@@ -231,6 +231,10 @@
       <div id="composer">
         <div id="attach-bar" class="hidden">
           <div id="attach-list"></div>
+          <div id="attach-group-row" class="hidden">
+            <label class="switch"><input type="checkbox" id="attach-group-toggle" checked><span class="switch-track"></span></label>
+            <span id="attach-group-label">合并为图片组发送</span>
+          </div>
           <button id="attach-clear" class="btn small-btn">清空</button>
         </div>
         <div id="reply-bar" class="hidden"></div>
@@ -474,6 +478,80 @@
       <svg viewBox="0 0 48 48" class="logo-mark egg-mark"><g class="ring-me"><rect x="9" y="18.25" width="21" height="11.5" rx="5.75" transform="rotate(-45 19.5 24)"/></g><g class="ring-peer"><rect x="18" y="18.25" width="21" height="11.5" rx="5.75" transform="rotate(-45 28.5 24)"/></g></svg>
       <div class="egg-text">无需网络，扣合即连。</div>
       <div class="egg-sub">BlueLink · 作者 ZPC</div>
+    </div>
+  </div>
+  <!-- 内置查看器（v2.6.0）：页内全屏覆盖层——文本/代码、图片、音视频三态。
+       选页内而非独立窗口：无第二个 WebView 冷启动，点击即开（秒开红线），关闭即释放。 -->
+  <div id="viewer" class="hidden">
+    <div class="viewer-top">
+      <span id="viewer-title">文件</span>
+      <span id="viewer-sub" class="muted small"></span>
+      <span class="flex-spacer"></span>
+      <span id="viewer-tools" class="hidden">
+        <select id="viewer-fmt" title="格式化快捷处理（只改显示，原文不动）">
+          <option value="">格式化处理…</option>
+          <option value="jsonPretty">JSON 美化</option>
+          <option value="jsonMin">JSON 压缩</option>
+          <option value="xmlPretty">XML 美化</option>
+          <option value="reindent">代码整理缩进</option>
+          <option value="b64enc">Base64 编码</option>
+          <option value="b64dec">Base64 解码</option>
+          <option value="urlEnc">URL 编码</option>
+          <option value="urlDec">URL 解码</option>
+          <option value="tsConv">时间戳 → 时间</option>
+        </select>
+        <button id="viewer-fmt-go" class="btn small-btn">执行</button>
+        <button id="viewer-find-btn" class="btn small-btn">查找</button>
+        <button id="viewer-copy-all" class="btn small-btn">复制全文</button>
+      </span>
+      <button id="viewer-close" class="icon-btn" title="关闭 (Esc)"><svg class="ico"><use href="#i-x"/></svg></button>
+    </div>
+    <!-- 文本/代码 -->
+    <div id="viewer-text" class="hidden">
+      <div id="viewer-findbar" class="hidden">
+        <input id="viewer-find-input" type="text" placeholder="在文件中查找（Enter 下一个）">
+        <span id="viewer-find-count" class="muted small"></span>
+        <button id="viewer-find-prev" class="btn small-btn">上一个</button>
+        <button id="viewer-find-next" class="btn small-btn">下一个</button>
+        <button id="viewer-find-close" class="btn small-btn">关闭</button>
+      </div>
+      <div id="viewer-banner" class="hidden">
+        <span id="viewer-banner-text"></span>
+        <span class="flex-spacer"></span>
+        <button id="viewer-banner-copy" class="btn small-btn">复制结果</button>
+        <button id="viewer-banner-origin" class="btn small-btn">查看原文</button>
+        <button id="viewer-banner-close" class="btn small-btn">关闭</button>
+      </div>
+      <div id="viewer-scroll">
+        <div id="viewer-spacer">
+          <div id="viewer-gutter"></div>
+          <div id="viewer-lines"></div>
+        </div>
+      </div>
+      <div id="viewer-status" class="muted small"></div>
+    </div>
+    <!-- 图片 -->
+    <div id="viewer-image" class="hidden">
+      <div id="viewer-img-stage">
+        <img id="viewer-img" alt="" draggable="false">
+        <button id="viewer-img-prev" class="viewer-nav hidden" title="上一张 (←)">‹</button>
+        <button id="viewer-img-next" class="viewer-nav hidden" title="下一张 (→)">›</button>
+      </div>
+      <div class="viewer-imgbar">
+        <button id="vi-fit" class="btn small-btn">适屏</button>
+        <button id="vi-actual" class="btn small-btn">1:1</button>
+        <button id="vi-rotl" class="btn small-btn">↺ 左旋</button>
+        <button id="vi-rotr" class="btn small-btn">↻ 右旋</button>
+        <span id="vi-count" class="muted small"></span>
+        <span id="vi-zoom" class="muted small"></span>
+        <span class="muted small">滚轮缩放 · 拖动平移 · 双击适屏/1:1</span>
+      </div>
+    </div>
+    <!-- 音视频 -->
+    <div id="viewer-media" class="hidden">
+      <video id="viewer-video" controls class="hidden"></video>
+      <audio id="viewer-audio" controls class="hidden"></audio>
+      <p id="viewer-media-err" class="hidden">此格式内置播放不了。<button id="viewer-media-open" class="btn small-btn">用系统程序打开</button></p>
     </div>
   </div>
   <div id="toast" class="hidden"></div>

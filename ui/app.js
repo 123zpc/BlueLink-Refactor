@@ -129,7 +129,7 @@ function buildMessageEl(m, opts = {}) {
   const wrap = document.createElement("div");
   wrap.className = "msg";
   const bubble = document.createElement("div");
-  bubble.className = "bubble" + (m.kind === "file" ? " file-card" : "");
+  bubble.className = "bubble" + (m.kind === "file" ? " file-card" : "") + (m.kind === "imagegroup" ? " group-card" : "");
   if (m.reply_to && m.kind === "text" && !opts.ai) {
     const q = document.createElement("div");
     q.className = "quote-block";
@@ -138,12 +138,14 @@ function buildMessageEl(m, opts = {}) {
     bubble.appendChild(q);
     fillQuote(q, m);
   }
-  if (m.kind === "file") {
+  if (m.kind === "imagegroup") {
+    buildGroupBubble(bubble, m, row);
+  } else if (m.kind === "file") {
     bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div><div class="progress hidden"><div></div></div><div class="progress-meta hidden"></div><button class="progress-cancel hidden">取消</button><button class="transfer-retry hidden">重试</button>`;
     state.lastFileBubble = bubble;
     bubble.addEventListener("click", (e) => {
       if (e.target.closest("button")) return;
-      openFileMenu(m.id, e.clientX, e.clientY);
+      openFileSmart(m, e.clientX, e.clientY);
     });
     bubble.querySelector(".progress-cancel").addEventListener("click", async () => {
       const tid = state.transferMap[m.id];
@@ -190,7 +192,8 @@ function buildMessageEl(m, opts = {}) {
   const actions = document.createElement("span");
   actions.className = "msg-actions";
   const btns = [["彩签", (e) => openCatPop(m.id, e.currentTarget)], ["收藏", () => toggleMark(m.id, "favorite")], ["置顶", () => toggleMark(m.id, "pin")]];
-  if (!opts.ai) btns.push(["引用", () => setReply(m)], ["问AI", () => askAiAbout(m)]);
+  // 图片组的正文是清单 JSON，引用/问AI 对它无意义，不给这两个入口
+  if (!opts.ai && m.kind !== "imagegroup") btns.push(["引用", () => setReply(m)], ["问AI", () => askAiAbout(m)]);
   if (opts.ai && m.sender === "ai") btns.push(["复制", () => navigator.clipboard.writeText(m.body)], ["重新生成", () => regenerateAi()]);
   for (const [label, fn] of btns) {
     const b = document.createElement("button");
@@ -243,7 +246,9 @@ async function fillQuote(el, m) {
     }
     if (!orig) { el.textContent = "原消息已删除"; return; }
     const who = orig.sender === "me" ? "我" : orig.sender === "ai" ? "AI" : "对方";
-    el.textContent = `${who}：${orig.body.slice(0, 80)}`;
+    el.textContent = orig.kind === "imagegroup"
+      ? `${who}：[图片组]`
+      : `${who}：${orig.body.slice(0, 80)}`;
   } catch (_) { el.textContent = "引用消息"; }
 }
 
@@ -677,6 +682,11 @@ $("input").addEventListener("paste", () => setTimeout(updateDocBar, 0));
 // 附件按钮多选、输入框粘贴文件、拖放文件三个入口都汇入这条队列；
 // 点发送时按顺序逐个传（每个文件一条文件消息、各自进度），单个失败
 // 提示并跳过、不堵住后面。发送前可在附件条逐个移除、也可一键清空。
+/** 待发队列里的图片数（按扩展名判定，与查看器/图片组共用同一口径）。 */
+function pendingImageCount() {
+  return state.pendingFiles.filter((f) => isImageExt(fileExt(f.name))).length;
+}
+
 function renderAttachBar() {
   const bar = $("attach-bar");
   const list = $("attach-list");
@@ -700,8 +710,23 @@ function renderAttachBar() {
     chip.appendChild(x);
     list.appendChild(chip);
   }
+  // 图片组开关：队列里图片超过 3 张才出现（定版口径），默认开启；
+  // 用户手动改过就尊重其选择，直到队列清空才复位默认。
+  const grow = $("attach-group-row");
+  const nImg = pendingImageCount();
+  if (!state.pendingFiles.length) state.attachGroupTouched = false;
+  if (nImg > 3) {
+    if (grow.classList.contains("hidden") && !state.attachGroupTouched) {
+      $("attach-group-toggle").checked = true;
+    }
+    $("attach-group-label").textContent = `把 ${nImg} 张图片合并为一组发送`;
+    grow.classList.remove("hidden");
+  } else {
+    grow.classList.add("hidden");
+  }
   bar.classList.toggle("hidden", state.pendingFiles.length === 0);
 }
+$("attach-group-toggle").addEventListener("change", () => { state.attachGroupTouched = true; });
 $("attach-clear").addEventListener("click", () => {
   state.pendingFiles = [];
   renderAttachBar();
@@ -801,9 +826,22 @@ async function sendCurrent() {
       // 未连接时保留队列（连上后点发送即可），只提示不清空
       showToast("尚未连接设备，文件未发送");
     } else {
+      // 图片组（v2.6.0 定版）：队列里图片超过 3 张且合并开关开着时，
+      // 图片子集整体走一组发送（保持相对顺序，在第一张图片的位置
+      // 整组发出）；其余文件仍逐个发。开关状态要在清队列前读。
+      const groupOn = pendingImageCount() > 3 && $("attach-group-toggle").checked;
       state.pendingFiles = [];
       renderAttachBar();
+      let groupSent = false;
       for (const f of queue) {
+        if (groupOn && isImageExt(fileExt(f.name))) {
+          if (groupSent) continue;
+          groupSent = true;
+          const paths = queue.filter((q) => isImageExt(fileExt(q.name))).map((q) => q.path);
+          try { await invoke("send_image_group", { paths }); }
+          catch (e) { showToast(`图片组发送失败：${e}`); }
+          continue;
+        }
         try { await invoke("send_file_path", { path: f.path }); }
         catch (e) { showToast(`文件「${f.name}」发送失败：${e}`); }
       }
@@ -1713,6 +1751,7 @@ async function copyText(text) {
  * #file-menu（点外关闭逻辑现成）。 */
 function openMsgMenu(m, x, y) {
   if (m.kind === "file") { openFileMenu(m.id, x, y); return; }
+  if (m.kind === "imagegroup") { openGroupMenu(m, x, y); return; }
   if (m.kind === "system") return;
   const menu = $("file-menu");
   menu.innerHTML = "";
@@ -2526,11 +2565,35 @@ async function wireEvents() {
     switchView("chat");
     if (state.connected) loadChatMessages();
   });
+  await listen("message_updated", (e) => {
+    // 已有消息内容变化（图片组接收端逐张并入清单）：按 id 重建该行，
+    // 位置与已渲染集合不变；不在当前列表里就忽略（下次加载自然带出）。
+    const m = e.payload;
+    if (!m || m.conversation_id === state.aiConvId) return;
+    registerGroupMembers(m);
+    delete state.groupFiles[m.id];
+    const row = document.querySelector(`#messages [data-mid="${m.id}"]`);
+    if (row) {
+      const fresh = buildMessageEl(m, {});
+      fresh.dataset.ts = row.dataset.ts;
+      fresh.dataset.seq = row.dataset.seq;
+      if (row.classList.contains("grouped")) fresh.classList.add("grouped");
+      row.replaceWith(fresh);
+    }
+  });
   await listen("message_status", (e) => {
     // 回执可能早于本地回显气泡渲染到达：找不到元素时稍后重试一次，避免状态标签停在「已发送」
     const apply = () => {
       const row = document.querySelector(`[data-mid="${e.payload.id}"] .msg-status`);
       if (row) applyStatus(row, e.payload.id, e.payload.status);
+      // 图片组：组消息本身的状态是最终口径——成员 done 事件可能早于气泡渲染被丢，
+      // 这里对账收起进度 UI，避免进度条永远停在「正在校验…」
+      if (e.payload.status === "delivered" || e.payload.status === "failed") {
+        const grow = document.querySelector(`[data-mid="${e.payload.id}"]`);
+        if (grow && grow.dataset.kind === "imagegroup") {
+          grow.querySelectorAll(".progress, .progress-meta").forEach((el) => el.classList.add("hidden"));
+        }
+      }
       return !!row;
     };
     if (!apply()) setTimeout(apply, 400);
@@ -2551,6 +2614,9 @@ async function wireEvents() {
   await listen("transfer_progress", (e) => {
     const { transfer_id, msg_id, received, total } = e.payload;
     if (msg_id && transfer_id) state.transferMap[msg_id] = transfer_id;
+    // 图片组成员的进度按组聚合显示在组气泡上（成员 msg_id → 组 id）
+    const gid = msg_id ? (state.groupMemberOf || {})[msg_id] : null;
+    if (gid) { updateGroupProgress(gid, msg_id, received, total); return; }
     let b = null;
     if (msg_id) {
       const row = document.querySelector(`[data-mid="${msg_id}"]`);
@@ -2582,6 +2648,9 @@ async function wireEvents() {
   await listen("transfer_state", (e) => {
     const { transfer_id, state: tstate } = e.payload;
     const mid = Object.keys(state.transferMap).find((k) => state.transferMap[k] === transfer_id);
+    // 图片组成员的状态同样按组聚合（完成时顺带刷新组气泡缩略图）
+    const gid = mid ? (state.groupMemberOf || {})[mid] : null;
+    if (gid) { updateGroupTransferState(gid, mid, tstate); return; }
     let b = null;
     if (mid) {
       const row = document.querySelector(`[data-mid="${mid}"]`);
@@ -2841,3 +2910,1082 @@ $("update-action").addEventListener("click", async () => {
   }
 })();
 
+
+/* ================= 内置查看器 + 图片组（v2.6.0） =================
+ * 查看器形态：页内全屏覆盖层（不用独立窗口）——没有第二个 WebView
+ * 的冷启动与二次脚本加载，点击即出画面（秒开红线）；状态全在内存
+ * 里，关闭即释放。文本解码走 WebView 自带 TextDecoder（UTF-8 严格
+ * 校验失败回退 GBK），图片/媒体走 asset 协议直读本地文件，后端零
+ * 新增依赖。 */
+
+// ---------- 文件类型口径（查看器分流/图片组共用） ----------
+const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "ico"];
+const TEXT_EXTS = new Set(["txt", "md", "log", "json", "xml", "csv", "tsv", "ini", "cfg", "conf", "yaml", "yml", "toml", "properties", "env", "java", "js", "mjs", "ts", "jsx", "tsx", "rs", "py", "go", "c", "h", "cpp", "hpp", "cc", "cs", "php", "rb", "sh", "bash", "zsh", "sql", "html", "htm", "css", "scss", "vue", "kt", "swift", "pl", "r", "lua", "diff", "patch", "dockerfile", "gitignore", "gradle", "cmake"]);
+const VIDEO_EXTS = ["mp4", "webm", "mkv", "mov", "m4v", "avi"];
+const AUDIO_EXTS = ["mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"];
+const OFFICE_EXTS = ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf"];
+function fileExt(name) {
+  const s = String(name || "");
+  const i = s.lastIndexOf(".");
+  return i >= 0 ? s.slice(i + 1).toLowerCase() : "";
+}
+function isImageExt(e) { return IMAGE_EXTS.includes(e); }
+
+// ---------- asset 协议直读（图片/媒体） ----------
+const assetUrlCache = new Map();
+async function assetUrl(path) {
+  if (!assetUrlCache.has(path)) {
+    assetUrlCache.set(path, (async () => {
+      await invoke("allow_asset_file", { path });
+      return window.__TAURI__.core.convertFileSrc(path);
+    })());
+  }
+  return assetUrlCache.get(path);
+}
+
+// ---------- 图片组 ----------
+state.groupMemberOf = {};  // 成员 msg_id → 组消息 id
+state.groupFiles = {};     // 组消息 id → group_files 结果缓存
+state.groupProgress = {};  // 组消息 id → { members: Map, states: Map }
+
+function parseManifest(body) {
+  try {
+    const j = JSON.parse(body);
+    return Array.isArray(j.items) ? j.items : [];
+  } catch (_) { return []; }
+}
+function registerGroupMembers(m) {
+  if (!m || m.kind !== "imagegroup") return;
+  for (const it of parseManifest(m.body)) state.groupMemberOf[it.msg_id] = m.id;
+}
+async function groupFilesOf(gid) {
+  if (!state.groupFiles[gid]) {
+    try { state.groupFiles[gid] = await invoke("group_files", { messageId: gid }); }
+    catch (_) { state.groupFiles[gid] = []; }
+  }
+  return state.groupFiles[gid];
+}
+
+/** 组气泡：堆叠卡片（仿 iOS 短信图片组）——主图 + 露边的底层卡 +
+ * 「共 N 张」角标 + 气泡上左右翻卡；点主图进查看器大图翻看。 */
+function buildGroupBubble(bubble, m, row) {
+  const items = parseManifest(m.body);
+  registerGroupMembers(m);
+  bubble._gcount = items.length;
+  bubble.innerHTML = `
+    <div class="gstack">
+      <div class="gstack-card c2"></div>
+      <div class="gstack-card c1"></div>
+      <div class="gstack-main">
+        <img class="gstack-img hidden" alt="" draggable="false">
+        <div class="gstack-ph">${iconUse("i-file", "ico ico-28")}<span class="gstack-ph-name"></span></div>
+      </div>
+      <span class="gstack-count">共 ${items.length} 张</span>
+      <button class="gstack-nav prev" title="上一张">‹</button>
+      <button class="gstack-nav next" title="下一张">›</button>
+      <span class="gstack-idx">1 / ${items.length}</span>
+    </div>
+    <div class="progress hidden"><div></div></div>
+    <div class="progress-meta hidden"></div>
+    <button class="progress-cancel hidden">取消</button>
+    <button class="transfer-retry hidden">重试</button>`;
+  state.lastFileBubble = bubble;
+  bubble._gidx = 0;
+  const showCard = async () => {
+    const files = await groupFilesOf(m.id);
+    if (!items.length) return;
+    const i = Math.max(0, Math.min(bubble._gidx, items.length - 1));
+    bubble._gidx = i;
+    bubble.querySelector(".gstack-idx").textContent = `${i + 1} / ${items.length}`;
+    const img = bubble.querySelector(".gstack-img");
+    const ph = bubble.querySelector(".gstack-ph");
+    const f = files[i];
+    if (f && f.exists && f.path) {
+      try {
+        img.src = await assetUrl(f.path);
+        img.classList.remove("hidden");
+        ph.classList.add("hidden");
+        return;
+      } catch (_) { /* 落到占位 */ }
+    }
+    img.classList.add("hidden");
+    ph.classList.remove("hidden");
+    ph.querySelector(".gstack-ph-name").textContent = items[i] ? items[i].name : "";
+  };
+  bubble._showGroupCard = showCard;
+  showCard();
+  const step = (d) => {
+    if (items.length < 2) return;
+    bubble._gidx = (bubble._gidx + d + items.length) % items.length;
+    showCard();
+  };
+  bubble.querySelector(".gstack-nav.prev").addEventListener("click", (e) => { e.stopPropagation(); step(-1); });
+  bubble.querySelector(".gstack-nav.next").addEventListener("click", (e) => { e.stopPropagation(); step(1); });
+  bubble.addEventListener("click", async (e) => {
+    if (e.target.closest("button")) return;
+    const files = await groupFilesOf(m.id);
+    const view = items.map((it, i) => ({
+      name: it.name,
+      path: files[i] && files[i].exists ? files[i].path : null,
+    }));
+    openImageViewer(view, bubble._gidx);
+  });
+  bubble.querySelector(".progress-cancel").addEventListener("click", async () => {
+    for (const it of items) {
+      const tid = state.transferMap[it.msg_id];
+      if (tid) { await invoke("cancel_transfer", { transferId: tid }); return; }
+    }
+  });
+  bubble.querySelector(".transfer-retry").addEventListener("click", async () => {
+    try {
+      await invoke("resend_message", { messageId: m.id });
+      row.remove();
+      state.renderedChat.delete(m.id);
+    } catch (err) { showToast("重发失败：" + err); }
+  });
+}
+
+function groupProg(gid) {
+  if (!state.groupProgress[gid]) state.groupProgress[gid] = { members: new Map(), states: new Map() };
+  return state.groupProgress[gid];
+}
+function groupBubbleOf(gid) {
+  const row = document.querySelector(`[data-mid="${gid}"]`);
+  return row ? row.querySelector(".bubble") : null;
+}
+/** 组进度聚合：成员各自的已传字节汇总成一条组进度。 */
+function updateGroupProgress(gid, memberMsgId, received, total) {
+  const gp = groupProg(gid);
+  gp.members.set(memberMsgId, { received, total });
+  const b = groupBubbleOf(gid);
+  if (!b) return;
+  let r = 0, t = 0;
+  for (const v of gp.members.values()) { r += v.received; t += v.total; }
+  const bar = b.querySelector(".progress");
+  const fill = b.querySelector(".progress > div");
+  const meta = b.querySelector(".progress-meta");
+  if (bar && fill) {
+    bar.classList.remove("hidden");
+    const pct = t ? Math.floor((r / t) * 100) : 0;
+    fill.style.width = pct + "%";
+    if (meta) {
+      meta.classList.remove("hidden");
+      meta.textContent = `${pct}% · ${fmtSize(r)} / ${fmtSize(t)}`;
+    }
+  }
+  const cancel = b.querySelector(".progress-cancel");
+  if (cancel && r < t) cancel.classList.remove("hidden");
+}
+function updateGroupTransferState(gid, memberMsgId, tstate) {
+  const gp = groupProg(gid);
+  gp.states.set(memberMsgId, tstate);
+  const b = groupBubbleOf(gid);
+  if (!b) return;
+  const meta = b.querySelector(".progress-meta");
+  const bar = b.querySelector(".progress");
+  const cancel = b.querySelector(".progress-cancel");
+  const retry = b.querySelector(".transfer-retry");
+  if (cancel) cancel.classList.add("hidden");
+  if (tstate === "done") {
+    if (b._showGroupCard) b._showGroupCard();
+    const total = b._gcount || gp.states.size;
+    let done = 0;
+    for (const s of gp.states.values()) if (s === "done") done++;
+    if (done >= total) {
+      if (meta) { meta.classList.remove("hidden"); meta.textContent = "已完成"; }
+      setTimeout(() => {
+        if (bar) bar.classList.add("hidden");
+        if (meta) meta.classList.add("hidden");
+      }, 400);
+    } else if (meta) {
+      meta.classList.remove("hidden");
+      meta.textContent = `已完成 ${done} / ${total} 张`;
+    }
+  } else if (tstate === "verifying") {
+    if (meta) { meta.classList.remove("hidden"); meta.textContent = "正在校验…"; }
+  } else if (tstate === "verify_failed") {
+    if (meta) { meta.classList.remove("hidden"); meta.textContent = "有图片校验失败，文件不完整"; }
+    if (retry) retry.classList.remove("hidden");
+  } else if (tstate === "cancelled") {
+    if (meta) { meta.classList.remove("hidden"); meta.textContent = "已取消"; }
+    if (retry) retry.classList.remove("hidden");
+  }
+}
+
+/** 图片组右键菜单：查看、保存全部（按序 1、2、3…落到所选文件夹）、
+ * 收藏/置顶/删除记录。容器与文件菜单共用 #file-menu。 */
+function openGroupMenu(m, x, y) {
+  const menu = $("file-menu");
+  const items = parseManifest(m.body);
+  menu.innerHTML = "";
+  const entries = [
+    ["查看图片", async () => {
+      const files = await groupFilesOf(m.id);
+      openImageViewer(items.map((it, i) => ({
+        name: it.name,
+        path: files[i] && files[i].exists ? files[i].path : null,
+      })), 0);
+    }],
+    ["保存全部图片…", async () => {
+      const dir = await window.__TAURI__.dialog.open({ directory: true, multiple: false });
+      if (!dir) return;
+      const [ok, total] = await invoke("save_group_images", { messageId: m.id, dir });
+      showToast(`已保存 ${ok} / ${total} 张图片到所选文件夹`);
+    }],
+    ["收藏", () => toggleMark(m.id, "favorite")],
+    [state.pinIds.has(m.id) ? "取消置顶" : "置顶", () => toggleMark(m.id, "pin")],
+    ["删除记录", async () => {
+      await invoke("delete_message", { messageId: m.id });
+      const row = document.querySelector(`[data-mid="${m.id}"]`);
+      if (row) {
+        row.remove();
+        state.renderedChat.delete(m.id);
+        state.renderedAi.delete(m.id);
+      }
+      showToast("记录已删除（文件本体保留）");
+    }],
+  ];
+  for (const [label, fn] of entries) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (label === "删除记录") b.className = "fm-danger";
+    b.addEventListener("click", async () => {
+      menu.classList.add("hidden");
+      try { await fn(); } catch (e) { showToast("操作失败：" + e); }
+    });
+    menu.appendChild(b);
+  }
+  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
+  menu.style.top = Math.min(y, window.innerHeight - 240) + "px";
+  menu.classList.remove("hidden");
+}
+
+/** 文件气泡点击分流（v2.6.0）：文本/代码→内置文本查看器，图片→
+ * 图片查看器，音视频→内置播放，PDF/Office→系统程序打开（本轮不做
+ * 内置），其余与文件不存在时维持原文件菜单。 */
+async function openFileSmart(m, x, y) {
+  let info = null;
+  try { info = await invoke("file_info", { messageId: m.id }); } catch (_) { /* 忽略 */ }
+  if (!info || !info.exists || !info.path) { openFileMenu(m.id, x, y); return; }
+  const ext = fileExt(info.name || m.body);
+  if (TEXT_EXTS.has(ext)) { openTextViewer(info); return; }
+  if (isImageExt(ext)) { openImageViewer([{ name: info.name, path: info.path }], 0); return; }
+  if (VIDEO_EXTS.includes(ext) || AUDIO_EXTS.includes(ext)) { openMediaViewer(info, ext); return; }
+  if (ext === "pdf" || OFFICE_EXTS.includes(ext)) {
+    try { await invoke("open_file", { path: info.path }); }
+    catch (e) { showToast("打开失败：" + e); }
+    return;
+  }
+  openFileMenu(m.id, x, y);
+}
+
+// ---------- 查看器外壳 ----------
+let viewerMode = null; // "text" | "image" | "media"
+function showViewer(mode, title, sub) {
+  viewerMode = mode;
+  $("viewer").classList.remove("hidden");
+  $("viewer-title").textContent = title || "";
+  $("viewer-sub").textContent = sub || "";
+  $("viewer-text").classList.toggle("hidden", mode !== "text");
+  $("viewer-image").classList.toggle("hidden", mode !== "image");
+  $("viewer-media").classList.toggle("hidden", mode !== "media");
+  $("viewer-tools").classList.toggle("hidden", mode !== "text");
+}
+function closeViewer() {
+  $("viewer").classList.add("hidden");
+  // 关闭即释放：停播并摘掉媒体/图片源，文本模型整体丢弃
+  for (const id of ["viewer-video", "viewer-audio"]) {
+    const el = $(id);
+    try { el.pause(); el.removeAttribute("src"); el.load(); } catch (_) { /* 忽略 */ }
+  }
+  $("viewer-img").removeAttribute("src");
+  tvReset();
+  IV.items = [];
+  viewerMode = null;
+}
+$("viewer-close").addEventListener("click", closeViewer);
+document.addEventListener("keydown", (e) => {
+  if ($("viewer").classList.contains("hidden")) return;
+  if (e.key === "Escape") {
+    if (viewerMode === "text" && !$("viewer-findbar").classList.contains("hidden")) {
+      closeFindBar();
+      return;
+    }
+    closeViewer();
+    return;
+  }
+  if (viewerMode === "image") {
+    if (e.key === "ArrowLeft") ivStep(-1);
+    else if (e.key === "ArrowRight") ivStep(1);
+  } else if (viewerMode === "text") {
+    tvKeys(e);
+  }
+});
+
+// ---------- 图片查看器 ----------
+const IV = { items: [], idx: 0, scale: 1, rot: 0, tx: 0, ty: 0, fitScale: 1, natural: { w: 0, h: 0 } };
+async function openImageViewer(items, idx) {
+  IV.items = items || [];
+  IV.idx = Math.max(0, Math.min(idx || 0, IV.items.length - 1));
+  showViewer(
+    "image",
+    IV.items.length > 1 ? `图片组 · 共 ${IV.items.length} 张` : (IV.items[0] ? IV.items[0].name : "图片"),
+    ""
+  );
+  await ivShow();
+}
+async function ivShow() {
+  const it = IV.items[IV.idx];
+  const img = $("viewer-img");
+  $("vi-count").textContent = IV.items.length > 1 ? `${IV.idx + 1} / ${IV.items.length}` : "";
+  $("viewer-img-prev").classList.toggle("hidden", IV.items.length <= 1);
+  $("viewer-img-next").classList.toggle("hidden", IV.items.length <= 1);
+  $("viewer-sub").textContent = it ? it.name : "";
+  $("viewer-title").textContent = IV.items.length > 1 ? `图片组 · 共 ${IV.items.length} 张` : (it ? it.name : "图片");
+  IV.rot = 0; IV.tx = 0; IV.ty = 0; IV.scale = 1;
+  img.removeAttribute("src");
+  if (!it || !it.path) { $("vi-zoom").textContent = "文件未就绪（尚未接收完成或已被移动）"; return; }
+  $("vi-zoom").textContent = "";
+  try { img.src = await assetUrl(it.path); }
+  catch (_) { $("vi-zoom").textContent = "图片加载失败"; }
+}
+function ivFit() {
+  const stage = $("viewer-img-stage");
+  const { w, h } = IV.natural;
+  if (!w || !h || !stage.clientWidth) return;
+  const swap = IV.rot % 180 !== 0;
+  const ew = swap ? h : w, eh = swap ? w : h;
+  const sw = Math.max(50, stage.clientWidth - 24), sh = Math.max(50, stage.clientHeight - 24);
+  IV.fitScale = ew <= sw && eh <= sh ? 1 : Math.min(sw / ew, sh / eh);
+  IV.scale = IV.fitScale;
+  IV.tx = 0; IV.ty = 0;
+  ivApply();
+}
+function ivApply() {
+  $("viewer-img").style.transform =
+    `translate(${IV.tx}px, ${IV.ty}px) rotate(${IV.rot}deg) scale(${IV.scale})`;
+  $("vi-zoom").textContent = `${Math.round(IV.scale * 100)}%`;
+}
+function ivStep(d) {
+  if (IV.items.length < 2) return;
+  IV.idx = (IV.idx + d + IV.items.length) % IV.items.length;
+  ivShow();
+}
+$("viewer-img").addEventListener("load", () => {
+  IV.natural = { w: $("viewer-img").naturalWidth, h: $("viewer-img").naturalHeight };
+  ivFit();
+});
+$("vi-fit").addEventListener("click", () => ivFit());
+$("vi-actual").addEventListener("click", () => { IV.scale = 1; IV.tx = 0; IV.ty = 0; ivApply(); });
+$("vi-rotl").addEventListener("click", () => { IV.rot = (IV.rot + 270) % 360; ivFit(); });
+$("vi-rotr").addEventListener("click", () => { IV.rot = (IV.rot + 90) % 360; ivFit(); });
+$("viewer-img-prev").addEventListener("click", () => ivStep(-1));
+$("viewer-img-next").addEventListener("click", () => ivStep(1));
+{
+  const stage = $("viewer-img-stage");
+  stage.addEventListener("wheel", (e) => {
+    if (viewerMode !== "image") return;
+    e.preventDefault();
+    IV.scale = Math.max(0.05, Math.min(20, IV.scale * (e.deltaY < 0 ? 1.12 : 0.89)));
+    ivApply();
+  }, { passive: false });
+  stage.addEventListener("dblclick", () => {
+    if (Math.abs(IV.scale - IV.fitScale) < 0.01) {
+      IV.scale = 1; IV.tx = 0; IV.ty = 0; ivApply();
+    } else ivFit();
+  });
+  let drag = null;
+  stage.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("button")) return;
+    drag = { x: e.clientX, y: e.clientY, tx: IV.tx, ty: IV.ty };
+    stage.setPointerCapture(e.pointerId);
+  });
+  stage.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    IV.tx = drag.tx + (e.clientX - drag.x);
+    IV.ty = drag.ty + (e.clientY - drag.y);
+    ivApply();
+  });
+  stage.addEventListener("pointerup", () => { drag = null; });
+  stage.addEventListener("pointercancel", () => { drag = null; });
+}
+
+// ---------- 音视频（WebView 自带播放，播不了给系统打开兜底） ----------
+let mediaPath = null;
+async function openMediaViewer(info, ext) {
+  mediaPath = info.path;
+  showViewer("media", info.name, fmtSize(info.size));
+  const isVideo = VIDEO_EXTS.includes(ext);
+  const vel = $("viewer-video"), ael = $("viewer-audio");
+  vel.classList.toggle("hidden", !isVideo);
+  ael.classList.toggle("hidden", isVideo);
+  $("viewer-media-err").classList.add("hidden");
+  try {
+    const el = isVideo ? vel : ael;
+    el.src = await assetUrl(info.path);
+    el.play().catch(() => { /* 自动播放被拦时用户可手动点播放 */ });
+  } catch (_) {
+    $("viewer-media-err").classList.remove("hidden");
+  }
+}
+for (const id of ["viewer-video", "viewer-audio"]) {
+  $(id).addEventListener("error", () => {
+    if (viewerMode === "media") $("viewer-media-err").classList.remove("hidden");
+  });
+}
+$("viewer-media-open").addEventListener("click", async () => {
+  if (mediaPath) {
+    try { await invoke("open_file", { path: mediaPath }); }
+    catch (e) { showToast("打开失败：" + e); }
+  }
+});
+
+// ---------- 文本/代码查看器 ----------
+// 红线落实：①秒开——先把原文第一屏以纯文本渲染出来，高亮随后补；
+// ②大文件不卡——虚拟滚动只渲染可视行（±10 行缓冲）；③选择/复制
+// 走数据层——内存持全文与行偏移表，选区是 {行,列} 模型，与渲染了
+// 多少行无关，Ctrl+A 全选、Ctrl+C 复制选区都按模型算；④高亮——
+// 小文件（≤4000 行）打开即全量算完，大文件只算可视区及滚动预取，
+// 结果只缓存视区附近（上限约 6000 行），不全量缓存。
+const TV = {
+  name: "", origText: "", text: "", lines: [], starts: [],
+  encoding: "", lang: "text", ext: "",
+  sel: null, hl: new Map(), stateAt: null, chW: 8,
+  findQ: "", findHits: [], findPos: -1, transformed: null,
+};
+const TV_LINE_H = 20;
+const TV_FULL_HL = 4000;
+const TV_FONT = '13px ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace';
+
+function tvReset() {
+  TV.text = ""; TV.origText = ""; TV.lines = []; TV.starts = [];
+  TV.sel = null; TV.hl.clear(); TV.stateAt = null;
+  TV.findQ = ""; TV.findHits = []; TV.findPos = -1; TV.transformed = null;
+  $("viewer-lines").innerHTML = "";
+  $("viewer-gutter").innerHTML = "";
+  $("viewer-banner").classList.add("hidden");
+  $("viewer-findbar").classList.add("hidden");
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+/** 编码识别：BOM 优先；UTF-8 严格解码成功即 UTF-8，否则 GBK。 */
+function decodeTextBytes(bytes) {
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return { text: new TextDecoder("utf-8").decode(bytes.subarray(3)), enc: "UTF-8" };
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return { text: new TextDecoder("utf-16le").decode(bytes), enc: "UTF-16" };
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return { text: new TextDecoder("utf-16be").decode(bytes), enc: "UTF-16" };
+  }
+  try {
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), enc: "UTF-8" };
+  } catch (_) {
+    return { text: new TextDecoder("gbk").decode(bytes), enc: "GBK" };
+  }
+}
+
+async function openTextViewer(info) {
+  showViewer("text", info.name, "加载中…");
+  tvReset();
+  TV.name = info.name;
+  let data;
+  try {
+    data = await invoke("read_text_file", { path: info.path });
+  } catch (e) {
+    const msg = String(e);
+    closeViewer();
+    if (msg.startsWith("TOO_LARGE")) {
+      showToast("文件超过 10 MB，改用系统程序打开");
+      try { await invoke("open_file", { path: info.path }); } catch (_) { /* 忽略 */ }
+    } else {
+      showToast("打开失败：" + msg);
+    }
+    return;
+  }
+  const dec = decodeTextBytes(base64ToBytes(data.base64));
+  TV.origText = dec.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  TV.encoding = dec.enc;
+  TV.ext = fileExt(info.name);
+  TV.lang = langOfExt(TV.ext);
+  $("viewer-sub").textContent = `${fmtSize(data.size)} · ${dec.enc}`;
+  tvSetText(TV.origText);
+}
+
+function tvSetText(text) {
+  TV.text = text;
+  TV.lines = text.split("\n");
+  TV.starts = new Array(TV.lines.length);
+  let off = 0;
+  for (let i = 0; i < TV.lines.length; i++) {
+    TV.starts[i] = off;
+    off += TV.lines[i].length + 1;
+  }
+  TV.sel = null;
+  TV.hl.clear();
+  TV.stateAt = TV.lines.length <= TV_FULL_HL ? new Array(TV.lines.length + 1) : null;
+  TV.findHits = []; TV.findPos = -1;
+  $("viewer-scroll").scrollTop = 0;
+  tvMeasureCh();
+  tvRender(); // 第一屏先出原文（无高亮），不等排版
+  if (TV.lines.length <= TV_FULL_HL) {
+    tvHighlightRange(0, TV.lines.length);
+    tvRender();
+  } else {
+    tvEnsureHlVisible();
+  }
+  tvStatus();
+}
+
+let tvCanvas = null;
+function tvMeasureCh() {
+  if (!tvCanvas) tvCanvas = document.createElement("canvas");
+  const ctx = tvCanvas.getContext("2d");
+  ctx.font = TV_FONT;
+  TV.chW = ctx.measureText("0").width || 7.8;
+}
+
+function tvRender() {
+  const sc = $("viewer-scroll");
+  if (!TV.lines.length || !sc.clientHeight) return;
+  const total = TV.lines.length;
+  $("viewer-spacer").style.height = total * TV_LINE_H + "px";
+  $("viewer-gutter").style.height = total * TV_LINE_H + "px";
+  const first = Math.max(0, Math.floor(sc.scrollTop / TV_LINE_H) - 10);
+  const visCount = Math.ceil(sc.clientHeight / TV_LINE_H) + 20;
+  const last = Math.min(total, first + visCount);
+  const linesEl = $("viewer-lines"), gutEl = $("viewer-gutter");
+  linesEl.style.paddingTop = first * TV_LINE_H + "px";
+  gutEl.style.paddingTop = first * TV_LINE_H + "px";
+  let lh = "", gh = "";
+  for (let i = first; i < last; i++) {
+    gh += `<div class="tv-num">${i + 1}</div>`;
+    lh += `<div class="tv-line">${tvLineHtml(i)}</div>`;
+  }
+  linesEl.innerHTML = lh;
+  gutEl.innerHTML = gh;
+}
+
+/** 一行的 HTML：语法色（缓存或纯文本）+ 选区/查找命中的矩形衬底
+ * （等宽字体按列定位，只加衬底不改布局，高亮不跳动）。 */
+function tvLineHtml(i) {
+  const rects = [];
+  const sel = normSel();
+  if (sel && i >= sel.a.l && i <= sel.f.l) {
+    const from = i === sel.a.l ? sel.a.c : 0;
+    const to = i === sel.f.l ? sel.f.c : TV.lines[i].length;
+    if (to > from) {
+      rects.push(`<span class="tv-rect sel" style="left:${from * TV.chW}px;width:${(to - from) * TV.chW}px"></span>`);
+    }
+  }
+  if (TV.findQ) {
+    const line = TV.lines[i];
+    let at = line.indexOf(TV.findQ);
+    while (at >= 0) {
+      rects.push(`<span class="tv-rect hit" style="left:${at * TV.chW}px;width:${TV.findQ.length * TV.chW}px"></span>`);
+      at = line.indexOf(TV.findQ, at + 1);
+    }
+  }
+  const body = TV.hl.get(i) ?? esc(TV.lines[i]);
+  return rects.join("") + `<span class="tv-code">${body}</span>`;
+}
+
+let tvScrollRaf = 0;
+$("viewer-scroll").addEventListener("scroll", () => {
+  if (tvScrollRaf) return;
+  tvScrollRaf = requestAnimationFrame(() => {
+    tvScrollRaf = 0;
+    tvRender();
+    tvEnsureHlVisible();
+  });
+});
+/** 大文件：只给可视区（上下各扩一屏）补高亮，其余滚动到了再算。 */
+function tvEnsureHlVisible() {
+  if (TV.lines.length <= TV_FULL_HL) return;
+  const sc = $("viewer-scroll");
+  const first = Math.max(0, Math.floor(sc.scrollTop / TV_LINE_H) - 40);
+  const last = Math.min(
+    TV.lines.length,
+    first + Math.ceil(sc.clientHeight / TV_LINE_H) + 80
+  );
+  let need = false;
+  for (let i = first; i < last; i++) {
+    if (!TV.hl.has(i)) { need = true; break; }
+  }
+  if (need) {
+    tvHighlightRange(first, last);
+    tvRender();
+  }
+}
+
+/** 把 [from, to) 行逐行着色进缓存。小文件全量时经 stateAt 精确接续
+ * 跨行状态（块注释/模板串）；大文件分片时每片从默认状态起算，片头
+ * 个别行可能短暂色差——轻量取舍，不影响内容与布局。 */
+function tvHighlightRange(from, to) {
+  let st = { block: false, tpl: false };
+  if (from > 0 && TV.stateAt && TV.stateAt[from]) st = TV.stateAt[from];
+  for (let i = from; i < to; i++) {
+    if (TV.stateAt) TV.stateAt[i] = st;
+    const r = tvTokenizeLine(TV.lines[i], TV.lang, st);
+    TV.hl.set(i, r.html);
+    st = r.st;
+  }
+  if (TV.stateAt) TV.stateAt[to] = st;
+  if (TV.hl.size > 6000) {
+    const mid = Math.floor((from + to) / 2);
+    for (const k of [...TV.hl.keys()]) {
+      if (Math.abs(k - mid) > 3000) TV.hl.delete(k);
+    }
+  }
+}
+
+// ---------- 轻量语法高亮（手写逐行状态机，零依赖、几 KB） ----------
+const TV_KW = {
+  js: "break case catch class const continue debugger default delete do else export extends finally for function if import in instanceof let new return super switch this throw try typeof var void while with yield async await static get set of null undefined true false",
+  rust: "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while",
+  py: "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield True False None print",
+  c: "auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while bool true false null nullptr namespace public private protected class template typename virtual friend this new delete try catch throw final extends implements interface package void",
+  go: "break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var true false nil",
+};
+function langOfExt(ext) {
+  if (["js", "mjs", "jsx", "ts", "tsx"].includes(ext)) return "js";
+  if (ext === "rs") return "rust";
+  if (ext === "py") return "py";
+  if (["java", "c", "h", "cpp", "hpp", "cc", "cs", "kt", "swift", "scala", "php"].includes(ext)) return "c";
+  if (ext === "go") return "go";
+  if (ext === "json") return "json";
+  if (["html", "htm", "xml", "svg", "vue"].includes(ext)) return "markup";
+  if (ext === "css" || ext === "scss") return "css";
+  if (["sh", "bash", "zsh"].includes(ext)) return "shell";
+  return "text";
+}
+
+function tvTokenizeLine(line, lang, st) {
+  if (lang === "text") return { html: esc(line), st };
+  if (lang === "json") return { html: tvTokenizeJson(line), st };
+  if (lang === "markup") return { html: tvTokenizeMarkup(line), st };
+  const lineComment = lang === "py" || lang === "shell" ? "#" : "//";
+  const kw = TV_KW[lang] ? new Set(TV_KW[lang].split(" ")) : null;
+  let out = "", i = 0;
+  const n = line.length;
+  let plain = "";
+  const flush = () => { if (plain) { out += esc(plain); plain = ""; } };
+  const push = (txt, cls) => { flush(); out += `<span class="${cls}">${esc(txt)}</span>`; };
+  if (st.block) {
+    const end = line.indexOf("*/");
+    if (end < 0) { out += `<span class="tk-com">${esc(line)}</span>`; return { html: out, st }; }
+    out += `<span class="tk-com">${esc(line.slice(0, end + 2))}</span>`;
+    i = end + 2;
+    st = { block: false, tpl: st.tpl };
+  }
+  if (st.tpl) {
+    let j = i;
+    while (j < n) {
+      if (line[j] === "\\") { j += 2; continue; }
+      if (line[j] === "`") break;
+      j++;
+    }
+    if (j >= n) { out += `<span class="tk-str">${esc(line.slice(i))}</span>`; return { html: out, st }; }
+    out += `<span class="tk-str">${esc(line.slice(i, j + 1))}</span>`;
+    i = j + 1;
+    st = { block: st.block, tpl: false };
+  }
+  while (i < n) {
+    const ch = line[i];
+    if (lang !== "css" && line.startsWith(lineComment, i)) {
+      push(line.slice(i), "tk-com");
+      i = n;
+      break;
+    }
+    if (line.startsWith("/*", i)) {
+      const end = line.indexOf("*/", i + 2);
+      if (end < 0) {
+        push(line.slice(i), "tk-com");
+        st = { block: true, tpl: st.tpl };
+        i = n;
+        break;
+      }
+      push(line.slice(i, end + 2), "tk-com");
+      i = end + 2;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || (ch === "`" && lang === "js")) {
+      const q = ch;
+      let j = i + 1;
+      while (j < n) {
+        if (line[j] === "\\") { j += 2; continue; }
+        if (line[j] === q) break;
+        j++;
+      }
+      if (j >= n) {
+        push(line.slice(i), "tk-str");
+        if (q === "`") st = { block: st.block, tpl: true };
+        i = n;
+        break;
+      }
+      push(line.slice(i, j + 1), "tk-str");
+      i = j + 1;
+      continue;
+    }
+    if (ch >= "0" && ch <= "9" && !/[\w$]/.test(plain.slice(-1))) {
+      let j = i;
+      while (j < n && /[\w.]/.test(line[j])) j++;
+      push(line.slice(i, j), "tk-num");
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(ch) || ch.charCodeAt(0) > 127) {
+      let j = i;
+      while (j < n && /[\w$]/.test(line[j])) j++;
+      const word = line.slice(i, j);
+      if (kw && kw.has(word)) push(word, "tk-kw");
+      else plain += word;
+      i = j;
+      continue;
+    }
+    plain += ch;
+    i++;
+  }
+  flush();
+  return { html: out, st };
+}
+
+function tvTokenizeJson(line) {
+  let out = "", i = 0;
+  const n = line.length;
+  while (i < n) {
+    const ch = line[i];
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < n) {
+        if (line[j] === "\\") { j += 2; continue; }
+        if (line[j] === '"') break;
+        j++;
+      }
+      const s = line.slice(i, Math.min(j + 1, n));
+      let k = j + 1;
+      while (k < n && line[k] === " ") k++;
+      out += `<span class="${line[k] === ":" ? "tk-key" : "tk-str"}">${esc(s)}</span>`;
+      i = j + 1;
+      continue;
+    }
+    if (/[-\d]/.test(ch)) {
+      let j = i;
+      while (j < n && /[\d.eE+-]/.test(line[j])) j++;
+      out += `<span class="tk-num">${esc(line.slice(i, j))}</span>`;
+      i = j;
+      continue;
+    }
+    const word = /^(true|false|null)\b/.exec(line.slice(i));
+    if (word) {
+      out += `<span class="tk-kw">${word[1]}</span>`;
+      i += word[1].length;
+      continue;
+    }
+    out += esc(ch);
+    i++;
+  }
+  return out;
+}
+
+function tvTokenizeMarkup(line) {
+  let out = "", i = 0;
+  const n = line.length;
+  while (i < n) {
+    if (line.startsWith("<!--", i)) {
+      const end = line.indexOf("-->", i + 4);
+      const stop = end < 0 ? n : end + 3;
+      out += `<span class="tk-com">${esc(line.slice(i, stop))}</span>`;
+      i = stop;
+      continue;
+    }
+    if (line[i] === "<") {
+      const end = line.indexOf(">", i);
+      const stop = end < 0 ? n : end + 1;
+      const tag = line.slice(i, stop);
+      out += tag
+        .split(/("[^"]*"|'[^']*')/g)
+        .map((p, k) => (k % 2 === 1
+          ? `<span class="tk-str">${esc(p)}</span>`
+          : `<span class="tk-tag">${esc(p)}</span>`))
+        .join("");
+      i = stop;
+      continue;
+    }
+    out += esc(line[i]);
+    i++;
+  }
+  return out;
+}
+
+// ---------- 选择/复制（数据层选区模型） ----------
+function normSel() {
+  if (!TV.sel) return null;
+  const { a, f } = TV.sel;
+  if (a.l < f.l || (a.l === f.l && a.c <= f.c)) return { a, f };
+  return { a: f, f: a };
+}
+function tvSelText() {
+  const s = normSel();
+  if (!s) return "";
+  return TV.text.slice(TV.starts[s.a.l] + s.a.c, TV.starts[s.f.l] + s.f.c);
+}
+function tvPosFromEvent(e) {
+  const spacer = $("viewer-spacer");
+  const linesEl = $("viewer-lines");
+  const y = e.clientY - spacer.getBoundingClientRect().top;
+  const l = Math.max(0, Math.min(TV.lines.length - 1, Math.floor(y / TV_LINE_H)));
+  const c = Math.max(0, Math.min(
+    TV.lines[l].length,
+    Math.round((e.clientX - linesEl.getBoundingClientRect().left) / TV.chW)
+  ));
+  return { l, c };
+}
+let tvSelecting = false;
+$("viewer-lines").addEventListener("mousedown", (e) => {
+  if (viewerMode !== "text" || !TV.lines.length) return;
+  const pos = tvPosFromEvent(e);
+  TV.sel = { a: pos, f: { ...pos } };
+  tvSelecting = true;
+  tvRender();
+  tvStatus();
+  e.preventDefault();
+});
+document.addEventListener("mousemove", (e) => {
+  if (!tvSelecting) return;
+  const sc = $("viewer-scroll");
+  const r = sc.getBoundingClientRect();
+  if (e.clientY < r.top + 28) sc.scrollTop -= 24;
+  else if (e.clientY > r.bottom - 28) sc.scrollTop += 24;
+  TV.sel.f = tvPosFromEvent(e);
+  tvRender();
+  tvStatus();
+});
+document.addEventListener("mouseup", () => { tvSelecting = false; });
+$("viewer-lines").addEventListener("dblclick", (e) => {
+  if (viewerMode !== "text" || !TV.lines.length) return;
+  const pos = tvPosFromEvent(e);
+  const line = TV.lines[pos.l];
+  let a = pos.c, f = pos.c;
+  while (a > 0 && /[\w$-]/.test(line[a - 1])) a--;
+  while (f < line.length && /[\w$-]/.test(line[f])) f++;
+  if (f > a) {
+    TV.sel = { a: { l: pos.l, c: a }, f: { l: pos.l, c: f } };
+    tvRender();
+    tvStatus();
+  }
+});
+
+function tvKeys(e) {
+  if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "SELECT")) return;
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod) return;
+  const k = e.key.toLowerCase();
+  if (k === "a") {
+    e.preventDefault();
+    if (!TV.lines.length) return;
+    TV.sel = {
+      a: { l: 0, c: 0 },
+      f: { l: TV.lines.length - 1, c: TV.lines[TV.lines.length - 1].length },
+    };
+    tvRender();
+    tvStatus();
+  } else if (k === "c") {
+    const s = normSel();
+    if (s && (s.a.l !== s.f.l || s.a.c !== s.f.c)) {
+      e.preventDefault();
+      copyText(tvSelText());
+    }
+  } else if (k === "f") {
+    e.preventDefault();
+    openFindBar();
+  }
+}
+
+function tvStatus() {
+  const parts = [`共 ${TV.lines.length} 行`, `编码 ${TV.encoding}`];
+  const s = normSel();
+  if (s && (s.a.l !== s.f.l || s.a.c !== s.f.c)) {
+    parts.push(`已选 ${TV.starts[s.f.l] + s.f.c - (TV.starts[s.a.l] + s.a.c)} 字`);
+  }
+  $("viewer-status").textContent = parts.join(" · ");
+}
+
+// ---------- 文件内查找 ----------
+function openFindBar() {
+  $("viewer-findbar").classList.remove("hidden");
+  const inp = $("viewer-find-input");
+  inp.focus();
+  inp.select();
+}
+function closeFindBar() {
+  $("viewer-findbar").classList.add("hidden");
+  TV.findQ = "";
+  TV.findHits = [];
+  TV.findPos = -1;
+  $("viewer-find-count").textContent = "";
+  tvRender();
+}
+function tvFindRun() {
+  const q = $("viewer-find-input").value;
+  TV.findQ = q;
+  TV.findHits = [];
+  TV.findPos = -1;
+  if (q) {
+    for (let i = 0; i < TV.lines.length && TV.findHits.length < 2000; i++) {
+      if (TV.lines[i].includes(q)) TV.findHits.push(i);
+    }
+  }
+  $("viewer-find-count").textContent = q
+    ? (TV.findHits.length ? `共 ${TV.findHits.length} 处` : "无结果")
+    : "";
+  tvRender();
+}
+function tvFindJump(dir) {
+  if (!TV.findHits.length) {
+    tvFindRun();
+    if (!TV.findHits.length) return;
+  }
+  TV.findPos = (TV.findPos + dir + TV.findHits.length) % TV.findHits.length;
+  const l = TV.findHits[TV.findPos];
+  const c = TV.lines[l].indexOf(TV.findQ);
+  TV.sel = { a: { l, c }, f: { l, c: c + TV.findQ.length } };
+  const sc = $("viewer-scroll");
+  sc.scrollTop = Math.max(0, l * TV_LINE_H - sc.clientHeight / 2);
+  $("viewer-find-count").textContent = `${TV.findPos + 1} / ${TV.findHits.length} 处`;
+  tvRender();
+  tvStatus();
+}
+$("viewer-find-btn").addEventListener("click", openFindBar);
+$("viewer-find-close").addEventListener("click", closeFindBar);
+$("viewer-find-input").addEventListener("input", tvFindRun);
+$("viewer-find-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); tvFindJump(e.shiftKey ? -1 : 1); }
+});
+$("viewer-find-prev").addEventListener("click", () => tvFindJump(-1));
+$("viewer-find-next").addEventListener("click", () => tvFindJump(1));
+
+// ---------- 格式化快捷处理（显示层，原文不动） ----------
+const TV_FMT_LABEL = {
+  jsonPretty: "JSON 美化", jsonMin: "JSON 压缩", xmlPretty: "XML 美化",
+  reindent: "代码整理缩进", b64enc: "Base64 编码", b64dec: "Base64 解码",
+  urlEnc: "URL 编码", urlDec: "URL 解码", tsConv: "时间戳转换",
+};
+$("viewer-fmt-go").addEventListener("click", () => {
+  const kind = $("viewer-fmt").value;
+  if (!kind) { showToast("先选择一种处理"); return; }
+  tvApplyTransform(kind);
+});
+$("viewer-copy-all").addEventListener("click", () => {
+  if (TV.text) copyText(TV.text);
+});
+$("viewer-banner-origin").addEventListener("click", () => {
+  TV.transformed = null;
+  TV.lang = langOfExt(TV.ext);
+  $("viewer-banner").classList.add("hidden");
+  tvSetText(TV.origText);
+});
+$("viewer-banner-close").addEventListener("click", () => {
+  $("viewer-banner").classList.add("hidden");
+});
+function fmtDateTime(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function tvApplyTransform(kind) {
+  const src = TV.origText;
+  try {
+    if (kind === "tsConv") {
+      // 优先看选区里的数字，没有就找全文第一个 10/13 位时间戳
+      const selTxt = tvSelText();
+      const m = (selTxt && /\d{10,13}/.exec(selTxt)) || /\d{10,13}/.exec(src);
+      if (!m) { showToast("没有找到时间戳（10 或 13 位数字）"); return; }
+      let v = Number(m[0]);
+      if (m[0].length === 10) v *= 1000;
+      const d = new Date(v);
+      if (isNaN(d.getTime())) { showToast("时间戳超出可表示范围"); return; }
+      const out = `${m[0]} → ${fmtDateTime(d)}（本地时间）`;
+      TV.transformed = kind;
+      $("viewer-banner-text").textContent = `时间戳转换：${out}（原文未修改）`;
+      $("viewer-banner").classList.remove("hidden");
+      $("viewer-banner-copy").onclick = () => copyText(out);
+      return;
+    }
+    let out;
+    if (kind === "jsonPretty") out = JSON.stringify(JSON.parse(src), null, 2);
+    else if (kind === "jsonMin") out = JSON.stringify(JSON.parse(src));
+    else if (kind === "xmlPretty") out = xmlPretty(src);
+    else if (kind === "reindent") out = reindentCode(src);
+    else if (kind === "b64enc") out = b64EncodeText(src);
+    else if (kind === "b64dec") out = b64DecodeText(src);
+    else if (kind === "urlEnc") out = encodeURIComponent(src);
+    else if (kind === "urlDec") out = decodeURIComponent(src);
+    else return;
+    TV.transformed = kind;
+    tvSetText(out);
+    if (kind === "jsonPretty" || kind === "jsonMin") {
+      TV.lang = "json";
+      TV.hl.clear();
+      TV.stateAt = TV.lines.length <= TV_FULL_HL ? new Array(TV.lines.length + 1) : null;
+      if (TV.lines.length <= TV_FULL_HL) tvHighlightRange(0, TV.lines.length);
+      tvRender();
+    }
+    $("viewer-banner-text").textContent =
+      `已应用「${TV_FMT_LABEL[kind]}」——显示层处理，原文未修改`;
+    $("viewer-banner").classList.remove("hidden");
+    $("viewer-banner-copy").onclick = () => copyText(TV.text);
+  } catch (e) {
+    showToast(`处理失败：${String((e && e.message) || e).slice(0, 80)}`);
+  }
+}
+function xmlPretty(src) {
+  const s = src.replace(/>\s+</g, "><").trim();
+  const parts = s.split(/(<[^>]+>)/g).filter((p) => p.length);
+  let depth = 0;
+  const out = [];
+  for (const p of parts) {
+    if (/^<\//.test(p)) depth = Math.max(0, depth - 1);
+    out.push("  ".repeat(depth) + p);
+    if (/^<[^!?/][^>]*[^/]>$/.test(p) && !/^<(br|hr|img|input|meta|link)[\s>]/.test(p)) depth++;
+  }
+  return out.join("\n");
+}
+/** 通用大括号缩进整理（近似：不解析字符串里的括号，显示层处理，
+ * 原文不动，看不顺眼点「查看原文」即可）。 */
+function reindentCode(src) {
+  let depth = 0;
+  const out = [];
+  for (const raw of src.split("\n")) {
+    const line = raw.trim();
+    if (!line) { out.push(""); continue; }
+    const lead = /^[})\]]/.test(line) ? 1 : 0;
+    out.push("  ".repeat(Math.max(0, depth - lead)) + line);
+    let delta = 0;
+    for (const ch of line) {
+      if (ch === "{" || ch === "[" || ch === "(") delta++;
+      else if (ch === "}" || ch === "]" || ch === ")") delta--;
+    }
+    depth = Math.max(0, depth + delta);
+  }
+  return out.join("\n");
+}
+function b64EncodeText(s) {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+function b64DecodeText(s) {
+  const bin = atob(s.replace(/\s/g, ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}

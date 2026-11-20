@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "unstable"] }
+tauri = { version = "2", features = ["tray-icon", "unstable", "protocol-asset"] }
 tauri-plugin-dialog = "2"
 # 系统通知（收到新消息且窗口不在前台时弹）：官方插件，桌面端通知投递走它
 tauri-plugin-notification = "2"

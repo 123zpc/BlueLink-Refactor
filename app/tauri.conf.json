@@ -2,7 +2,11 @@
   "$schema": "https://schema.tauri.app/config/2",
   "app": {
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
     },
     "windows": [
       {
@@ -40,5 +44,5 @@
     }
   },
   "productName": "BlueLink",
-  "version": "2.5.2"
+  "version": "2.6.0"
 }
