@@ -107,8 +107,10 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// 本地日期时间字段 → unix 风格秒。只用于与同为本地时的 stLastSeen 互相比较
-/// （两侧同口径相减，时区不影响结论），不表示真实 UTC 时刻。
+/// 日期时间字段 → unix 风格秒（把 SYSTEMTIME 的年月日时分秒压成一个可
+/// 比较的标量）。基准由字段来源决定：同一个数值在 UTC 与本地两种读法下
+/// 差一个时区偏移——stLastSeen 的基准经真机实证并不稳定（见
+/// heard_this_round 的说明），调用方不得假设它与某一侧同基准。
 /// 年为 0（SYSTEMTIME 空值）或字段非法时返回 None。
 #[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 平台仅测试引用
 fn civil_to_unix_secs(
@@ -131,18 +133,53 @@ fn civil_to_unix_secs(
 #[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 平台仅测试引用
 const HEARD_TOLERANCE_SECS: i64 = 2;
 
-/// 在场门（2026-11-20 v2.5.1）：本轮扫描是否真的「听到」了这台设备。
-/// 经典 Inquiry 开了 fReturnRemembered，系统会把记住但不在场的设备也报出来
-/// （用户实证：九个月前最后见到的设备冒充在场、还带着 AEP 缓存旧信号）。
-/// 判定：当前已连接，或 lastSeen 落在本轮扫描窗口内（以轮始为界、带容差）。
+/// 在场门「近期」兜底（秒）：旧戳只要在任一时钟基准的读法下不足 24 小时，
+/// 就不构成不在场证据（见 heard_this_round 的实证说明）。只有新旧两种
+/// 读法都远超这个尺度的古董戳（如九个月前）才许拦下。
 #[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 平台仅测试引用
-fn heard_this_round(last_seen_secs: Option<i64>, connected: bool, round_start_secs: i64) -> bool {
+const HEARD_RECENT_FLOOR_SECS: i64 = 24 * 3600;
+
+/// 在场门（2026-11-20 v2.5.1 引入，v2.5.2 紧急修正）：本轮扫描是否放行
+/// 这台设备。经典 Inquiry 开了 fReturnRemembered，系统会把记住但不在场
+/// 的设备也报出来（用户实证：九个月前最后见到的设备冒充在场、还带着
+/// AEP 缓存旧信号），v2.5.1 据此用 stLastSeen 与本地轮始比较设门。
+///
+/// 但 v2.5.1 的前提被用户回传的真机 SCANPROBE 转储（2026-11-19/20 两日
+/// 日志）双双证伪，门在真机上把非连接设备 100% 误杀（扫描 0 台）：
+/// - 2026-11-19 的轮次里 stLastSeen 是本地时、逐台在本轮应答秒数上分布，
+///   九个月没用过的 LAPTOP-QN3CQGC7 保持 2026-02-24 旧戳——这一天按
+///   本地基准本可工作；
+/// - 2026-11-20 的轮次里全表 stLastSeen 却是 UTC 基准、统一等于枚举
+///   完成秒（连 QN3CQGC7 也被刷成轮时刻）——基准与新鲜度都不可靠；
+///   v2.5.1 以 GetLocalTime 为轮始，撞上 UTC 基准轮次时全员差约 8
+///   小时（UTC+8），无一能过门。
+///
+/// 修正口径（宁可放过假在场，绝不再误杀真在场）：门只许拦「有戳、且
+/// 在 UTC 与本地两种基准读法下都明确古老」的设备——即两种读法下都不
+/// 在本轮窗口内（带容差）、且两种读法下都旧于 24 小时近期线。无戳
+/// （None）时枚举本轮返回本身就是在场证据，放行；已连接恒放行。
+/// 代价如实记录：UTC 基准轮次里 QN3CQGC7 这类古董记住设备仍会进
+/// 列表（与 v2.5.0 行为相同），靠 stLastSeen 无法根治，只能另案处理。
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 平台仅测试引用
+fn heard_this_round(
+    last_seen_secs: Option<i64>,
+    connected: bool,
+    round_start_utc: i64,
+    round_start_local: i64,
+) -> bool {
     if connected {
         return true;
     }
     match last_seen_secs {
-        Some(t) => t + HEARD_TOLERANCE_SECS >= round_start_secs,
-        None => false,
+        None => true,
+        Some(t) => {
+            // 本轮窗口内：任一基准读法成立即算新鲜（stLastSeen 基准不稳定，
+            // 单基准比较正是 v2.5.1 全员误杀的根源）
+            t + HEARD_TOLERANCE_SECS >= round_start_utc
+                || t + HEARD_TOLERANCE_SECS >= round_start_local
+                // 近期兜底：任一基准读法下不足 24 小时的戳不作不在场证据
+                || t + HEARD_RECENT_FLOOR_SECS > round_start_utc.min(round_start_local)
+        }
     }
 }
 
@@ -173,7 +210,7 @@ mod imp {
         RNRSERVICE_DELETE, RNRSERVICE_REGISTER, SD_BOTH, SOCKADDR, SOCKET, SOCKET_ERROR,
         SOCK_STREAM, WSADATA, WSAESETSERVICEOP, WSAQUERYSETW,
     };
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
 
     /// 标准 SPP 服务 UUID（00001101-0000-1000-8000-00805F9B34FB），与老版本一致：
     /// 服务端用它向 SDP 注册，客户端用它让系统解析 RFCOMM 通道。
@@ -360,10 +397,12 @@ mod imp {
             Ok(())
         }
 
-        /// 最新一轮 Inquiry 的设备快照：已在 inquiry 建表处过在场门（只含本轮
-        /// 真听到或已连接的设备，见 heard_this_round）；是不是 BlueLink 由连接
-        /// 后的服务层握手判定。返回前把 AEP 枚举缓存里的信号按地址并入——
-        /// 只作用于在场设备（信号门），不在场设备不可能带格出现。
+        /// 最新一轮 Inquiry 的设备快照：已在 inquiry 建表处过在场门（只滤
+        /// 双基准读法下都明确古老的记住设备，见 heard_this_round）；是不是
+        /// BlueLink 由连接后的服务层握手判定。返回前把 AEP 枚举缓存里的
+        /// 信号按地址并入——只作用于出表设备（信号门），被滤掉的设备不
+        /// 可能带格出现。AEP 并入只写 rssi、从不删表：缓存为空或查询无
+        /// 结果时列表原样返回。
         pub fn list_found(&self) -> Result<Vec<FoundDevice>, TransportError> {
             let mut devs = self.found.lock().map(|f| f.clone()).unwrap_or_default();
             super::merge_aep_rssi(&mut devs, &|mac| {
@@ -416,6 +455,19 @@ mod imp {
         }
     }
 
+    /// SYSTEMTIME → civil 秒（字段非法/年为 0 时 None），口径见
+    /// civil_to_unix_secs 的说明。
+    fn systemtime_to_civil_secs(t: &windows_sys::Win32::Foundation::SYSTEMTIME) -> Option<i64> {
+        civil_to_unix_secs(
+            i32::from(t.wYear),
+            u32::from(t.wMonth),
+            u32::from(t.wDay),
+            u32::from(t.wHour),
+            u32::from(t.wMinute),
+            u32::from(t.wSecond),
+        )
+    }
+
     /// 执行一轮经典 Inquiry（阻塞，约 10 秒），返回本轮发现的全部设备。
     /// 参数照老版本：已认证/已记住/未知/已连接全返回 + 发起 Inquiry，不按服务过滤。
     fn run_inquiry() -> Result<(Vec<FoundDevice>, Vec<String>), TransportError> {
@@ -432,20 +484,23 @@ mod imp {
     unsafe fn inquiry_on_radio(
         radio: HANDLE,
     ) -> Result<(Vec<FoundDevice>, Vec<String>), TransportError> {
-        // 本轮开始时刻（本地时，与 stLastSeen 同口径换算成 unix 风格秒）：
-        // 在场门的判定界。取不到时用 0——此时 lastSeen 判定会全部放行，
-        // 退回旧行为而不是误杀全部设备。
-        let mut now_st = windows_sys::Win32::Foundation::SYSTEMTIME::default();
-        GetLocalTime(&mut now_st);
-        let round_start = civil_to_unix_secs(
-            i32::from(now_st.wYear),
-            u32::from(now_st.wMonth),
-            u32::from(now_st.wDay),
-            u32::from(now_st.wHour),
-            u32::from(now_st.wMinute),
-            u32::from(now_st.wSecond),
-        )
-        .unwrap_or(0);
+        // 本轮开始时刻（在场门的判定界）：UTC 与本地两个基准都取——
+        // stLastSeen 的基准经真机实证不稳定（见 heard_this_round 说明），
+        // 门在两种读法下各判一次，任一新鲜即放行。任一侧取不到时用另一
+        // 侧兜底；两侧都取不到时用 0——此时窗口判定会全部放行，退回旧
+        // 行为而不是误杀全部设备。
+        let mut utc_st = windows_sys::Win32::Foundation::SYSTEMTIME::default();
+        GetSystemTime(&mut utc_st);
+        let mut local_st = windows_sys::Win32::Foundation::SYSTEMTIME::default();
+        GetLocalTime(&mut local_st);
+        let round_start_utc = systemtime_to_civil_secs(&utc_st);
+        let round_start_local = systemtime_to_civil_secs(&local_st);
+        let (round_start_utc, round_start_local) = match (round_start_utc, round_start_local) {
+            (Some(u), Some(l)) => (u, l),
+            (Some(u), None) => (u, u),
+            (None, Some(l)) => (l, l),
+            (None, None) => (0, 0),
+        };
         let mut params: BLUETOOTH_DEVICE_SEARCH_PARAMS = std::mem::zeroed();
         params.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32;
         params.fReturnAuthenticated = 1;
@@ -478,18 +533,17 @@ mod imp {
             if !raws.iter().any(|r| r.Address.Anonymous.ullLong == mac) {
                 raws.push(info);
             }
-            // 在场门：记住但本轮没应答的设备不进列表（SCANPROBE dump 仍保留
-            // 全量原始数据，仅日志）。信号门随之成立：list_found 的 AEP 并入
-            // 只作用于出表后的在场设备，不在场者不可能带格出现。
-            let last_seen = civil_to_unix_secs(
-                i32::from(info.stLastSeen.wYear),
-                u32::from(info.stLastSeen.wMonth),
-                u32::from(info.stLastSeen.wDay),
-                u32::from(info.stLastSeen.wHour),
-                u32::from(info.stLastSeen.wMinute),
-                u32::from(info.stLastSeen.wSecond),
-            );
-            if !heard_this_round(last_seen, info.fConnected != 0, round_start) {
+            // 在场门：只拦双基准读法下都明确古老的记住设备（判定与实证
+            // 依据见 heard_this_round 说明；SCANPROBE dump 仍保留全量
+            // 原始数据，仅日志）。信号门随之成立：list_found 的 AEP 并入
+            // 只作用于出表后的设备，不出表者不可能带格出现。
+            let last_seen = systemtime_to_civil_secs(&info.stLastSeen);
+            if !heard_this_round(
+                last_seen,
+                info.fConnected != 0,
+                round_start_utc,
+                round_start_local,
+            ) {
                 filtered_out += 1;
                 info = BLUETOOTH_DEVICE_INFO::default();
                 info.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
@@ -1335,27 +1389,51 @@ mod tests {
         assert_eq!(devs2[1].rssi, None);
     }
 
-    /// 在场门三类设备（2026-11-20 v2.5.1）：本轮刚听到→进；九个月前最后一次
-    /// 见到的记住设备（用户实证 LAPTOP-QN3CQGC7 lastSeen=2026-02-24）→出；
-    /// 已连接→进（哪怕 lastSeen 旧）；无 lastSeen 且未连接→出；容差边界内→进。
+    /// 在场门三类设备（2026-11-20 v2.5.2 修正口径，实证依据见
+    /// heard_this_round 说明）：①本轮枚举返回、无 lastSeen→放行（枚举
+    /// 返回本身是在场证据）；②lastSeen 在本轮窗口内→放行（UTC 与本地
+    /// 任一基准读法新鲜都算——v2.5.1 只认本地读法、把 UTC 基准的新鲜戳
+    /// 全员误杀，正是真机扫描 0 台的复现场景，必须放行）；③lastSeen
+    /// 九个月前、两基准读法都明确古老→拦下。已连接恒放行。
     #[test]
     fn 在场门三类设备() {
-        // 2026-11-19 09:30:00 UTC 一轮扫描开始（unix 秒经 date 核对）
-        let round_start = 1_795_080_600_i64;
-        // 本轮内刚听到（晚于轮始 3 秒）
-        assert!(heard_this_round(Some(round_start + 3), false, round_start));
-        // 容差边界：轮始前 2 秒内仍算本轮（容差常量 2）
-        assert!(heard_this_round(Some(round_start - 2), false, round_start));
-        // 轮始前 3 秒：出
-        assert!(!heard_this_round(Some(round_start - 3), false, round_start));
-        // 九个月前（2026-02-24 12:00 UTC = 1771934400，用户实证 QN3CQGC7）：出
-        assert!(!heard_this_round(Some(1_771_934_400), false, round_start));
-        // lastSeen 旧但当前已连接：进
-        assert!(heard_this_round(Some(1_771_934_400), true, round_start));
-        // 没有 lastSeen 且未连接（纯记住条目）：出
-        assert!(!heard_this_round(None, false, round_start));
-        // 没有 lastSeen 但已连接：进
-        assert!(heard_this_round(None, true, round_start));
+        // 一轮扫描开始：UTC 基准 2026-11-19 09:30:00（unix 秒经 date 核对）；
+        // 本地基准（UTC+8）同一时刻的 civil 读数 = UTC 读数 + 28800
+        let utc = 1_795_080_600_i64;
+        let local = utc + 28_800;
+        // ① 本轮枚举返回、无 lastSeen、未连接：放行（v2.5.1 此处为拦，已改）
+        assert!(heard_this_round(None, false, utc, local));
+        // 无 lastSeen 但已连接：放行
+        assert!(heard_this_round(None, true, utc, local));
+        // ② 窗口内新鲜戳（UTC 读法，轮始后 3 秒）：放行
+        assert!(heard_this_round(Some(utc + 3), false, utc, local));
+        // ②' 窗口内新鲜戳（本地读法）：放行——它在 UTC 读法下差约 8 小时，
+        // v2.5.1 的单基准门正是死在这里
+        assert!(heard_this_round(Some(local + 3), false, utc, local));
+        // ②'' UTC 基准轮次的统一轮时刻戳（2026-11-20 真机转储形态）：放行
+        assert!(heard_this_round(Some(utc), false, utc, local));
+        // 容差边界：任一基准轮始前 2 秒内：放行
+        assert!(heard_this_round(Some(utc - 2), false, utc, local));
+        // 同日旧戳（7.5 小时前，两读法都不足 24 小时近期线）：放行（宁可放过）
+        assert!(heard_this_round(
+            Some(utc - 7 * 3600 - 1800),
+            false,
+            utc,
+            local
+        ));
+        // 负偏移时区（UTC-5）下本地读法的新鲜戳：放行
+        let local_west = utc - 18_000;
+        assert!(heard_this_round(
+            Some(local_west + 3),
+            false,
+            utc,
+            local_west
+        ));
+        // ③ 九个月前（2026-02-24 12:00 UTC = 1771934400，用户实证
+        // LAPTOP-QN3CQGC7 的旧戳，两基准读法都明确古老）：拦下
+        assert!(!heard_this_round(Some(1_771_934_400), false, utc, local));
+        // ③' 九个月前但当前已连接：放行
+        assert!(heard_this_round(Some(1_771_934_400), true, utc, local));
         // civil→unix 换算自检（数值经 date -u 核对）
         assert_eq!(civil_to_unix_secs(1970, 1, 1, 0, 0, 0), Some(0));
         assert_eq!(

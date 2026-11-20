@@ -2,18 +2,21 @@
 //! 桌面端（Tauri）与演示 CLI 都只调用这一层，不直接碰底层 crate。
 
 pub mod log;
+mod machine_id;
 pub use log::log_line;
 
 use bluelink_ai::{AiClient, AiConfig, ChatMessage};
 use bluelink_domain::*;
-use bluelink_protocol::{ClipboardImage, Control, FileChunk, Frame, CHUNK_SIZE};
+use bluelink_protocol::{
+    ClipboardImage, Control, FileChunk, Frame, CHUNK_SIZE, COMP_NONE, COMP_ZLIB_LEGACY, COMP_ZSTD,
+};
 use bluelink_storage::Storage;
 use bluelink_transport::Conn;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -175,6 +178,12 @@ pub fn reveal_file(path: &Path) -> Result<(), ServiceError> {
     result
 }
 
+/// 当前分片压缩算法名（发送完成日志用；与协议层压缩标志对应）。
+const COMPRESSION_LABEL: &str = "zstd";
+/// zstd 压缩级别：3 级是速度/压缩率的平衡点（空中带宽才是瓶颈，
+/// 不用高级别拖慢 CPU）。
+const ZSTD_LEVEL: i32 = 3;
+
 /// 已知压缩格式（这些扩展名的分片直传，不再压缩）。
 const KNOWN_COMPRESSED: &[&str] = &[
     "zip", "7z", "rar", "gz", "bz2", "xz", "jpg", "jpeg", "png", "gif", "webp", "mp4", "mkv",
@@ -205,17 +214,13 @@ pub fn derive_transfer_id(file_sha: &str, peer_id: &str) -> String {
     )
 }
 
-/// 尝试压缩分片：已知压缩格式或压不动时返回 None（直传）。
+/// 尝试压缩分片（zstd）：已知压缩格式或压不动时返回 None（直传）。
 fn try_compress(data: &[u8], file_name: &str) -> Option<Vec<u8>> {
     let ext = Path::new(file_name).extension()?.to_str()?.to_lowercase();
     if KNOWN_COMPRESSED.contains(&ext.as_str()) {
         return None;
     }
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
-    enc.write_all(data).ok()?;
-    let out = enc.finish().ok()?;
+    let out = zstd::bulk::compress(data, ZSTD_LEVEL).ok()?;
     if out.len() < data.len() {
         Some(out)
     } else {
@@ -223,21 +228,37 @@ fn try_compress(data: &[u8], file_name: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn decompress(data: &[u8]) -> Result<Vec<u8>, ServiceError> {
-    use flate2::read::ZlibDecoder;
-    let mut dec = ZlibDecoder::new(data);
-    let mut out = Vec::new();
-    dec.read_to_end(&mut out)?;
-    Ok(out)
+/// 按压缩标志解压分片。旧版 zlib 标志与未知算法都明确报错、干净失败：
+/// 半成品文件不会通过 FileVerify 的 SHA-256 校验，绝不写出坏文件。
+fn decompress(data: &[u8], compression: u8) -> Result<Vec<u8>, ServiceError> {
+    match compression {
+        COMP_ZSTD => {
+            use std::io::Read as _;
+            let mut dec = zstd::stream::read::Decoder::new(data)
+                .map_err(|e| ServiceError::Other(format!("zstd 解压失败：{e}")))?;
+            // 单个分片解压后至多 CHUNK_SIZE 字节，留一倍余量做安全上限
+            let mut out = Vec::new();
+            (&mut dec)
+                .take((CHUNK_SIZE * 2) as u64)
+                .read_to_end(&mut out)
+                .map_err(|e| ServiceError::Other(format!("zstd 解压失败：{e}")))?;
+            if out.len() > CHUNK_SIZE {
+                return Err(ServiceError::Other("分片解压后大小异常，已停止传输".into()));
+            }
+            Ok(out)
+        }
+        COMP_ZLIB_LEGACY => Err(ServiceError::Other(
+            "对方版本较旧（使用旧版 zlib 压缩），请对方升级到 v2.5.2 以上后再传此类文件".into(),
+        )),
+        other => Err(ServiceError::Other(format!(
+            "不认识的压缩算法（标志 {other}），已停止本次传输"
+        ))),
+    }
 }
 
-/// 无条件 zlib 压缩（剪贴板图片用；压不动时调用方自行回落直传）。
-fn zlib_compress(data: &[u8]) -> Option<Vec<u8>> {
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
-    enc.write_all(data).ok()?;
-    enc.finish().ok()
+/// 无条件 zstd 压缩（剪贴板图片用；压不动时调用方自行回落直传）。
+fn zstd_compress(data: &[u8]) -> Option<Vec<u8>> {
+    zstd::bulk::compress(data, ZSTD_LEVEL).ok()
 }
 
 /// 剪贴板单份内容上限（2MB）：文字按字节数、图片按压缩后实际发送大小算，
@@ -351,6 +372,12 @@ struct RecvState {
     part_path: PathBuf,
     ranges: Ranges,
     written: u64,
+    /// 增量校验状态：收片时顺手把数据喂给哈希器，FileDone 时免整文件
+    /// 重读。hashed_upto 是已按序喂入的字节数（文件前缀长度）；只有
+    /// 全新传输（无续传区间）才启用，续传/异常时置 None 回退整文件
+    /// 重算，校验强度不降。
+    hasher: Option<Sha256>,
+    hashed_upto: u64,
 }
 
 /// 一个对端会话。
@@ -358,7 +385,18 @@ struct PeerSession {
     conn: Arc<Conn>,
     peer: Device,
     conversation_id: String,
+    /// 最近一次收到入站帧的时刻（毫秒）：心跳任务据此判死——链路静默
+    /// 死亡（对端进程没了/无线电被关/会话被对端静默丢弃）时收发两端都
+    /// 不会报错，只有「太久没有任何入站帧」是可靠信号（2026-11-20
+    /// 双机日志实锤：一边会话已死、另一边 28 秒后才靠人工断开察觉）。
+    last_inbound_ms: AtomicU64,
 }
+
+/// 心跳节奏：每 5 秒发一帧 Ping（协议控制帧，对端现成回 Pong，任何
+/// 入站帧都刷新存活戳）；连续 15 秒无任何入站帧判死。两边同跑这套，
+/// 静默死亡的察觉差从「无上限」压到 15 秒内。
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const HEARTBEAT_DEAD_MS: u64 = 15_000;
 
 /// 节点：本机身份 + 存储 + 当前连接 + AI 配置。
 pub struct Node {
@@ -436,13 +474,60 @@ impl Node {
                 default_download_dir.clone()
             }
         };
+        // 设备 ID（2026-11-20 改机器绑定）：优先按操作系统机器标识
+        // 确定性派生（见 machine_bound_device_id），卸载重装/清数据后
+        // 不变；派生值仍写进 device_id.txt——机器标识偶发读不到时靠它
+        // 兜底沿用。存量随机 ID 与派生值不同则一次性切换并落定案行。
+        // 联调覆盖：环境变量 BLUELINK_DEVICE_ID_OVERRIDE 非空时直接用它
+        // （同一台机器上跑双实例联调时区分身份用；设备 ID 不是秘密，
+        // 连接码本就显示在界面上，此覆盖不构成安全边界）。
         let id_path = data_dir.join("device_id.txt");
-        let device_id = if id_path.exists() {
-            std::fs::read_to_string(&id_path)?.trim().to_string()
-        } else {
-            let id = new_id();
-            std::fs::write(&id_path, &id)?;
+        let stored_id = std::fs::read_to_string(&id_path)
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty());
+        let env_override = std::env::var("BLUELINK_DEVICE_ID_OVERRIDE")
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty());
+        let device_id = if let Some(id) = env_override {
+            let _ = std::fs::write(&id_path, &id);
             id
+        } else {
+            match (machine_id::read_machine_id(), stored_id) {
+                (Some(mid), stored) => {
+                    let derived = machine_bound_device_id(&mid);
+                    match stored {
+                        Some(s) if s == derived => derived,
+                        Some(_) => {
+                            let _ = std::fs::write(&id_path, &derived);
+                            log::log_line(
+                                "app",
+                                "设备 ID 已切换为机器绑定，连接码随之变更（仅此一次）",
+                            );
+                            derived
+                        }
+                        None => {
+                            let _ = std::fs::write(&id_path, &derived);
+                            log::log_line("app", "设备 ID 已按机器标识绑定生成（重装/清数据不变）");
+                            derived
+                        }
+                    }
+                }
+                (None, Some(s)) => {
+                    log::log_line("app", "机器标识读取失败，沿用已持久化的设备 ID");
+                    s
+                }
+                (None, None) => {
+                    let id = new_id();
+                    let _ = std::fs::write(&id_path, &id);
+                    log::log_line(
+                        "app",
+                        "机器标识读取失败，设备 ID 随机生成并持久化（清数据后会变）",
+                    );
+                    id
+                }
+            }
         };
         let (events, _) = broadcast::channel(512);
         Ok(Arc::new(Self {
@@ -687,7 +772,13 @@ impl Node {
             conn: conn.clone(),
             peer,
             conversation_id,
+            last_inbound_ms: AtomicU64::new(now_ms() as u64),
         });
+        // 已有旧会话时先按「被新连接替换」收尾再换上新会话，不许无声覆盖
+        let old = self.peer.lock().await.clone();
+        if let Some(old) = old {
+            self.end_session(&old, "被新连接替换").await;
+        }
         *self.peer.lock().await = Some(session.clone());
         // 连接结果是 essential：普通模式也要能查到「连上了谁」（握手分步行是 verbose，不能替代结果行）
         log::log_line(
@@ -702,11 +793,12 @@ impl Node {
             peer_name: Some(session.peer.name.clone()),
         });
 
-        // 接收循环
+        // 接收循环 + 心跳（判死察觉，见 spawn_heartbeat）
         let peer_out = session.peer.clone();
         let node = self.clone();
         let recv_session = session.clone();
         tokio::spawn(async move { node.recv_loop(recv_session).await });
+        self.spawn_heartbeat(session.clone());
 
         // 剪贴板同步：连接建立后先把本机开关状态通告对方（对方也会发来它的），
         // 再启动本机剪贴板监视任务（任务里再按「双方都开」决定是否真正读写）
@@ -721,43 +813,15 @@ impl Node {
         Ok(peer_out)
     }
 
-    /// 断开当前连接：先关底层连接（对端读到 EOF 随之结束会话），再清本机会话。
-    /// 只清指针不关连接的话，对端会一直以为还连着（2026-11-19 取消迟到成功实测撞出）。
+    /// 断开当前连接（界面按钮/取消清理都走这里）：经 end_session 以
+    /// 「用户主动断开」落字。只清指针不关连接的话，对端会一直以为还
+    /// 连着（2026-11-19 取消迟到成功实测撞出），故收尾必关底层连接。
     pub async fn disconnect(&self) {
-        let session = self.peer.lock().await.take();
-        if let Some(s) = &session {
-            s.conn.close().await;
-            // 断开结果是 essential（旧版只发事件不落日志，普通模式查不到断开记录）
-            log::log_line(
-                "conn",
-                &format!("连接已断开（本机主动）：对方 {}", s.peer.name),
-            );
-        }
-        drop(session);
-        self.clip_peer_on.store(false, Ordering::Relaxed);
-        self.emit(Event::ConnectionChanged {
-            connected: false,
-            peer_name: None,
-        });
-        self.emit_clipboard_state(false);
-    }
-
-    async fn recv_loop(self: Arc<Self>, session: Arc<PeerSession>) {
-        while let Ok(frame) = session.conn.recv().await {
-            if let Err(e) = self.handle_frame(&session, frame).await {
-                eprintln!("处理帧出错：{e}");
-            }
-        }
-        // 连接断开：清理会话并通知
-        let mut guard = self.peer.lock().await;
-        if let Some(cur) = &*guard {
-            if Arc::ptr_eq(cur, &session) {
-                log::log_line(
-                    "conn",
-                    &format!("连接已断开（链路结束）：对方 {}", cur.peer.name),
-                );
-                *guard = None;
-                self.clip_peer_on.store(false, Ordering::Relaxed);
+        let session = self.peer.lock().await.clone();
+        match session {
+            Some(s) => self.end_session(&s, "用户主动断开").await,
+            None => {
+                // 无会话时也广播一次断开事件，前端状态归零（旧行为）
                 self.emit(Event::ConnectionChanged {
                     connected: false,
                     peer_name: None,
@@ -765,6 +829,110 @@ impl Node {
                 self.emit_clipboard_state(false);
             }
         }
+    }
+
+    /// 会话结束的唯一出口：清会话槽、落 essential 定案行、发断开事件、
+    /// 关底层连接。reason 必须是真实来源（用户主动断开 / 链路结束 /
+    /// 接收出错：… / 心跳判死：… / 发送失败：… / 被新连接替换）——
+    /// 2026-11-20 双机日志实锤旧版把清理动作统一打成「本机主动」，
+    /// 与对端先察觉的事实矛盾、误导排查，从此分开落字。多个结束路径
+    /// （接收循环/心跳/界面断开/新连接替换）赛跑时只有先到者执行：
+    /// 同一会话只落一行、只发一次事件。
+    async fn end_session(&self, session: &Arc<PeerSession>, reason: &str) {
+        {
+            let mut guard = self.peer.lock().await;
+            let is_current = guard
+                .as_ref()
+                .map(|cur| Arc::ptr_eq(cur, session))
+                .unwrap_or(false);
+            if !is_current {
+                return; // 已被其他路径结束或替换
+            }
+            *guard = None;
+        }
+        self.clip_peer_on.store(false, Ordering::Relaxed);
+        log::log_line(
+            "conn",
+            &format!("连接已断开（{reason}）：对方 {}", session.peer.name),
+        );
+        self.emit(Event::ConnectionChanged {
+            connected: false,
+            peer_name: None,
+        });
+        self.emit_clipboard_state(false);
+        session.conn.close().await;
+    }
+
+    /// 心跳任务（每会话一个）：周期发 Ping 探活；连续 HEARTBEAT_DEAD_MS
+    /// 无任何入站帧判死并经 end_session 收尾。会话被替换/结束后自行
+    /// 退出。两边同跑：静默死亡（对端会话被静默丢弃、进程消失、无线
+    /// 电被关）不再靠人工察觉，察觉差压进判死阈值内。
+    fn spawn_heartbeat(self: &Arc<Self>, session: Arc<PeerSession>) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+            tick.tick().await; // 跳过 interval 的立即第一拍
+            loop {
+                tick.tick().await;
+                {
+                    let guard = node.peer.lock().await;
+                    let is_current = guard
+                        .as_ref()
+                        .map(|cur| Arc::ptr_eq(cur, &session))
+                        .unwrap_or(false);
+                    if !is_current {
+                        return; // 会话已结束/被替换
+                    }
+                }
+                let silent_ms = now_ms() - session.last_inbound_ms.load(Ordering::Relaxed) as i64;
+                if silent_ms >= HEARTBEAT_DEAD_MS as i64 {
+                    // 传输进行中不判死：发完等校验/收片未齐时，对端是
+                    // 在合法地等我方（校验重算可达数秒），静默不等于
+                    // 死亡——v2.5.2 实测撞出：300MB 文件校验期接收端
+                    // 被自家心跳误杀。真死由传输侧超时（30s/60s）与
+                    // 接收循环错误兜底。
+                    let busy = !node.recv_files.lock().await.is_empty()
+                        || !node.verify_waiters.lock().await.is_empty()
+                        || !node.accept_waiters.lock().await.is_empty();
+                    if !busy {
+                        node.end_session(
+                            &session,
+                            &format!("心跳判死：{} 秒无任何入站帧", silent_ms / 1000),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                if let Err(e) = session.conn.send(&Frame::Control(Control::Ping)).await {
+                    node.end_session(&session, &format!("发送失败：心跳帧发送出错（{e}）"))
+                        .await;
+                    return;
+                }
+            }
+        });
+    }
+
+    async fn recv_loop(self: Arc<Self>, session: Arc<PeerSession>) {
+        // 结束原因分开落字：干净 EOF（对端关连接/链路被栈断开）与接收
+        // 出错（帧失步/IO 错误）不是一回事；具体传输侧原因看相邻的
+        // transport essential 行（通知流结束/写失败/取消订阅等）。
+        let reason = loop {
+            match session.conn.recv().await {
+                Ok(frame) => {
+                    session
+                        .last_inbound_ms
+                        .store(now_ms() as u64, Ordering::Relaxed);
+                    if let Err(e) = self.handle_frame(&session, frame).await {
+                        eprintln!("处理帧出错：{e}");
+                    }
+                }
+                Err(bluelink_transport::TransportError::Closed) => {
+                    break "链路结束".to_string();
+                }
+                Err(e) => break format!("接收出错：{e}"),
+            }
+        };
+        self.end_session(&session, &reason).await;
     }
 
     async fn handle_frame(
@@ -1199,12 +1367,12 @@ impl Node {
                 height,
                 rgba,
             } => {
-                // 位图先 zlib 压缩（截图类内容压缩率高），上限按实际发送大小算
+                // 位图先 zstd 压缩（截图类内容压缩率高），上限按实际发送大小算
                 let digest = clip_image_digest(width, height, &rgba);
-                let compressed = zlib_compress(&rgba).filter(|c| c.len() < rgba.len());
-                let (data, was_compressed) = match &compressed {
-                    Some(c) => (c.clone(), true),
-                    None => (rgba, false),
+                let compressed = zstd_compress(&rgba).filter(|c| c.len() < rgba.len());
+                let (data, comp_algo) = match &compressed {
+                    Some(c) => (c.clone(), COMP_ZSTD),
+                    None => (rgba, COMP_NONE),
                 };
                 if data.len() > CLIPBOARD_MAX_BYTES {
                     log::log_line(
@@ -1221,7 +1389,7 @@ impl Node {
                     hash: digest,
                     width,
                     height,
-                    compressed: was_compressed,
+                    compression: comp_algo,
                     data,
                 });
                 if session.conn.send(&frame).await.is_ok() {
@@ -1239,7 +1407,7 @@ impl Node {
         let ClipboardImage {
             width,
             height,
-            compressed,
+            compression,
             data,
             ..
         } = img;
@@ -1257,10 +1425,17 @@ impl Node {
         let expect = (width as u64)
             .checked_mul(height as u64)
             .and_then(|n| n.checked_mul(4));
-        let rgba = if compressed {
+        let rgba = if compression == COMP_ZLIB_LEGACY {
+            // 旧版 zlib 图片：对方版本较旧，本版不再解，忽略并在日志注明
+            log::log_line(
+                "clipboard",
+                "收到对方剪贴板图片（旧版 zlib 压缩），对方版本较旧，已忽略",
+            );
+            return;
+        } else if compression == COMP_ZSTD {
             match tokio::task::spawn_blocking(move || {
-                use flate2::read::ZlibDecoder;
-                let mut dec = ZlibDecoder::new(&data[..]);
+                use std::io::Read as _;
+                let mut dec = zstd::stream::read::Decoder::new(&data[..])?;
                 let mut out = Vec::new();
                 let mut limited = (&mut dec).take(64 * 1024 * 1024 + 1);
                 limited.read_to_end(&mut out).map(|_| out)
@@ -1273,8 +1448,14 @@ impl Node {
                     return;
                 }
             }
-        } else {
+        } else if compression == COMP_NONE {
             data
+        } else {
+            log::log_line(
+                "clipboard",
+                &format!("收到对方剪贴板图片，不认识的压缩算法（标志 {compression}），已忽略"),
+            );
+            return;
         };
         if expect != Some(rgba.len() as u64) || rgba.len() > 64 * 1024 * 1024 {
             log::log_line(
@@ -1414,6 +1595,9 @@ impl Node {
         });
 
         // 按缺失区间流式发送
+        let send_started = std::time::Instant::now();
+        let mut wire_bytes: u64 = 0; // 实际空中字节（压缩后分片数据之和）
+        let mut used_compression = false;
         let mut file = std::fs::File::open(path)?;
         let mut sent_total = covered_bytes(&received);
         for (start, end) in missing {
@@ -1427,16 +1611,18 @@ impl Node {
                 let want = ((end - offset) as usize).min(CHUNK_SIZE);
                 let mut buf = vec![0u8; want];
                 file.read_exact(&mut buf)?;
-                let (compressed, data) = match try_compress(&buf, &name) {
-                    Some(c) => (true, c),
-                    None => (false, buf),
+                let (compression, data) = match try_compress(&buf, &name) {
+                    Some(c) => (COMP_ZSTD, c),
+                    None => (COMP_NONE, buf),
                 };
+                wire_bytes += data.len() as u64;
+                used_compression |= compression != COMP_NONE;
                 session
                     .conn
                     .send(&Frame::Chunk(FileChunk {
                         transfer_id: transfer_id.clone(),
                         offset,
-                        compressed,
+                        compression,
                         data,
                     }))
                     .await?;
@@ -1456,6 +1642,12 @@ impl Node {
             .lock()
             .await
             .insert(transfer_id.clone(), vtx);
+        // 最后一片已发完：先切「等校验」状态，界面显示「已发送，等待
+        // 对方校验…」，别让进度条在 100% 无文案干挂到校验回来。
+        self.emit(Event::TransferState {
+            transfer_id: transfer_id.clone(),
+            state: "verifying".into(),
+        });
         session
             .conn
             .send(&Frame::Control(Control::FileDone {
@@ -1467,6 +1659,14 @@ impl Node {
             .map_err(|_| ServiceError::Other("等待校验结果超时".into()))?
             .map_err(|_| ServiceError::Other("校验通道已关闭".into()))?;
         if ok {
+            log::log_line(
+                "files",
+                &format!(
+                    "文件发送完成：{name}，原始 {size} 字节，空中 {wire_bytes} 字节，耗时 {} 毫秒，压缩 {}",
+                    send_started.elapsed().as_millis(),
+                    if used_compression { COMPRESSION_LABEL } else { "无" },
+                ),
+            );
             self.storage
                 .update_message_status(&msg.id, MessageStatus::Delivered)?;
             self.emit(Event::TransferState {
@@ -1512,6 +1712,9 @@ impl Node {
             .open(&part_path)?;
         file.set_len(size)?;
         let file_id = new_id();
+        // 增量哈希只对全新传输启用：已有续传区间时前缀内容不在内存里，
+        // FileDone 时回退整文件重算（on_file_done 处理）。
+        let fresh = ranges.is_empty();
         self.recv_files.lock().await.insert(
             transfer_id.clone(),
             RecvState {
@@ -1523,6 +1726,8 @@ impl Node {
                 part_path,
                 ranges: ranges.clone(),
                 written: covered_bytes(&ranges),
+                hasher: if fresh { Some(Sha256::new()) } else { None },
+                hashed_upto: 0,
             },
         );
         self.storage.save_file(&FileMeta {
@@ -1575,12 +1780,13 @@ impl Node {
         let st = guard
             .get_mut(&chunk.transfer_id)
             .ok_or_else(|| ServiceError::Other("收到未知传输的分片".into()))?;
-        let data = if chunk.compressed {
-            decompress(&chunk.data)?
-        } else {
+        let data = if chunk.compression == COMP_NONE {
             chunk.data
+        } else {
+            decompress(&chunk.data, chunk.compression)?
         };
         let mut f = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .open(&st.part_path)?;
         f.seek(SeekFrom::Start(chunk.offset))?;
@@ -1593,6 +1799,41 @@ impl Node {
             .concat(),
         );
         st.written = covered_bytes(&st.ranges);
+        // 增量哈希：本片若正好接上已哈希前缀，直接喂内存数据；随后把
+        // 前缀之后已落盘的连续区间（乱序先到的片）从磁盘补喂，直到
+        // 遇到空缺。任何异常都置 None 回退整文件重算，不影响校验。
+        if st.hasher.is_some() {
+            let data_len = data.len() as u64;
+            if chunk.offset <= st.hashed_upto && chunk.offset + data_len > st.hashed_upto {
+                let skip = (st.hashed_upto - chunk.offset) as usize;
+                if let Some(h) = st.hasher.as_mut() {
+                    h.update(&data[skip..]);
+                }
+                st.hashed_upto += data_len - skip as u64;
+            }
+            loop {
+                let next_end = st
+                    .ranges
+                    .iter()
+                    .find(|(s, e)| *s <= st.hashed_upto && *e > st.hashed_upto)
+                    .map(|(_, e)| *e);
+                let Some(end) = next_end else { break };
+                let span = (end - st.hashed_upto) as usize;
+                let mut buf = vec![0u8; span];
+                let read_ok = f
+                    .seek(SeekFrom::Start(st.hashed_upto))
+                    .and_then(|_| f.read_exact(&mut buf))
+                    .is_ok();
+                if !read_ok {
+                    st.hasher = None;
+                    break;
+                }
+                if let Some(h) = st.hasher.as_mut() {
+                    h.update(&buf);
+                }
+                st.hashed_upto = end;
+            }
+        }
         let (tid, written, total, ranges, mid) = (
             chunk.transfer_id.clone(),
             st.written,
@@ -1617,13 +1858,33 @@ impl Node {
         session: &Arc<PeerSession>,
         transfer_id: String,
     ) -> Result<(), ServiceError> {
-        let st = self
+        // 先给本方界面一个「校验中」状态，别让进度条在 100% 干挂着
+        self.emit(Event::TransferState {
+            transfer_id: transfer_id.clone(),
+            state: "verifying".into(),
+        });
+        let mut st = self
             .recv_files
             .lock()
             .await
             .remove(&transfer_id)
             .ok_or_else(|| ServiceError::Other("完成信号对应未知传输".into()))?;
-        let actual = sha256_file(&st.part_path)?;
+        // 增量哈希覆盖全文件时直接比对摘要，免去整文件重读（大文件
+        // 这一步原来要数秒）；否则（续传/乱序补片/中途异常）回退现行
+        // 整文件重算，校验强度不降。
+        let (actual, verify_how) = if st.hasher.is_some() && st.hashed_upto == st.total {
+            let digest = format!("{:x}", st.hasher.take().unwrap().finalize());
+            (digest, "增量哈希")
+        } else {
+            // 整文件重算挪出接收循环：大文件要读数秒，堵在循环里会让
+            // 心跳与其它帧都读不到（v2.5.2 实测撞出：校验期会话被自家
+            // 心跳误判死亡）。spawn_blocking 里算，循环保持通畅。
+            let part = st.part_path.clone();
+            let digest = tokio::task::spawn_blocking(move || sha256_file(&part))
+                .await
+                .map_err(|e| ServiceError::Other(format!("校验任务失败：{e}")))??;
+            (digest, "整文件重算")
+        };
         let ok = actual == st.sha256;
         if ok {
             let _ = self
@@ -1651,9 +1912,10 @@ impl Node {
             log::log_line(
                 "files",
                 &format!(
-                    "接收完成：{}（{} 字节）→ {}",
+                    "接收完成：{}（{} 字节，校验：{}）→ {}",
                     st.name,
                     st.total,
+                    verify_how,
                     final_path.display()
                 ),
             );
@@ -2124,6 +2386,10 @@ impl Node {
     async fn handle_ai_proxy_frame(&self, c: Control) {
         match c {
             Control::AiProxyChunk { request_id, delta } => {
+                // 空分片不入等待通道：空 Ok 是 Done 的结束哨兵，混入会误判结束。
+                if delta.is_empty() {
+                    return;
+                }
                 if let Some(tx) = self.proxy_waiters.lock().await.get(&request_id) {
                     let _ = tx.send(Ok(delta)).await;
                 }
@@ -2224,6 +2490,11 @@ impl Node {
         let rid_fwd = request_id.clone();
         let forwarder = tokio::spawn(async move {
             while let Some(d) = rx.recv().await {
+                // 空增量不转发：上游流式首片常只有角色、内容为空，而请求端把
+                // 「空增量」保留作 Done 的结束哨兵，转发空片会让对方误判结束。
+                if d.is_empty() {
+                    continue;
+                }
                 let _ = conn_fwd
                     .send(&Frame::Control(Control::AiProxyChunk {
                         request_id: rid_fwd.clone(),
@@ -2251,5 +2522,58 @@ impl Node {
             .send(&Frame::Control(Control::AiProxyDone { request_id, error }))
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+
+    #[test]
+    fn zstd分片压缩往返一致() {
+        let data = "可压缩的文本内容，用于验证 zstd 往返。"
+            .repeat(200)
+            .into_bytes();
+        let packed = try_compress(&data, "记录.txt").expect("文本应可压缩");
+        assert!(packed.len() < data.len());
+        let back = decompress(&packed, COMP_ZSTD).unwrap();
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn 已知压缩格式跳过压缩() {
+        let data = vec![7u8; 4096];
+        assert!(try_compress(&data, "归档.zip").is_none());
+        assert!(try_compress(&data, "照片.JPG").is_none());
+        assert!(try_compress(&data, "文档.pdf").is_none());
+    }
+
+    #[test]
+    fn 压完变大则直传() {
+        // 随机数据压不动 → 返回 None 走直传
+        let mut x: u32 = 0x12345678;
+        let data: Vec<u8> = (0..2048)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 24) as u8
+            })
+            .collect();
+        assert!(try_compress(&data, "随机.bin").is_none());
+    }
+
+    #[test]
+    fn 旧版zlib标志干净失败并提示升级() {
+        let err = decompress(b"whatever", COMP_ZLIB_LEGACY).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("旧版") && msg.contains("升级"),
+            "提示原文：{msg}"
+        );
+    }
+
+    #[test]
+    fn 未知压缩标志干净失败() {
+        let err = decompress(b"whatever", 9).unwrap_err();
+        assert!(format!("{err}").contains("不认识的压缩算法"));
     }
 }

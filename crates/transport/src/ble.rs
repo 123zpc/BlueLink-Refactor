@@ -395,16 +395,38 @@ impl BleCentral {
         let total = || t0.elapsed().as_millis();
         let step_ms = |t: Instant| t.elapsed().as_millis();
         crate::probe::log_step("ble", &format!("连接步骤1/6 开始连接：目标 {device_id}"));
-        let peripherals = self.adapter.peripherals().await.map_err(ble_err)?;
+        // 目标不在当前扫描缓存里时不要立刻判死：断开后对端恢复广播、
+        // 本机扫描重新发现都需要几秒，旧版即时报「不在扫描范围内」把
+        // 刚断开后的立即重连误杀了（2026-11-20 真机实锤：断后 2 秒重连
+        // 报此错、再点一次就成）。最长等 10 秒、每 500ms 复查缓存。
         let mut target: Option<CentralPeripheral> = None;
-        for p in peripherals {
-            if p.id().to_string() == device_id {
-                target = Some(p);
+        let lookup_start = Instant::now();
+        let mut wait_logged = false;
+        loop {
+            let peripherals = self.adapter.peripherals().await.map_err(ble_err)?;
+            for p in peripherals {
+                if p.id().to_string() == device_id {
+                    target = Some(p);
+                    break;
+                }
+            }
+            if target.is_some() || lookup_start.elapsed() >= std::time::Duration::from_secs(10) {
                 break;
             }
+            if !wait_logged {
+                wait_logged = true;
+                crate::probe::log_step(
+                    "ble",
+                    "连接步骤1/6：目标暂不在扫描缓存内，等待其重新出现（最长 10 秒）",
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         let peripheral = target.ok_or_else(|| {
-            crate::probe::log("ble", "连接失败于步骤1/6：设备已不在扫描范围内");
+            crate::probe::log(
+                "ble",
+                "连接失败于步骤1/6：设备已不在扫描范围内（等待 10 秒仍未出现）",
+            );
             TransportError::Ble("设备已不在扫描范围内，请重新扫描".into())
         })?;
         let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
@@ -551,14 +573,24 @@ impl BleCentral {
             mut outgoing_rx,
         } = ends;
 
-        // 入站泵：通知字节 → 流
+        // 入站泵：通知字节 → 流。流结束必须落 essential——旧版静默退出，
+        // 客户端对链路死亡毫无察觉（会话靠服务层心跳才判死，日志里还
+        // 要有这条传输侧原因行才对得上账）
         let mut notifications = peripheral.notifications().await.map_err(ble_err)?;
         let in_tx = incoming_tx.clone();
         tokio::spawn(async move {
+            let mut local_close = false;
             while let Some(n) = notifications.next().await {
                 if n.uuid == OUTBOX_UUID && in_tx.send(n.value).await.is_err() {
+                    local_close = true; // 本机流已关（会话收尾中），不是对端断链
                     break;
                 }
+            }
+            if !local_close {
+                crate::probe::log(
+                    "ble",
+                    "客户端：对端通知流结束（对端断开或链路丢失），会话将结束",
+                );
             }
         });
 
@@ -576,7 +608,12 @@ impl BleCentral {
             while let Some(bytes) = outgoing_rx.recv().await {
                 let mut failed = false;
                 for piece in bytes.chunks(ATT_CHUNK) {
-                    if peer.write(&inbox, piece, write_type).await.is_err() {
+                    if let Err(e) = peer.write(&inbox, piece, write_type).await {
+                        // 写失败是会话死因之一，落 essential 再拆链（旧版静默）
+                        crate::probe::log(
+                            "ble",
+                            &format!("客户端：写失败（{}），主动断开链路", ble_err(e)),
+                        );
                         failed = true;
                         break;
                     }
@@ -811,7 +848,9 @@ pub async fn start_ble_server(
                         .map(|(c, _)| c == &request.client)
                         .unwrap_or(false)
                     {
-                        crate::probe::log_step(
+                        // 会话结束的原因行升 essential：普通模式下也要能查到
+                        // 「对端退订」这个真实死因（旧版仅 verbose 有行）
+                        crate::probe::log(
                             "ble",
                             &format!("服务端：对方取消订阅，链路断开（对方 {}）", request.client),
                         );
@@ -828,7 +867,14 @@ pub async fn start_ble_server(
                         request.characteristic == INBOX_UUID && client == &request.client
                     });
                     if let Some((_, tx)) = target {
-                        let _ = tx.try_send(value);
+                        if tx.try_send(value).is_err() {
+                            // 通道满/已关时旧版静默丢帧：字节流缺一片即失步，
+                            // 会话随后无声而死。从此丢帧必落 essential。
+                            crate::probe::log(
+                                "ble",
+                                "服务端：入站通道已满或已关闭，丢弃一帧入站数据（字节流可能失步）",
+                            );
+                        }
                     }
                     let _ = responder.send(WriteRequestResponse {
                         response: RequestResponse::Success,
@@ -840,12 +886,32 @@ pub async fn start_ble_server(
                         response: RequestResponse::Success,
                     });
                 }
-                PeripheralEvent::StateUpdate { is_powered: false } => {
-                    link = None;
+                PeripheralEvent::StateUpdate { is_powered } => {
+                    if !is_powered {
+                        // 无线电状态抖动不拆链（2026-11-20 双机日志实锤的
+                        // 静默杀会话路径）：Radio.StateChanged 在扫描/查询
+                        // 并发时可报瞬态非 On，旧版据此直接清链路——链路
+                        // 其实没断、广播与事件循环都还活着，服务层却收到
+                        // EOF 无声结束会话，对端 28 秒后才靠人工察觉。
+                        // 从此只落 essential 观察行：真关电/真断链会经
+                        // 通知失败、心跳判死等路径收尾，不靠这条事件。
+                        crate::probe::log(
+                            "ble",
+                            "服务端：蓝牙无线电状态报告关闭（瞬态抖动不拆链，继续观察）",
+                        );
+                    } else {
+                        crate::probe::log_step("ble", "服务端：蓝牙无线电状态开启");
+                    }
                 }
                 _ => {}
             }
         }
+        // 事件循环退出（外设事件通道关闭）必须留痕：旧版静默退出，
+        // 服务端整体聋掉也无从排查
+        crate::probe::log(
+            "ble",
+            "服务端：外设事件循环结束（事件通道关闭），服务端停止工作",
+        );
     });
 
     Ok((
@@ -938,7 +1004,7 @@ mod tests {
         let big = Frame::Chunk(bluelink_protocol::FileChunk {
             transfer_id: "12345678-1234-1234-1234-1234567890ab".to_string(),
             offset: 0,
-            compressed: false,
+            compression: bluelink_protocol::COMP_NONE,
             data: vec![9u8; 300 * 1024],
         });
         b.send(&big).await.unwrap();

@@ -10,7 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
-flate2 = { workspace = true }
+zstd = { workspace = true }
 # 系统剪贴板读写（文字 + RGBA 图片）：三平台都有原生后端，纯系统 API、无需运行时服务
 arboard = "3"
 bluelink-domain = { path = "../domain" }
@@ -18,3 +18,7 @@ bluelink-protocol = { path = "../protocol" }
 bluelink-storage = { path = "../storage" }
 bluelink-transport = { path = "../transport" }
 bluelink-ai = { path = "../ai" }
+
+# Windows 机器标识（MachineGuid）读取：设备 ID 机器绑定用，仅 Windows 目标
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

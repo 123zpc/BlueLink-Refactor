@@ -18,7 +18,7 @@ members = [
 ble-peripheral-rust = { path = "third-party/ble-peripheral-rust" }
 
 [workspace.package]
-version = "2.5.1"
+version = "2.5.2"
 edition = "2021"
 license = "MIT"
 
@@ -30,6 +30,6 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zstd = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures-util = "0.3"

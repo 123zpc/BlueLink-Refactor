@@ -10,6 +10,13 @@ pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 /// 文件分片大小（256 KiB）。
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
+/// 分片/图片帧的压缩算法标志（帧内 1 字节）：
+/// 0=无压缩，1=旧版 zlib（v2.5.2 起不再发送，收到即判旧版并干净失败），
+/// 2=zstd（v2.5.2 起）。其余取值一律按未知算法处理。
+pub const COMP_NONE: u8 = 0;
+pub const COMP_ZLIB_LEGACY: u8 = 1;
+pub const COMP_ZSTD: u8 = 2;
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("帧长度超限：{0}")]
@@ -129,11 +136,12 @@ impl Control {
 pub struct FileChunk {
     pub transfer_id: String,
     pub offset: u64,
-    pub compressed: bool,
+    /// 压缩算法标志（COMP_* 常量）。
+    pub compression: u8,
     pub data: Vec<u8>,
 }
 
-/// 剪贴板图片帧（类型码 0x1A，二进制承载）：RGBA 位图，可选 zlib 压缩
+/// 剪贴板图片帧（类型码 0x1A，二进制承载）：RGBA 位图，可选压缩
 /// （压缩/解压由服务层负责，协议层只搬字节，与文件分片同口径）。
 /// hash 为未压缩 RGBA 内容（含宽高）的 SHA-256，接收方据此抑制回环。
 #[derive(Debug, Clone, PartialEq)]
@@ -141,7 +149,8 @@ pub struct ClipboardImage {
     pub hash: [u8; 32],
     pub width: u32,
     pub height: u32,
-    pub compressed: bool,
+    /// 压缩算法标志（COMP_* 常量）。
+    pub compression: u8,
     pub data: Vec<u8>,
 }
 
@@ -162,7 +171,7 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
             // transfer_id 以 16 字节 UUID 形式承载；非 UUID 时退化为哈希前 16 字节
             p.extend_from_slice(&id_to_16(&ch.transfer_id));
             p.extend_from_slice(&ch.offset.to_le_bytes());
-            p.push(if ch.compressed { 1 } else { 0 });
+            p.push(ch.compression);
             p.extend_from_slice(&ch.data);
             (0x12u8, p)
         }
@@ -171,7 +180,7 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
             p.extend_from_slice(&img.hash);
             p.extend_from_slice(&img.width.to_le_bytes());
             p.extend_from_slice(&img.height.to_le_bytes());
-            p.push(if img.compressed { 1 } else { 0 });
+            p.push(img.compression);
             p.extend_from_slice(&img.data);
             (0x1Au8, p)
         }
@@ -246,7 +255,7 @@ pub async fn read_frame(
                     .try_into()
                     .map_err(|_| ProtocolError::BadChunk)?,
             ),
-            compressed: body[24] & 1 == 1,
+            compression: body[24],
             data: body[25..].to_vec(),
         };
         return Ok(Some(Frame::Chunk(chunk)));
@@ -269,7 +278,7 @@ pub async fn read_frame(
                     .try_into()
                     .map_err(|_| ProtocolError::BadChunk)?,
             ),
-            compressed: body[40] & 1 == 1,
+            compression: body[40],
             data: body[41..].to_vec(),
         };
         return Ok(Some(Frame::ClipboardImage(image)));
@@ -338,7 +347,7 @@ mod tests {
                 hash: [9u8; 32],
                 width: 3,
                 height: 2,
-                compressed: true,
+                compression: COMP_ZSTD,
                 data: vec![1, 2, 3, 4, 5],
             }),
         ];
@@ -360,7 +369,7 @@ mod tests {
         let f = Frame::Chunk(FileChunk {
             transfer_id: id.clone(),
             offset: 262144,
-            compressed: true,
+            compression: COMP_ZSTD,
             data: vec![7u8; 1000],
         });
         let bytes = encode(&f).unwrap();

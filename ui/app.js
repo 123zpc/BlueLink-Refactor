@@ -18,11 +18,12 @@ const state = {
   streamEl: null,
   categories: [],
   catEditId: null,
-  stagedImage: null,
+  pendingFiles: [],
   transferMap: {},
   quoteFrom: null,
   favIds: new Set(),
   pins: [],
+  pinIds: new Set(),
   lastFileBubble: null,
   btDevice: null,
   btDeviceName: null,
@@ -195,6 +196,7 @@ function buildMessageEl(m, opts = {}) {
     const b = document.createElement("button");
     b.textContent = label;
     if (label === "收藏") { b.classList.add("fav-btn"); paintFavBtn(b, state.favIds.has(m.id)); }
+    if (label === "置顶") { b.classList.add("pin-btn"); paintPinBtn(b, state.pinIds.has(m.id)); }
     b.addEventListener("click", fn);
     actions.appendChild(b);
   }
@@ -528,9 +530,25 @@ function rebuildDateRail() {
   }
 }
 
-async function refreshPinBar() {
+/** 置顶钮的已置顶态绘制（与收藏同口径：文案 + 强调色，CSS .marked）。 */
+function paintPinBtn(b, on) {
+  b.classList.toggle("marked", !!on);
+  b.textContent = on ? "已置顶" : "置顶";
+}
+
+/** 同步全部置顶 id 集（按钮态/菜单文案据此画，不按会话过滤）。 */
+async function refreshPinIds() {
   try {
     const pins = await invoke("list_marked", { kind: "pin" });
+    state.pinIds = new Set(pins.map((m) => m.id));
+    return pins;
+  } catch (_) { return null; }
+}
+
+async function refreshPinBar() {
+  try {
+    const pins = await refreshPinIds();
+    if (!pins) return;
     const mine = pins.filter((m) => m.conversation_id === state.peerConvId);
     state.pins = mine;
     const bar = $("pin-bar");
@@ -654,17 +672,62 @@ $("doc-bar-cancel").addEventListener("click", () => { docDismissed = true; updat
 // 必须优先取文字——粘进来就是文字，不超限直接按文字发送，绝不能变成图片；
 // 将来做图片粘贴时，图片分支也只处理剪贴板里没有文字的纯图片（如截图）。
 $("input").addEventListener("paste", () => setTimeout(updateDocBar, 0));
-// 粘贴图片：仅当剪贴板里没有文字时才走图片分支（带文字的粘贴永远优先文字，见上方注释）。
-$("input").addEventListener("paste", async (e) => {
-  const cd = e.clipboardData;
-  if (!cd) return;
-  const text = cd.getData("text/plain");
-  if (text && text.trim()) return;
-  const item = Array.from(cd.items || []).find((i) => i.kind === "file" && i.type.startsWith("image/"));
-  if (!item) return;
-  e.preventDefault();
-  const file = item.getAsFile();
-  if (!file) return;
+
+// ---------- 待发文件队列（多文件批量发送，用户 2026-11-20 定版） ----------
+// 附件按钮多选、输入框粘贴文件、拖放文件三个入口都汇入这条队列；
+// 点发送时按顺序逐个传（每个文件一条文件消息、各自进度），单个失败
+// 提示并跳过、不堵住后面。发送前可在附件条逐个移除、也可一键清空。
+function renderAttachBar() {
+  const bar = $("attach-bar");
+  const list = $("attach-list");
+  list.innerHTML = "";
+  for (const f of state.pendingFiles) {
+    const chip = document.createElement("span");
+    chip.className = "attach-chip";
+    const label = document.createElement("span");
+    label.className = "attach-name";
+    label.textContent = `${f.name} · ${fmtSize(f.size)}`;
+    label.title = f.path;
+    const x = document.createElement("button");
+    x.className = "attach-x";
+    x.textContent = "×";
+    x.title = "移除";
+    x.addEventListener("click", () => {
+      state.pendingFiles = state.pendingFiles.filter((q) => q.path !== f.path);
+      renderAttachBar();
+    });
+    chip.appendChild(label);
+    chip.appendChild(x);
+    list.appendChild(chip);
+  }
+  bar.classList.toggle("hidden", state.pendingFiles.length === 0);
+}
+$("attach-clear").addEventListener("click", () => {
+  state.pendingFiles = [];
+  renderAttachBar();
+});
+
+/** 把一批路径逐个校验入队（不存在/不是文件 → 提示并跳过，不连累其余）；
+ * 同路径重复添加自动去重。返回实际入队数量。 */
+async function stageFilePaths(paths) {
+  let added = 0;
+  for (const path of paths || []) {
+    if (!path || state.pendingFiles.some((q) => q.path === path)) continue;
+    try {
+      const info = await invoke("file_attach_info", { path });
+      state.pendingFiles.push({ path, name: info.name, size: info.size });
+      added++;
+    } catch (err) {
+      const base = String(path).split(/[\\/]/).pop() || path;
+      showToast(`无法添加「${base}」：${err}`);
+    }
+  }
+  if (added) renderAttachBar();
+  return added;
+}
+
+/** 粘贴的图片位图落盘入队（截图粘贴的老路径，行为与旧版一致）。 */
+async function stagePastedImageFile(file) {
   try {
     const buf = await file.arrayBuffer();
     const bytes = new Uint8Array(buf);
@@ -674,29 +737,76 @@ $("input").addEventListener("paste", async (e) => {
     }
     const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
     const path = await invoke("stage_pasted_image", { dataBase64: btoa(bin), ext });
-    state.stagedImage = { path, size: file.size };
-    $("attach-text").textContent = `粘贴的图片.${ext} · ${fmtSize(file.size)}（点发送时一并发给对方）`;
-    $("attach-bar").classList.remove("hidden");
+    state.pendingFiles.push({ path, name: `粘贴的图片.${ext}`, size: file.size });
+    renderAttachBar();
   } catch (err) { showToast("粘贴图片失败：" + err); }
-});
-$("attach-remove").addEventListener("click", () => {
-  state.stagedImage = null;
-  $("attach-bar").classList.add("hidden");
+}
+
+// 粘贴分流（定版规则，2026-11-18 + 2026-11-20 合并）：
+// ①剪贴板带普通文字 → 文字优先，永远按文字粘（Excel 等场景），不处理；
+// ②带文件对象 → 文件优先：向系统剪贴板要真实路径（文件管理器里复制
+//   的文件），逐个入待发队列，绝不把文件路径当文字粘进输入框；
+// ③没有文件对象路径但有一张图片位图 → 截图粘贴，落盘入队（旧规则）；
+// ④其余（平台读不到文件列表/虚拟文件）→ 诚实提示，不粘任何东西。
+// 注意：文件对象在各 WebView 的 DataTransfer 里暴露程度不一（WebKitGTK
+// 对 uri-list 剪贴板甚至既不给 text 也不给 files），故分流的权威来源是
+// 后端读到的系统剪贴板文件列表；同步先 preventDefault 掐掉默认粘贴
+// （防 uri 文本被塞进输入框），再异步定性。文字若长得纯像路径列表，
+// 也先拦下核对：剪贴板真有文件对象才按文件走，否则按文字粘回。
+function insertTextAtCursor(text) {
+  const ta = $("input");
+  const s = ta.selectionStart ?? ta.value.length;
+  const e2 = ta.selectionEnd ?? ta.value.length;
+  ta.value = ta.value.slice(0, s) + text + ta.value.slice(e2);
+  ta.selectionStart = ta.selectionEnd = s + text.length;
+  ta.dispatchEvent(new Event("input", { bubbles: true }));
+  autoGrow(ta);
+}
+$("input").addEventListener("paste", async (e) => {
+  const cd = e.clipboardData;
+  if (!cd) return;
+  const text = cd.getData("text/plain") || "";
+  const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const pathListOnly = lines.length > 0
+    && lines.every((l) => /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(l));
+  if (text.trim() && !pathListOnly) return; // 普通文字：原样粘贴
+  const fileItems = Array.from(cd.items || []).filter((i) => i.kind === "file");
+  // 无文字（或纯路径样文字）一律先同步拦下默认粘贴，再异步定性：
+  // DataTransfer 对文件对象的暴露各引擎不一（WebKitGTK 对 uri-list
+  // 剪贴板甚至什么都不给），权威来源是后端读到的系统剪贴板。
+  e.preventDefault();
+  let paths = null;
+  try { paths = await invoke("clipboard_file_list"); } catch (_) { paths = null; }
+  if (paths && paths.length) { await stageFilePaths(paths); return; }
+  if (pathListOnly) { insertTextAtCursor(text); return; } // 只是像路径的文字
+  const img = fileItems.find((i) => i.type.startsWith("image/"));
+  if (img) {
+    const f = img.getAsFile();
+    if (f) { await stagePastedImageFile(f); return; }
+  }
+  if (fileItems.length || (cd.files && cd.files.length)) {
+    showToast(paths === null ? "此系统暂未支持粘贴文件，请用附件按钮选择" : "未能读取粘贴的文件，已忽略");
+  }
 });
 
 async function sendCurrent() {
   const raw = $("input").value;
   const text = raw.trim();
-  if (!text && !state.stagedImage) return;
-  // 暂存的粘贴图片先发（文件气泡由后端事件回推，与选文件发送一致）
-  if (state.stagedImage) {
-    const img = state.stagedImage;
-    state.stagedImage = null;
-    $("attach-bar").classList.add("hidden");
+  if (!text && !state.pendingFiles.length) return;
+  // 待发文件队列先逐个发（文件气泡由后端事件回推，与选文件发送一致；
+  // 每个文件一条消息、各自进度；单个失败提示并跳过、不堵住后面）
+  if (state.pendingFiles.length) {
+    const queue = state.pendingFiles;
     if (!state.connected) {
-      showToast("尚未连接设备，图片未发送");
+      // 未连接时保留队列（连上后点发送即可），只提示不清空
+      showToast("尚未连接设备，文件未发送");
     } else {
-      invoke("send_file_path", { path: img.path }).catch((e) => showToast("图片发送失败：" + e));
+      state.pendingFiles = [];
+      renderAttachBar();
+      for (const f of queue) {
+        try { await invoke("send_file_path", { path: f.path }); }
+        catch (e) { showToast(`文件「${f.name}」发送失败：${e}`); }
+      }
     }
     if (!text) {
       $("input").value = ""; autoGrow($("input"));
@@ -765,9 +875,11 @@ $("input").addEventListener("input", () => {
 
 $("btn-file").addEventListener("click", async () => {
   try {
-    const path = await window.__TAURI__.dialog.open({ multiple: false, directory: false });
-    if (!path) return;
-    invoke("send_file_path", { path }).catch((e) => showToast("文件发送失败：" + e));
+    // 多选入待发队列（与粘贴/拖放同一条队列，点发送键统一逐个发）
+    const picked = await window.__TAURI__.dialog.open({ multiple: true, directory: false });
+    if (!picked) return;
+    await stageFilePaths(Array.isArray(picked) ? picked : [picked]);
+    $("input").focus();
   } catch (e) { showToast("选择文件失败：" + e); }
 });
 
@@ -1486,7 +1598,16 @@ async function refreshFavIds() {
 async function toggleMark(mid, kind) {
   try {
     const on = await invoke("toggle_mark", { messageId: mid, kind });
-    if (kind === "pin") refreshPinBar();
+    if (kind === "pin") {
+      // 补反馈（v2.5.2，与收藏同口径）：旧版置顶落库没问题、置顶栏也会
+      // 刷新，但没 toast、按钮与菜单文案纹丝不动，用户感觉「跟没起效
+      // 一样」（2026-11-20 实报）。现在触发点立刻变已置顶态 + toast，
+      // 取消同理复原；置顶栏随后端数据刷新（await 到位再返回）。
+      if (on) state.pinIds.add(mid); else state.pinIds.delete(mid);
+      document.querySelectorAll(`[data-mid="${mid}"] .pin-btn`).forEach((b) => paintPinBtn(b, on));
+      showToast(on ? "已置顶" : "已取消置顶");
+      await refreshPinBar();
+    }
     if (kind === "favorite") {
       // 补反馈（v2.5.1）：旧版收藏落库没问题但界面纹丝不动，看起来像没用。
       // 现在触发点立刻变已收藏态 + toast，取消同理复原。
@@ -1598,7 +1719,7 @@ function openMsgMenu(m, x, y) {
   const items = [
     ["复制", () => copyText(m.body)],
     ["收藏", () => toggleMark(m.id, "favorite")],
-    ["置顶", () => toggleMark(m.id, "pin")],
+    [state.pinIds.has(m.id) ? "取消置顶" : "置顶", () => toggleMark(m.id, "pin")],
     ["引用", () => setReply(m)],
     ["问AI", () => askAiAbout(m)],
   ];
@@ -1627,6 +1748,19 @@ async function openFileMenu(mid, x, y) {
     ["打开", exists, async () => { await invoke("open_file", { path: info.path }); }, ""],
     ["打开文件位置", exists, async () => { await invoke("reveal_file", { path: info.path }); }, ""],
     ["复制文件", exists, async () => {
+      // 首选后端原生实现：Windows 写 CF_HDROP 文件本体（等同资源管理器
+      // Ctrl+C，用户 2026-11-20 要求，Windows 上不再回退路径）；后端
+      // 报 UNSUPPORTED 的平台（macOS/Linux 现状）维持旧有回退链。
+      try {
+        await invoke("copy_file_to_clipboard", { path: info.path });
+        showToast("已复制文件");
+        return;
+      } catch (e) {
+        if (!String(e).startsWith("UNSUPPORTED")) {
+          showToast("复制失败：" + e);
+          return;
+        }
+      }
       try {
         const resp = await fetch("file://" + encodeURI(info.path));
         const blob = await resp.blob();
@@ -1866,6 +2000,7 @@ $("search-input").addEventListener("input", () => {
 // ---------- AI ----------
 async function loadAiMessages() {
   await refreshFavIds();
+  await refreshPinIds();
   const msgs = await invoke("list_messages", { conversationId: state.aiConvId, limit: 200 });
   const container = $("ai-messages");
   container.innerHTML = "";
@@ -2383,6 +2518,14 @@ async function wireEvents() {
     if (m.conversation_id === state.aiConvId) appendMessage($("ai-messages"), m, state.renderedAi, { ai: true });
     else { appendMessage($("messages"), m, state.renderedChat, {}); rebuildDateRail(); }
   });
+  await listen("notification_activated", (e) => {
+    // 点系统通知（Windows WinRT 激活回调）回窗：后端已把窗口带回前台，
+    // 这里只负责打开对应会话（设备会话回聊天页，AI 会话回 AI 页）。
+    const cid = e.payload && e.payload.conversation_id;
+    if (cid && (cid === state.aiConvId || cid.startsWith("ai"))) { switchView("ai"); return; }
+    switchView("chat");
+    if (state.connected) loadChatMessages();
+  });
   await listen("message_status", (e) => {
     // 回执可能早于本地回显气泡渲染到达：找不到元素时稍后重试一次，避免状态标签停在「已发送」
     const apply = () => {
@@ -2458,7 +2601,15 @@ async function wireEvents() {
       setTimeout(() => {
         if (bar) bar.classList.add("hidden");
         if (meta) meta.classList.add("hidden");
-      }, 900);
+      }, 400);
+    } else if (tstate === "verifying") {
+      // 片已发完/收完、等校验结果：明说在等什么，不在 100% 干挂着
+      if (bar) bar.classList.remove("hidden");
+      if (meta) {
+        meta.classList.remove("hidden");
+        const mine = b.closest(".msg-row")?.dataset.sender === "me";
+        meta.textContent = mine ? "已发送，等待对方校验…" : "已收完，正在校验…";
+      }
     } else if (tstate === "cancelled") {
       if (meta) { meta.classList.remove("hidden"); meta.textContent = "已取消"; }
       if (retry) retry.classList.remove("hidden");
@@ -2504,6 +2655,126 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
     applyTheme(b.dataset.themeSet);
   }));
 
+// ---------- 软件更新（v2.5.2）：仅手动触发，平时绝不自动联网检查 ----------
+// 流程：点「检查更新」→ 查 GitHub 已发布版 latest.json（草稿不会被推送）→
+// 已是最新给明确提示；发现新版弹窗（版本号+说明节选）→「立即更新」下载
+// （进度条；下载中可取消——插件下载无法中途掐断，取消=放弃，下载完不安装）→
+// 下载完成再确认 → 安装并自动重启。签名校验由 updater 插件按公钥执行。
+let updHandle = null;   // check() 返回的 Update 对象
+let updPhase = "idle";  // idle | found | downloading | downloaded | installing
+let updAbandoned = false;
+
+function updSetStatus(text) { $("update-status").textContent = text; }
+function friendlyUpdError(e) {
+  const s = String((e && e.message) || e || "");
+  if (/404|not found/i.test(s)) return "暂无可用的更新信息";
+  if (/network|error sending request|dns|connect|timed out/i.test(s)) return "网络不可用";
+  return s.slice(0, 80) || "未知错误";
+}
+
+$("btn-check-update").addEventListener("click", async () => {
+  const btn = $("btn-check-update");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  updSetStatus("正在检查更新…");
+  try {
+    const updater = window.__TAURI__.updater;
+    if (!updater || !updater.check) throw new Error("更新组件不可用");
+    const update = await updater.check();
+    if (!update) {
+      updSetStatus("已是最新版本");
+      showToast("已是最新版本");
+      return;
+    }
+    updHandle = update;
+    updPhase = "found";
+    updAbandoned = false;
+    $("update-title").textContent = `发现新版本 v${update.version}`;
+    const notes = (update.body || "").trim();
+    $("update-notes").textContent = notes ? notes.slice(0, 600) : "（此版本未附更新说明）";
+    $("update-progress-wrap").classList.add("hidden");
+    $("update-action").textContent = "立即更新";
+    $("update-action").disabled = false;
+    $("update-cancel").textContent = "以后再说";
+    $("update-cancel").disabled = false;
+    $("update-modal").classList.remove("hidden");
+    updSetStatus(`发现新版本 v${update.version}`);
+  } catch (e) {
+    updSetStatus("检查失败，请稍后再试");
+    showToast("检查更新失败：" + friendlyUpdError(e));
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("update-cancel").addEventListener("click", () => {
+  if (updPhase === "downloading") { updAbandoned = true; updSetStatus("已取消更新"); }
+  if (updPhase === "found") updSetStatus("仅手动检查，不会自动联网");
+  $("update-modal").classList.add("hidden");
+});
+
+$("update-action").addEventListener("click", async () => {
+  if (!updHandle) return;
+  if (updPhase === "found") {
+    updPhase = "downloading";
+    updAbandoned = false;
+    $("update-action").disabled = true;
+    $("update-cancel").textContent = "取消";
+    $("update-progress-wrap").classList.remove("hidden");
+    const bar = $("update-progress-bar");
+    const text = $("update-progress-text");
+    bar.style.width = "0%";
+    text.textContent = "正在下载…";
+    let total = 0;
+    let got = 0;
+    try {
+      await updHandle.download((ev) => {
+        if (ev.event === "Started") { total = ev.data.contentLength || 0; }
+        else if (ev.event === "Progress") {
+          got += ev.data.chunkLength || 0;
+          if (total > 0) {
+            const pct = Math.min(100, Math.round((got / total) * 100));
+            bar.style.width = pct + "%";
+            text.textContent = `正在下载… ${pct}%`;
+          } else {
+            text.textContent = `正在下载… ${Math.round(got / 1024)} KB`;
+          }
+        }
+      });
+    } catch (e) {
+      updPhase = "found";
+      $("update-action").disabled = false;
+      $("update-progress-wrap").classList.add("hidden");
+      showToast("下载失败：" + friendlyUpdError(e));
+      return;
+    }
+    if (updAbandoned) { updPhase = "idle"; updHandle = null; return; }
+    updPhase = "downloaded";
+    $("update-title").textContent = "下载完成";
+    $("update-notes").textContent = "新版本已下载完成。点「安装并重启」将自动完成安装并重新打开 BlueLink。";
+    $("update-progress-wrap").classList.add("hidden");
+    $("update-action").textContent = "安装并重启";
+    $("update-action").disabled = false;
+    $("update-cancel").textContent = "以后再说";
+    updSetStatus("新版本已下载，待安装");
+  } else if (updPhase === "downloaded") {
+    updPhase = "installing";
+    $("update-action").disabled = true;
+    $("update-cancel").disabled = true;
+    $("update-action").textContent = "正在安装…";
+    try {
+      await updHandle.install();
+      await invoke("restart_app");
+    } catch (e) {
+      updPhase = "downloaded";
+      $("update-action").disabled = false;
+      $("update-cancel").disabled = false;
+      $("update-action").textContent = "安装并重启";
+      showToast("安装失败：" + friendlyUpdError(e));
+    }
+  }
+});
+
 // ---------- 启动 ----------
 (async function init() {
   applyTheme(localStorage.getItem("bl-theme") || "system");
@@ -2528,18 +2799,18 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
   invoke("get_bt_transport").then((t) => { btTransport = t; syncTransportSeg(); }).catch(() => {});
   // 事件订阅失败不能拖垮其余启动流程（v2.0.0 曾因缺权限配置导致实时事件全灭）。
   try { await wireEvents(); } catch (e) { console.error("事件订阅失败", e); }
-  // 拖拽文件到窗口直接发送（需已连接）；拖放提示层只做视觉提示，不拦截事件。
+  // 拖拽文件到窗口：入待发队列（与附件按钮/粘贴同一条队列，点发送键
+  // 统一逐个发；旧版是拖放即直发，2026-11-20 批量队列定版后统一口径）。
+  // 拖放提示层只做视觉提示，不拦截事件。
   try {
-    await window.__TAURI__.webview.getCurrentWebview().onDragDropEvent((e) => {
+    await window.__TAURI__.webview.getCurrentWebview().onDragDropEvent(async (e) => {
       const p = e.payload || {};
       if (p.type === "enter" || p.type === "over") {
         $("drop-overlay").classList.remove("hidden");
       } else if (p.type === "drop") {
         $("drop-overlay").classList.add("hidden");
-        if (!state.connected) { showToast("尚未连接设备，无法发送文件"); return; }
-        for (const path of p.paths || []) {
-          invoke("send_file_path", { path }).catch((err) => showToast("文件发送失败：" + err));
-        }
+        const added = await stageFilePaths(p.paths || []);
+        if (added) showToast(`已添加 ${added} 个文件，点发送键发送`);
       } else {
         $("drop-overlay").classList.add("hidden");
       }

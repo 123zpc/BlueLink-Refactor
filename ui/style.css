@@ -178,9 +178,10 @@ section { display: flex; flex-direction: column; height: 100%; }
 .panel-foot { margin-top: auto; padding-top: 12px; flex: none; }
 
 /* 右栏：滚动列（与左栏同顶同底；卡片依次排，超高栏内滚动）。
-   2026-11-19 用户新规矩：默认正常状态下右栏不出现滚动条——卡间距/内边距/行高已按
-   默认窗口（1180×760）收紧到各常态卡栈完整塞下；overflow-y:auto 只作自适应兜底
-   （窗口变矮、开发者模式多一张卡等内容变多时才滚）。 */
+   2026-11-19 用户规矩：默认正常状态下右栏不出现滚动条——常态卡栈须在
+   出厂默认窗口（900×600，2026-11-20 窗口纠正后）完整塞下，矮窗紧凑
+   规则见文件末尾 @media (max-height: 680px)；overflow-y:auto 只作自适应
+   兜底（开发者模式多一张卡等内容变多时才滚）。 */
 .connect-side { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; min-height: 0; padding-right: 2px; }
 .side-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 11px 16px; flex: none; }
 .side-card-title { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
@@ -513,9 +514,18 @@ section { display: flex; flex-direction: column; height: 100%; }
 #back-to-reply { position: absolute; right: 18px; bottom: 160px; z-index: 8; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); }
 #btn-bottom { position: absolute; right: 18px; bottom: 118px; z-index: 8; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); }
 
-#attach-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; margin-bottom: 6px;
+#attach-bar { display: flex; align-items: flex-start; gap: 8px; padding: 6px 10px; margin-bottom: 6px;
   background: var(--accent-soft); border-radius: 8px; font-size: 12.5px; }
 #attach-bar.hidden { display: none; }
+/* 待发文件队列（多文件批量发送）：每个文件一枚 chip，可单独移除、可清空 */
+#attach-list { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; }
+.attach-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 6px 2px 10px; max-width: 100%; }
+.attach-chip .attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attach-x { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 13px;
+  line-height: 1; padding: 2px 4px; border-radius: 999px; flex: none; }
+.attach-x:hover { color: var(--err); background: var(--hover); }
+#attach-clear { flex: none; }
 
 #file-menu { position: fixed; min-width: 168px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18); z-index: 40; padding: 4px; }
@@ -531,8 +541,12 @@ section { display: flex; flex-direction: column; height: 100%; }
   border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); cursor: pointer; }
 .msg-status.failed { color: #E11D48; cursor: pointer; text-decoration: underline; }
 
-#modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); z-index: 60; display: flex; align-items: center; justify-content: center; }
-#modal.hidden { display: none; }
+#modal, #update-modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); z-index: 60; display: flex; align-items: center; justify-content: center; }
+#modal.hidden, #update-modal.hidden { display: none; }
+#update-modal .modal-box { width: 400px; }
+#update-modal h3 { margin: 0 0 10px; font-size: 15px; }
+#update-notes { white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow-y: auto; font-size: 13px; }
+#update-progress-wrap { margin-bottom: 16px; }
 .modal-box { background: var(--panel); border-radius: 12px; padding: 20px; width: 340px; max-width: 90vw; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3); }
 .modal-box p { margin: 0 0 16px; font-size: 14px; line-height: 1.55; }
 .modal-btns { justify-content: flex-end; }
@@ -598,14 +612,20 @@ section { display: flex; flex-direction: column; height: 100%; }
 #btn-scan, .card-btns .btn, .device-panel-head b, #device-count { white-space: nowrap; }
 #btn-scan { flex: none; }
 
-/* 窄窗布局（≤1100px，用户 2026-11-19 真机截图裁定）：四列抢宽时两处收敛——
-   ①会话列表改浮层抽屉：absolute 盖在内容上（带阴影），不再占布局宽度；
-   悬浮开关的位置由 applyAside 按实测宽计算（收起 64 / 展开 64+288），
-   浮层模式下数值不变、行为不变。②连接页改单栏堆叠：右栏卡片流到设备
-   列表下方，整页纵向滚动。宽窗（>1100px）布局与定版原型完全一致。 */
+/* 窄窗布局（≤1100px，用户 2026-11-19 真机截图裁定）：会话列表改浮层
+   抽屉：absolute 盖在内容上（带阴影），不再占布局宽度；悬浮开关的
+   位置由 applyAside 按实测宽计算（收起 64 / 展开 64+288），浮层模式
+   下数值不变、行为不变。 */
 @media (max-width: 1100px) {
   #aside { position: absolute; left: 64px; top: 0; bottom: 0; z-index: 30;
     box-shadow: 10px 0 28px rgba(0, 0, 0, 0.20); }
+}
+
+/* 连接页单栏堆叠只在 760px 以下启用（2026-11-20 窗口纠正）：出厂最小
+   窗口 900×600 起必须保两栏——v2.5.1 前的 ≤1100px 堆叠会在 900 宽把
+   连接页压成纵向长滚动，正是用户纠正的「靠抬最小尺寸交差」的另一面。
+   760px 以下（小于最小窗口、仅嵌入/异常环境）才堆叠兜底。 */
+@media (max-width: 760px) {
   #connect-view { overflow-y: auto; }
   .connect-wrap { height: auto; min-height: 100%; }
   .connect-cols { grid-template-columns: minmax(0, 1fr); flex: none; }
@@ -613,4 +633,36 @@ section { display: flex; flex-direction: column; height: 100%; }
   #bt-device-list { max-height: 44vh; }
   .connect-side { overflow: visible; }
   .steps-card { flex: none; }
+}
+
+/* 矮窗紧凑（高度 ≤680px，覆盖出厂默认/最小 900×600）：连接页收紧密度，
+   保证浏览态与输码态在 600px 高下整页不滚动、全部卡片可见。只动连接
+   页自身的间距/字号，不删任何功能信息；开发者模式多一张卡时右栏仍可
+   滚动兜底（滚动条是自适应兜底的老规矩）。 */
+@media (max-height: 680px) {
+  #connect-view { padding: 6px 16px; }
+  .connect-head { margin-bottom: 4px; }
+  .connect-head h1 { font-size: 18px; }
+  .capsule { padding: 4px 12px; }
+  .connect-side { gap: 6px; }
+  /* 步骤卡在矮窗下允许微缩（吃掉舍入级溢出），避免 1–2px 溢出就出滚动条 */
+  .steps-card { flex: 1 1 auto; min-height: 0; }
+  .side-card { padding: 8px 14px; }
+  .side-card-title { margin-bottom: 4px; }
+  .side-name { font-size: 15px; line-height: 1.2; }
+  .my-code-big { font-size: 22px; letter-spacing: 2px; line-height: 1.1; }
+  .card-btns { margin-top: 6px; }
+  .side-divider { margin: 5px 0; }
+  .status-line { line-height: 1.35; padding: 0; }
+  .status-note { margin: 1px 0 2px 16px; }
+  .steps-list, #steps-guide { gap: 5px; line-height: 1.35; }
+  .step-title { margin-bottom: 1px; }
+  .step-row { font-size: 13px; }
+  .steps-foot .side-divider { margin-bottom: 6px; }
+  #bt-peer-code { padding: 6px 12px; }
+  .device-panel { padding: 12px 16px; }
+  .device-panel-head { margin-bottom: 8px; }
+  .bt-device, .bt-skeleton { padding: 9px 12px; margin-bottom: 8px; }
+  .bt-device-ico, .skel-ico { width: 34px; height: 34px; }
+  .panel-foot { padding-top: 8px; }
 }

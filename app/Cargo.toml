@@ -11,6 +11,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 # 单实例：托盘常驻时再点图标只唤出已有窗口，不起第二进程（防双开抢占经典蓝牙端口 7）
 tauri-plugin-single-instance = "2"
+# 软件更新（v2.5.2）：官方 updater 插件，仅设置页手动触发检查；签名公钥与
+# 端点在 tauri.conf.json 的 plugins.updater（端点只认 GitHub 已发布版）
+tauri-plugin-updater = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -19,6 +22,23 @@ bluelink-storage = { path = "../crates/storage" }
 bluelink-transport = { path = "../crates/transport" }
 bluelink-ai = { path = "../crates/ai" }
 bluelink-services = { path = "../crates/services" }
+
+# Windows 原生通知（v2.5.2，仅 Windows 编译）：WinRT toast + 点击激活回调
+# （win_notify 模块）。windows crate 只取用到的特性面；winreg 写每用户注册表
+# （AUMID/激活器 CLSID），免管理员、免改安装器。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Notifications",
+] }
+# #[implement] 宏展开直接引用 windows_core，需显式直依赖
+windows-core = "0.61"
+winreg = "0.55"
 
 [features]
 default = []

@@ -3,6 +3,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod local_api;
+mod win_clipboard;
+#[cfg(windows)]
+mod win_notify;
 
 use bluelink_ai::{AiClient, AiConfig, ChatMessage};
 use bluelink_domain::{
@@ -1242,6 +1245,47 @@ fn reveal_file(path: String) -> Result<(), String> {
     bluelink_services::reveal_file(std::path::Path::new(&path)).map_err(|e| e.to_string())
 }
 
+/// 把文件本体放进系统剪贴板（文件菜单「复制文件」）：Windows 写
+/// CF_HDROP（等同资源管理器 Ctrl+C，粘到文件夹里出来的是文件本身，
+/// 用户 2026-11-20 要求，路径回退在 Windows 作废）；其他平台返回
+/// UNSUPPORTED 错误，前端维持原有回退（见 win_clipboard 模块说明）。
+#[tauri::command]
+fn copy_file_to_clipboard(path: String) -> Result<(), String> {
+    win_clipboard::set_file_list(&[path.as_str()])
+}
+
+/// 读系统剪贴板里的文件列表（输入框粘贴文件时取真实路径）：在文件
+/// 管理器里复制文件后剪贴板里就是文件对象格式。Ok(空)=没有文件对象；
+/// UNSUPPORTED 错误=此平台暂未实现读取（见 win_clipboard 模块说明）。
+#[tauri::command]
+fn clipboard_file_list() -> Result<Vec<String>, String> {
+    win_clipboard::get_file_list()
+}
+
+/// 待发附件的入队校验信息：文件须存在且是普通文件，返回文件名与大小。
+#[derive(Serialize)]
+struct AttachInfo {
+    name: String,
+    size: u64,
+}
+
+#[tauri::command]
+fn file_attach_info(path: String) -> Result<AttachInfo, String> {
+    let p = std::path::Path::new(&path);
+    let meta = std::fs::metadata(p).map_err(|e| format!("文件不存在或不可读（{e}）"))?;
+    if !meta.is_file() {
+        return Err("不是文件（文件夹不能直接发送）".to_string());
+    }
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| "文件名无效".to_string())?;
+    Ok(AttachInfo {
+        name,
+        size: meta.len(),
+    })
+}
+
 /// 复制文件到目标路径（文件菜单「另存为」，目标由保存对话框选定）。
 #[tauri::command]
 fn copy_file_as(src: String, dst: String) -> Result<(), String> {
@@ -1414,14 +1458,52 @@ async fn set_local_api(
     Ok(())
 }
 
+/// 软件更新安装完成后的重启（v2.5.2，前端 updater 流程专用命令）。
+/// Linux 以 AppImage 运行时：updater 已把 $APPIMAGE 文件替换为新版，必须按
+/// AppImage 路径重新拉起（进程内 current_exe 指向挂载/解压的旧副本路径，
+/// 直接 restart 会启到旧版或失效路径）；其余情况走 Tauri 标准 restart。
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(img) = std::env::var("APPIMAGE") {
+            if !img.is_empty() {
+                let _ = std::process::Command::new(&img)
+                    .arg("--appimage-extract-and-run")
+                    .spawn();
+                app.exit(0);
+                return;
+            }
+        }
+    }
+    app.restart();
+}
+
+/// 通知被点击后的统一处理（v2.5.2）：把主窗口带回前台（托盘隐藏先恢复
+/// 显示、最小化先还原），并通知前端打开对应会话。Windows 由 WinRT 激活
+/// 回调调用（win_notify 模块）；其他平台暂无点击来源（官方通知插件在
+/// 桌面端没有点击回调）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn on_notification_activated(app: &AppHandle, conversation_id: &str) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+    let _ = app.emit(
+        "notification_activated",
+        serde_json::json!({ "conversation_id": conversation_id }),
+    );
+}
+
 /// 系统通知（v2.5.1）：收到对方新聊天消息时，仅当开关开且窗口不在前台
 /// （隐藏到托盘/最小化/失焦）才弹。窗口可见且有焦点 = 用户正看着应用，不弹。
 /// 只针对聊天新消息；连接/AI 等其他事件不弹。
-/// 注：tauri-plugin-notification 在桌面端不提供通知点击回调，点通知回窗
-/// 这一环桌面端无官方能力，未实现（如实记录，见 QA）。
+/// 发送通道（v2.5.2）：Windows 走原生 WinRT toast 并带点击激活回调（点通知
+/// 回窗并打开会话，见 win_notify）；其他平台仍走 tauri-plugin-notification
+/// （桌面端无点击回调，那些平台点通知回窗未实现，如实记录，见 QA）。
 fn maybe_notify_new_message(app: &AppHandle, node: &Arc<Node>, m: &Message) {
     use bluelink_domain::{MessageKind, Sender};
-    use tauri_plugin_notification::NotificationExt as _;
     if m.sender != Sender::Peer || m.kind == MessageKind::System {
         return;
     }
@@ -1469,7 +1551,13 @@ fn maybe_notify_new_message(app: &AppHandle, node: &Arc<Node>, m: &Message) {
             excerpt
         }
     };
-    let _ = app.notification().builder().title(title).body(body).show();
+    #[cfg(windows)]
+    win_notify::send(&title, &body, &m.conversation_id);
+    #[cfg(not(windows))]
+    {
+        use tauri_plugin_notification::NotificationExt as _;
+        let _ = app.notification().builder().title(title).body(body).show();
+    }
 }
 
 /// 把节点事件转发给前端（事件名与详细设计第三章一致）。
@@ -1578,7 +1666,12 @@ fn main() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Windows 原生通知（WinRT toast + 点击激活回调）尽早初始化：
+            // COM 激活类注册要赶在系统可能投递激活请求之前完成。
+            #[cfg(windows)]
+            win_notify::init(app.handle().clone());
             let data_dir = app.path().app_data_dir()?;
             let name = std::env::var("COMPUTERNAME")
                 .or_else(|_| std::env::var("HOSTNAME"))
@@ -1991,12 +2084,16 @@ fn main() {
             set_log_dir,
             get_sys_notify,
             set_sys_notify,
+            restart_app,
             clean_cache,
             clear_chat_history,
             file_info,
             open_file,
             reveal_file,
             copy_file_as,
+            copy_file_to_clipboard,
+            clipboard_file_list,
+            file_attach_info,
             stage_pasted_image,
             get_gateway_settings,
             set_proxy_allow,

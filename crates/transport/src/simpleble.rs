@@ -212,17 +212,34 @@ mod imp {
                 "simpleble",
                 &format!("连接步骤1/6 开始连接：目标 {device_id}"),
             );
-            let peripheral = self
-                .found
-                .lock()
-                .unwrap()
-                .map
-                .get(device_id)
-                .cloned()
-                .ok_or_else(|| {
-                    crate::probe::log("simpleble", "连接失败于步骤1/6：设备已不在扫描范围内");
-                    TransportError::Ble("设备已不在扫描范围内，请重新扫描".into())
-                })?;
+            // 目标不在扫描缓存时先等一等再判死（与 ble 路同口径）：断开后
+            // 对端恢复广播、扫描重新发现都需要几秒，旧版即时报错把立即
+            // 重连误杀了。最长等 10 秒、每 300ms 复查缓存。
+            let lookup_start = std::time::Instant::now();
+            let mut wait_logged = false;
+            let peripheral = loop {
+                let found = self.found.lock().unwrap().map.get(device_id).cloned();
+                if let Some(p) = found {
+                    break p;
+                }
+                if lookup_start.elapsed() >= std::time::Duration::from_secs(10) {
+                    crate::probe::log(
+                        "simpleble",
+                        "连接失败于步骤1/6：设备已不在扫描范围内（等待 10 秒仍未出现）",
+                    );
+                    return Err(TransportError::Ble(
+                        "设备已不在扫描范围内，请重新扫描".into(),
+                    ));
+                }
+                if !wait_logged {
+                    wait_logged = true;
+                    crate::probe::log_step(
+                        "simpleble",
+                        "连接步骤1/6：目标暂不在扫描缓存内，等待其重新出现（最长 10 秒）",
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            };
 
             // 连接事件流要在 connect 之前订阅，否则断开事件可能漏掉。
             let mut conn_events = peripheral.on_connection_event();

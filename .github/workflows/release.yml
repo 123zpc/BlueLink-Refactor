@@ -34,9 +34,14 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 更新签名私钥（无密码，故只配这一个 Secret）：tauri.conf.json 已开
+          # createUpdaterArtifacts，打包时据此产出各平台 .sig 与 latest.json；
+          # 缺这个 Secret 时签名步会失败——这是有意的，不许静默出无签名包。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "BlueLink ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
+          includeUpdaterJson: true
           args: ${{ runner.os == 'Windows' && '--features simpleble' || '' }}

@@ -17,6 +17,27 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 机器绑定设备 ID（2026-11-20 用户拍板）：以操作系统机器标识为锚
+/// 确定性派生设备 UUID——对规范化后的机器标识（去空白、转小写，加
+/// 域分隔前缀）做 SHA-256，取前 16 字节组装 UUID（版本位摆 5 表示
+/// 名字派生、变体位摆 10xx）。同一台机器永远得到同一个 ID，与应用
+/// 数据目录无关：卸载重装、清数据后设备 ID 与连接码都不再变化。
+/// 原始机器标识只在本机参与计算，绝不外发（握手走派生 UUID 与
+/// 连接码，同旧版）。不拿蓝牙 MAC 当锚：适配器禁用/更换/未就绪都会
+/// 让结果漂移。
+pub fn machine_bound_device_id(machine_id: &str) -> String {
+    let normalized = machine_id.trim().to_lowercase();
+    let digest = Sha256::digest(format!("bluelink-device-id-v1:{normalized}").as_bytes());
+    let mut b: [u8; 16] = digest[..16].try_into().expect("SHA-256 至少 16 字节");
+    b[6] = (b[6] & 0x0f) | 0x50; // 版本位：5（名字派生）
+    b[8] = (b[8] & 0x3f) | 0x80; // 变体位：10xx
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
+        b[14], b[15]
+    )
+}
+
 /// 由设备 ID 派生 6 位连接码（详细设计 1.3）：SHA-256 前 8 字节取模 1,000,000。
 pub fn connection_code(device_id: &str) -> String {
     let digest = Sha256::digest(device_id.as_bytes());
@@ -243,6 +264,41 @@ pub fn covered_bytes(received: &Ranges) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 机器绑定设备id确定性与格式() {
+        let guid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"; // 形态如 Windows MachineGuid
+        let a = machine_bound_device_id(guid);
+        // 确定性：同输入同输出；空白/大小写差异不影响（规范化）
+        assert_eq!(a, machine_bound_device_id(guid));
+        assert_eq!(
+            a,
+            machine_bound_device_id("  3F2504E0-4F89-11D3-9A0C-0305E82C3301\n")
+        );
+        // 不同机器标识得出不同 ID
+        assert_ne!(
+            a,
+            machine_bound_device_id("7c9e6679-7425-40de-944d-e07fc1f90ae7")
+        );
+        assert_ne!(
+            a,
+            machine_bound_device_id("0123456789abcdef0123456789abcdef")
+        );
+        // UUID 格式合法：36 字符、连字符位置、版本位 5、变体位 8/9/a/b，
+        // 且能被 uuid 解析、与连接码公式衔接（6 位数字）
+        assert_eq!(a.len(), 36);
+        let chars: Vec<char> = a.chars().collect();
+        for i in [8, 13, 18, 23] {
+            assert_eq!(chars[i], '-', "连字符应在 {i} 位：{a}");
+        }
+        assert_eq!(chars[14], '5', "版本位应为 5：{a}");
+        assert!(
+            ['8', '9', 'a', 'b'].contains(&chars[19]),
+            "变体位应为 8/9/a/b：{a}"
+        );
+        assert!(uuid::Uuid::parse_str(&a).is_ok());
+        assert_eq!(connection_code(&a).len(), 6);
+    }
 
     #[test]
     fn 连接码是稳定的六位数字() {
