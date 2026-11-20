@@ -130,7 +130,7 @@ pub fn parse_hdrop_data(data: &[u8]) -> Vec<String> {
 /// Err 以 UNSUPPORTED 开头表示此平台暂未实现读取（前端据此给诚实提示）。
 #[cfg(windows)]
 pub fn get_file_list() -> Result<Vec<String>, String> {
-    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
+    use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     const CF_HDROP_ID: u32 = 15;
@@ -145,7 +145,7 @@ pub fn get_file_list() -> Result<Vec<String>, String> {
                 return Ok(Vec::new());
             }
             let hg = HGLOBAL(handle.0);
-            let size = GlobalSize(Some(hg));
+            let size = GlobalSize(hg);
             let ptr = GlobalLock(hg);
             if ptr.is_null() {
                 return Err("锁定剪贴板内存失败".to_string());
