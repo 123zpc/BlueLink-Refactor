@@ -8,7 +8,8 @@ pub use log::log_line;
 use bluelink_ai::{AiClient, AiConfig, ChatMessage};
 use bluelink_domain::*;
 use bluelink_protocol::{
-    ClipboardImage, Control, FileChunk, Frame, CHUNK_SIZE, COMP_NONE, COMP_ZLIB_LEGACY, COMP_ZSTD,
+    ClipboardImage, Control, FileChunk, Frame, GroupRef, CHUNK_SIZE, COMP_NONE, COMP_ZLIB_LEGACY,
+    COMP_ZSTD,
 };
 use bluelink_storage::Storage;
 use bluelink_transport::Conn;
@@ -49,6 +50,9 @@ pub enum Event {
         peer_name: Option<String>,
     },
     MessageNew(Message),
+    /// 已有消息的内容发生变化（图片组接收端逐张追加清单时用）：
+    /// 前端按 id 找到已渲染行并重建该行，位置（seq）不变。
+    MessageUpdated(Message),
     MessageStatus {
         id: String,
         status: MessageStatus,
@@ -206,6 +210,18 @@ pub fn sha256_file(path: &Path) -> Result<String, ServiceError> {
 }
 
 /// 由文件哈希与对端设备派生稳定的传输 ID：同一文件重发时复用，实现断点续传。
+/// run_file_transfer 的结果：Done=走完校验（ok 为校验结论，附空中
+/// 字节/是否压缩/起始时刻供日志），Cancelled=被取消（收尾已在内部完成）。
+enum TransferRun {
+    Done {
+        ok: bool,
+        wire_bytes: u64,
+        used_compression: bool,
+        started: std::time::Instant,
+    },
+    Cancelled,
+}
+
 pub fn derive_transfer_id(file_sha: &str, peer_id: &str) -> String {
     let d = Sha256::digest(format!("{file_sha}:{peer_id}").as_bytes());
     format!(
@@ -1009,9 +1025,19 @@ impl Node {
                 size,
                 sha256,
                 mime,
+                group,
             }) => {
-                self.on_file_offer(session, transfer_id, msg_id, name, size, sha256, mime)
-                    .await?;
+                self.on_file_offer(
+                    session,
+                    transfer_id,
+                    msg_id,
+                    name,
+                    size,
+                    sha256,
+                    mime,
+                    group,
+                )
+                .await?;
             }
             Frame::Control(Control::FileAccept {
                 transfer_id,
@@ -1220,6 +1246,32 @@ impl Node {
                 let path = PathBuf::from(&meta.path);
                 tokio::spawn(async move {
                     let _ = node.send_file(&path).await;
+                });
+                Ok(())
+            }
+            MessageKind::ImageGroup => {
+                // 组重发：按清单收集仍在原位的成员文件，整组重新发出
+                // （生成新组消息，与文件重发的口径一致）；只剩一张时
+                // 退化为普通文件发送；一张都不在则明确报错。
+                let mut paths = Vec::new();
+                for it in parse_group_manifest(&m.body) {
+                    if let Some(meta) = self.storage.get_file(&it.file_id)? {
+                        let p = PathBuf::from(&meta.path);
+                        if !meta.path.is_empty() && p.exists() {
+                            paths.push(p);
+                        }
+                    }
+                }
+                if paths.is_empty() {
+                    return Err(ServiceError::Other("原图片已不存在，无法重发".into()));
+                }
+                let node = self.clone();
+                tokio::spawn(async move {
+                    let _ = if paths.len() == 1 {
+                        node.send_file(&paths[0]).await.map(|_| ())
+                    } else {
+                        node.send_image_group(&paths).await.map(|_| ())
+                    };
                 });
                 Ok(())
             }
@@ -1561,6 +1613,80 @@ impl Node {
         msg.seq = self.storage.insert_message(&msg)?;
         self.emit(Event::MessageNew(msg.clone()));
 
+        match self
+            .run_file_transfer(
+                &session,
+                path,
+                name.clone(),
+                size,
+                sha.clone(),
+                transfer_id.clone(),
+                msg.id.clone(),
+                None,
+            )
+            .await?
+        {
+            TransferRun::Cancelled => Ok(transfer_id),
+            TransferRun::Done {
+                ok,
+                wire_bytes,
+                used_compression,
+                started,
+            } => {
+                if ok {
+                    log::log_line(
+                        "files",
+                        &format!(
+                            "文件发送完成：{name}，原始 {size} 字节，空中 {wire_bytes} 字节，耗时 {} 毫秒，压缩 {}",
+                            started.elapsed().as_millis(),
+                            if used_compression { COMPRESSION_LABEL } else { "无" },
+                        ),
+                    );
+                    self.storage
+                        .update_message_status(&msg.id, MessageStatus::Delivered)?;
+                    // 状态事件补发：文件消息没有 Delivered 控制帧回执，
+                    // 不发事件前端气泡会一直停在「发送中」（v2.5.2 前的老缺口）
+                    self.emit(Event::MessageStatus {
+                        id: msg.id.clone(),
+                        status: MessageStatus::Delivered,
+                    });
+                    self.emit(Event::TransferState {
+                        transfer_id: transfer_id.clone(),
+                        state: "done".into(),
+                    });
+                } else {
+                    self.storage
+                        .update_message_status(&msg.id, MessageStatus::Failed)?;
+                    self.emit(Event::MessageStatus {
+                        id: msg.id.clone(),
+                        status: MessageStatus::Failed,
+                    });
+                    self.emit(Event::TransferState {
+                        transfer_id: transfer_id.clone(),
+                        state: "verify_failed".into(),
+                    });
+                }
+                Ok(transfer_id)
+            }
+        }
+    }
+
+    /// 单个文件的线上发送主体（要约→确认→分片→校验）：send_file 与
+    /// send_image_group 共用。msg_id 是进度/状态事件的回指 ID（单文件
+    /// 时是文件消息 ID，图片组时是成员 ID）；group 为图片组归属。
+    /// 本函数不碰消息状态——调用方按结果收尾（组消息是多成员聚合）。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_file_transfer(
+        &self,
+        session: &Arc<PeerSession>,
+        path: &Path,
+        name: String,
+        size: u64,
+        sha: String,
+        transfer_id: String,
+        msg_id: String,
+        group: Option<GroupRef>,
+    ) -> Result<TransferRun, ServiceError> {
         // 等待对方的已收区间（续传）
         let (tx, rx) = oneshot::channel();
         self.accept_waiters
@@ -1571,11 +1697,12 @@ impl Node {
             .conn
             .send(&Frame::Control(Control::FileOffer {
                 transfer_id: transfer_id.clone(),
-                msg_id: msg.id.clone(),
+                msg_id: msg_id.clone(),
                 name: name.clone(),
                 size,
                 sha256: sha,
                 mime: None,
+                group,
             }))
             .await?;
         let received = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
@@ -1583,13 +1710,13 @@ impl Node {
             .map_err(|_| ServiceError::Other("等待对方接收确认超时".into()))?
             .map_err(|_| ServiceError::Other("对方接收通道已关闭".into()))?;
         if self.take_cancelled(&transfer_id).await {
-            self.finish_cancelled(&transfer_id, &msg.id).await;
-            return Ok(transfer_id);
+            self.finish_cancelled(&transfer_id, &msg_id).await;
+            return Ok(TransferRun::Cancelled);
         }
         let missing = missing_ranges(&received, size);
         self.emit(Event::TransferProgress {
             transfer_id: transfer_id.clone(),
-            msg_id: msg.id.clone(),
+            msg_id: msg_id.clone(),
             received: covered_bytes(&received),
             total: size,
         });
@@ -1605,8 +1732,8 @@ impl Node {
             file.seek(SeekFrom::Start(start))?;
             while offset < end {
                 if self.take_cancelled(&transfer_id).await {
-                    self.finish_cancelled(&transfer_id, &msg.id).await;
-                    return Ok(transfer_id);
+                    self.finish_cancelled(&transfer_id, &msg_id).await;
+                    return Ok(TransferRun::Cancelled);
                 }
                 let want = ((end - offset) as usize).min(CHUNK_SIZE);
                 let mut buf = vec![0u8; want];
@@ -1630,7 +1757,7 @@ impl Node {
                 sent_total += want as u64;
                 self.emit(Event::TransferProgress {
                     transfer_id: transfer_id.clone(),
-                    msg_id: msg.id.clone(),
+                    msg_id: msg_id.clone(),
                     received: sent_total,
                     total: size,
                 });
@@ -1658,30 +1785,122 @@ impl Node {
             .await
             .map_err(|_| ServiceError::Other("等待校验结果超时".into()))?
             .map_err(|_| ServiceError::Other("校验通道已关闭".into()))?;
-        if ok {
-            log::log_line(
-                "files",
-                &format!(
-                    "文件发送完成：{name}，原始 {size} 字节，空中 {wire_bytes} 字节，耗时 {} 毫秒，压缩 {}",
-                    send_started.elapsed().as_millis(),
-                    if used_compression { COMPRESSION_LABEL } else { "无" },
-                ),
-            );
-            self.storage
-                .update_message_status(&msg.id, MessageStatus::Delivered)?;
-            self.emit(Event::TransferState {
-                transfer_id: transfer_id.clone(),
-                state: "done".into(),
-            });
-        } else {
-            self.storage
-                .update_message_status(&msg.id, MessageStatus::Failed)?;
-            self.emit(Event::TransferState {
-                transfer_id: transfer_id.clone(),
-                state: "verify_failed".into(),
-            });
+        Ok(TransferRun::Done {
+            ok,
+            wire_bytes,
+            used_compression,
+            started: send_started,
+        })
+    }
+
+    /// 发送图片组：多张图片合并为一条消息（v2.6.0）。先把成员清单
+    /// （文件 ID/名/大小/哈希）落成一条 ImageGroup 消息，再逐个成员走
+    /// 普通文件传输（FileOffer 带 group 归属，接收端据此收进同一条组
+    /// 消息）。成员失败不堵后面：全部成功组消息标 Delivered，任一失败
+    /// 标 Failed（与多文件队列「单个失败跳过」口径一致）。返回组消息 ID。
+    pub async fn send_image_group(&self, paths: &[PathBuf]) -> Result<String, ServiceError> {
+        if paths.len() < 2 {
+            return Err(ServiceError::Other("图片组至少需要 2 张图片".into()));
         }
-        Ok(transfer_id)
+        let session = self.session().await?;
+        // 先备齐成员清单（文件记录先行落库，清单引用它们的 ID）
+        let mut items: Vec<GroupItem> = Vec::with_capacity(paths.len());
+        let mut prepared: Vec<(PathBuf, String, u64, String, String, String)> =
+            Vec::with_capacity(paths.len());
+        for (i, path) in paths.iter().enumerate() {
+            let meta = std::fs::metadata(path)?;
+            let size = meta.len();
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .ok_or_else(|| ServiceError::Other("文件名无效".into()))?;
+            let sha = sha256_file(path)?;
+            let file_id = new_id();
+            self.storage.save_file(&FileMeta {
+                id: file_id.clone(),
+                name: name.clone(),
+                size,
+                sha256: sha.clone(),
+                path: path.to_string_lossy().to_string(),
+                mime: None,
+            })?;
+            let member_msg_id = new_id();
+            items.push(GroupItem {
+                msg_id: member_msg_id.clone(),
+                file_id,
+                name: name.clone(),
+                size,
+                sha256: sha.clone(),
+                idx: i as u32,
+            });
+            // 成员传输 ID 掺入成员消息 ID 派生：同一张图在组里出现两次也不撞
+            let transfer_id =
+                derive_transfer_id(&format!("{sha}:{member_msg_id}"), &session.peer.device_id);
+            prepared.push((path.clone(), name, size, sha, transfer_id, member_msg_id));
+        }
+        let group_id = new_id();
+        let mut msg = Message {
+            id: group_id.clone(),
+            conversation_id: session.conversation_id.clone(),
+            sender: Sender::Me,
+            kind: MessageKind::ImageGroup,
+            body: group_manifest_json(&items),
+            file_id: None,
+            reply_to: None,
+            status: MessageStatus::Sending,
+            created_at: now_ms(),
+            seq: 0,
+        };
+        msg.seq = self.storage.insert_message(&msg)?;
+        self.emit(Event::MessageNew(msg));
+        let total = prepared.len() as u32;
+        let mut failed = 0u32;
+        for (i, (path, name, size, sha, transfer_id, member_msg_id)) in
+            prepared.into_iter().enumerate()
+        {
+            let run = self
+                .run_file_transfer(
+                    &session,
+                    &path,
+                    name,
+                    size,
+                    sha,
+                    transfer_id,
+                    member_msg_id,
+                    Some(GroupRef {
+                        group_id: group_id.clone(),
+                        index: i as u32,
+                        total,
+                    }),
+                )
+                .await;
+            match run {
+                Ok(TransferRun::Done { ok: true, .. }) => {}
+                Ok(_) => failed += 1,
+                Err(e) => {
+                    failed += 1;
+                    log::log_line(
+                        "files",
+                        &format!("图片组成员发送失败（第 {} 张）：{e}", i + 1),
+                    );
+                }
+            }
+        }
+        let status = if failed == 0 {
+            MessageStatus::Delivered
+        } else {
+            MessageStatus::Failed
+        };
+        self.storage.update_message_status(&group_id, status)?;
+        self.emit(Event::MessageStatus {
+            id: group_id.clone(),
+            status,
+        });
+        log::log_line(
+            "files",
+            &format!("图片组发送结束：共 {total} 张，失败 {failed} 张"),
+        );
+        Ok(group_id)
     }
 
     // 参数与 FileOffer 帧字段一一对应，豁免参数个数检查
@@ -1695,6 +1914,7 @@ impl Node {
         size: u64,
         sha256: String,
         _mime: Option<String>,
+        group: Option<GroupRef>,
     ) -> Result<(), ServiceError> {
         // 恢复已有进度：传输记录 + .part 文件都在才算数
         let part_path = self.download_dir().join(format!("{transfer_id}.part"));
@@ -1734,24 +1954,43 @@ impl Node {
             id: file_id.clone(),
             name: name.clone(),
             size,
-            sha256,
+            sha256: sha256.clone(),
             path: String::new(),
             mime: None,
         })?;
-        let mut m = Message {
-            id: msg_id,
-            conversation_id: session.conversation_id.clone(),
-            sender: Sender::Peer,
-            kind: MessageKind::File,
-            body: name,
-            file_id: Some(file_id),
-            reply_to: None,
-            status: MessageStatus::Received,
-            created_at: now_ms(),
-            seq: 0,
-        };
-        m.seq = self.storage.insert_message(&m)?;
-        self.emit(Event::MessageNew(m));
+        match &group {
+            // 图片组成员：不单独建消息行，并入组消息清单（首个成员建组）
+            Some(g) => {
+                self.upsert_group_member(
+                    session,
+                    g,
+                    GroupItem {
+                        msg_id: msg_id.clone(),
+                        file_id: file_id.clone(),
+                        name: name.clone(),
+                        size,
+                        sha256: sha256.clone(),
+                        idx: g.index,
+                    },
+                )?;
+            }
+            None => {
+                let mut m = Message {
+                    id: msg_id,
+                    conversation_id: session.conversation_id.clone(),
+                    sender: Sender::Peer,
+                    kind: MessageKind::File,
+                    body: name,
+                    file_id: Some(file_id),
+                    reply_to: None,
+                    status: MessageStatus::Received,
+                    created_at: now_ms(),
+                    seq: 0,
+                };
+                m.seq = self.storage.insert_message(&m)?;
+                self.emit(Event::MessageNew(m));
+            }
+        }
         self.storage.save_transfer(
             &transfer_id,
             "",
@@ -1768,6 +2007,50 @@ impl Node {
                 received: ranges,
             }))
             .await?;
+        Ok(())
+    }
+
+    /// 图片组成员到达：把成员并入组消息清单。首个成员创建组消息；
+    /// 后续成员只更新 body（rowid/seq 不动，组气泡不跳位），清单按
+    /// 成员 idx 排序还原发送顺序。同一成员重复要约（断线重发）时
+    /// 刷新其 file_id，不重复追加。
+    fn upsert_group_member(
+        &self,
+        session: &Arc<PeerSession>,
+        g: &GroupRef,
+        item: GroupItem,
+    ) -> Result<(), ServiceError> {
+        match self.storage.get_message(&g.group_id)? {
+            Some(mut gm) => {
+                let mut items = parse_group_manifest(&gm.body);
+                if let Some(ex) = items.iter_mut().find(|it| it.msg_id == item.msg_id) {
+                    ex.file_id = item.file_id.clone();
+                } else {
+                    items.push(item);
+                    items.sort_by_key(|it| it.idx);
+                }
+                let body = group_manifest_json(&items);
+                self.storage.update_message_body(&g.group_id, &body)?;
+                gm.body = body;
+                self.emit(Event::MessageUpdated(gm));
+            }
+            None => {
+                let mut m = Message {
+                    id: g.group_id.clone(),
+                    conversation_id: session.conversation_id.clone(),
+                    sender: Sender::Peer,
+                    kind: MessageKind::ImageGroup,
+                    body: group_manifest_json(&[item]),
+                    file_id: None,
+                    reply_to: None,
+                    status: MessageStatus::Received,
+                    created_at: now_ms(),
+                    seq: 0,
+                };
+                m.seq = self.storage.insert_message(&m)?;
+                self.emit(Event::MessageNew(m));
+            }
+        }
         Ok(())
     }
 
@@ -2024,6 +2307,70 @@ impl Node {
             path: path.map(|p| p.to_string_lossy().to_string()),
             exists,
         }))
+    }
+
+    /// 图片组的全部成员文件信息（组气泡缩略图/图片查看器/保存全部
+    /// 用）：按清单顺序逐个定位本地路径，定位口径与 file_info 一致
+    /// （记录路径优先，缺失时按下载目录 + 文件名兜底）。
+    pub fn group_files(&self, message_id: &str) -> Result<Vec<MessageFileInfo>, ServiceError> {
+        let Some(m) = self.storage.get_message(message_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for it in parse_group_manifest(&m.body) {
+            let Some(meta) = self.storage.get_file(&it.file_id)? else {
+                continue;
+            };
+            let recorded = PathBuf::from(&meta.path);
+            let path = if !meta.path.is_empty() && recorded.exists() {
+                Some(recorded)
+            } else {
+                let fallback = self.download_dir().join(&meta.name);
+                if fallback.exists() {
+                    Some(fallback)
+                } else if !meta.path.is_empty() {
+                    Some(recorded)
+                } else {
+                    None
+                }
+            };
+            let exists = path.as_ref().map(|p| p.exists()).unwrap_or(false);
+            out.push(MessageFileInfo {
+                name: meta.name,
+                size: meta.size,
+                path: path.map(|p| p.to_string_lossy().to_string()),
+                exists,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 「保存全部图片」：把组内已落盘的图片按发送顺序复制到目标
+    /// 目录，命名为 1、2、3…（保留各自扩展名，序号与组内位置对齐，
+    /// 缺失的成员跳过不占号错位）。返回（成功数， 总数）。
+    pub fn save_group_images(
+        &self,
+        message_id: &str,
+        dir: &Path,
+    ) -> Result<(usize, usize), ServiceError> {
+        let files = self.group_files(message_id)?;
+        std::fs::create_dir_all(dir)?;
+        let mut ok = 0usize;
+        for (i, f) in files.iter().enumerate() {
+            if !f.exists {
+                continue;
+            }
+            let Some(src) = &f.path else { continue };
+            let ext = Path::new(&f.name)
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let dst = dir.join(format!("{}{}", i + 1, ext));
+            if std::fs::copy(src, &dst).is_ok() {
+                ok += 1;
+            }
+        }
+        Ok((ok, files.len()))
     }
 
     // ---------- AI ----------
@@ -2575,5 +2922,84 @@ mod compression_tests {
     fn 未知压缩标志干净失败() {
         let err = decompress(b"whatever", 9).unwrap_err();
         assert!(format!("{err}").contains("不认识的压缩算法"));
+    }
+}
+
+#[cfg(test)]
+mod group_save_tests {
+    use super::*;
+
+    // 「保存全部图片」：按组内顺序存为 1、2、3…（保留原扩展名）；
+    // 成员文件缺失时跳过且不补号错位（第 2 张缺失 → 只有 1.jpg 与 3.jpg）。
+    #[test]
+    fn 保存全部图片按序命名且缺失不补号() {
+        let base = std::env::temp_dir().join(format!("bl-group-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let node = Node::new(&base, "测试机").expect("建节点");
+        let dl = node.download_dir();
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut items = Vec::new();
+        for (i, name) in ["a.jpg", "b.png", "c.jpg"].iter().enumerate() {
+            let fid = format!("file-{i}");
+            let p = dl.join(name);
+            if i != 1 {
+                std::fs::write(&p, format!("data-{i}")).unwrap();
+            }
+            node.storage
+                .save_file(&FileMeta {
+                    id: fid.clone(),
+                    name: name.to_string(),
+                    size: 6,
+                    sha256: String::new(),
+                    path: p.to_string_lossy().to_string(),
+                    mime: None,
+                })
+                .unwrap();
+            items.push(GroupItem {
+                msg_id: format!("m-{i}"),
+                file_id: fid,
+                name: name.to_string(),
+                size: 6,
+                sha256: String::new(),
+                idx: i as u32,
+            });
+        }
+        node.storage
+            .create_conversation(&Conversation {
+                id: "conv-1".to_string(),
+                kind: ConversationKind::Peer,
+                peer_device_id: None,
+                title: "对端".to_string(),
+                draft: String::new(),
+                last_read_id: None,
+                created_at: 0,
+            })
+            .unwrap();
+        node.storage
+            .insert_message(&Message {
+                id: "g1".to_string(),
+                conversation_id: "conv-1".to_string(),
+                sender: Sender::Peer,
+                kind: MessageKind::ImageGroup,
+                body: group_manifest_json(&items),
+                file_id: None,
+                reply_to: None,
+                status: MessageStatus::Received,
+                created_at: 0,
+                seq: 0,
+            })
+            .unwrap();
+        let out = base.join("out");
+        let (ok, total) = node.save_group_images("g1", &out).expect("保存");
+        assert_eq!((ok, total), (2, 3));
+        assert!(out.join("1.jpg").exists());
+        assert!(!out.join("2.png").exists(), "缺失成员不落盘也不补号");
+        assert!(out.join("3.jpg").exists());
+        assert_eq!(
+            std::fs::read_to_string(out.join("3.jpg")).unwrap(),
+            "data-2",
+            "序号与内容对应组内顺序"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
