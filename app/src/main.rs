@@ -1479,6 +1479,20 @@ fn restart_app(app: AppHandle) {
     app.restart();
 }
 
+/// 原生窗口标题栏主题跟随应用主题（v2.5.2）：Windows 用原生标题栏，
+/// 应用切深色时标题栏默认仍是白色，需经此命令同步（Window::set_theme
+/// 需 tauri 的 unstable 特性）。"dark" → 深色、"light" → 浅色、
+/// "system" 或其他值 → None（跟随系统）。失败静默（个别平台不支持）。
+#[tauri::command]
+fn set_window_theme(window: tauri::Window, theme: String) {
+    let t = match theme.as_str() {
+        "dark" => Some(tauri::Theme::Dark),
+        "light" => Some(tauri::Theme::Light),
+        _ => None,
+    };
+    let _ = window.set_theme(t);
+}
+
 /// 通知被点击后的统一处理（v2.5.2）：把主窗口带回前台（托盘隐藏先恢复
 /// 显示、最小化先还原），并通知前端打开对应会话。Windows 由 WinRT 激活
 /// 回调调用（win_notify 模块）；其他平台暂无点击来源（官方通知插件在
@@ -2085,6 +2099,7 @@ fn main() {
             get_sys_notify,
             set_sys_notify,
             restart_app,
+            set_window_theme,
             clean_cache,
             clear_chat_history,
             file_info,

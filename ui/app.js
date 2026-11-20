@@ -2643,12 +2643,26 @@ function applyTheme(mode) {
   else document.documentElement.setAttribute("data-theme", mode);
   document.querySelectorAll("#theme-seg button").forEach((b) =>
     b.classList.toggle("active", b.dataset.themeSet === mode));
-  // 原生窗口标题栏跟随主题（深色时不再是一条白杠）
+  syncWindowTheme(mode);
+}
+// 原生窗口标题栏跟随主题（深色时不再是一条白杠）：走后端命令
+// set_window_theme（Window::set_theme）。失败静默，不阻塞主题切换；
+// 非 Tauri 环境（纯浏览器打开页面）直接跳过。
+function syncWindowTheme(mode) {
   try {
-    const w = window.__TAURI__.window.getCurrentWindow();
-    w.setTheme(mode === "system" ? null : mode).catch(() => {});
+    const p = invoke("set_window_theme", { theme: mode });
+    if (p && p.catch) p.catch(() => {});
   } catch (_) { /* 忽略 */ }
 }
+// 「跟随系统」时系统深浅翻转 → 再同步一次标题栏
+try {
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
+  const onSysThemeChange = () => {
+    if ((localStorage.getItem("bl-theme") || "system") === "system") syncWindowTheme("system");
+  };
+  if (mq.addEventListener) mq.addEventListener("change", onSysThemeChange);
+  else if (mq.addListener) mq.addListener(onSysThemeChange);
+} catch (_) { /* 忽略 */ }
 document.querySelectorAll("#theme-seg button").forEach((b) =>
   b.addEventListener("click", () => {
     localStorage.setItem("bl-theme", b.dataset.themeSet);
