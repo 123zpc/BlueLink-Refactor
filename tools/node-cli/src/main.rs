@@ -2,7 +2,7 @@
 //! 用法：
 //!   bluelink-node host    --dir <数据目录> --name <名字> --addr 127.0.0.1:7800
 //!   bluelink-node connect --dir <数据目录> --name <名字> --addr 127.0.0.1:7800 --code 123456
-//! 连接后从标准输入读命令：send <文本> | file <路径> | ai <问题> | code | quit
+//! 连接后从标准输入读命令：send <文本> | file <路径> | group <图1,图2,…> | ai <问题> | code | quit
 //! 可选环境变量：BLUELINK_AI_BASE / BLUELINK_AI_KEY / BLUELINK_AI_MODEL 配置本机 AI。
 
 use bluelink_services::{Event, Node};
@@ -119,6 +119,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match node2.send_file(std::path::Path::new(path.trim())).await {
                 Ok(id) => println!("[文件发送完成] {id}"),
                 Err(e) => println!("[文件发送失败] {e}"),
+            }
+        } else if let Some(list) = line.strip_prefix("group ") {
+            // 联调用：把逗号分隔的多个图片文件按「图片组」发出（v2.6.0）
+            let paths: Vec<std::path::PathBuf> = list
+                .split(',')
+                .map(|s| std::path::PathBuf::from(s.trim()))
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
+            match node2.send_image_group(&paths).await {
+                Ok(id) => println!("[图片组发送完成] {id}"),
+                Err(e) => println!("[图片组发送失败] {e}"),
             }
         } else if let Some(q) = line.strip_prefix("ai ") {
             match node2.ai_send(q).await {
