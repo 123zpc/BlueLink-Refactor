@@ -42,8 +42,30 @@ pub fn set_log_sink(f: LogSink) {
 }
 
 /// 写一行传输层诊断日志（未注入出口时静默丢弃，不影响功能）。
+/// 这一路是 essential：失败与错误定案行（如「连接失败于步骤 N/6」）走这里，
+/// 两种日志模式都必须落盘。
 pub(crate) fn log(tag: &str, msg: &str) {
     if let Ok(g) = SINK.lock() {
+        if let Some(f) = *g {
+            f(tag, msg);
+        }
+    }
+}
+
+static STEP_SINK: Mutex<Option<LogSink>> = Mutex::new(None);
+
+/// 注入分步流水日志出口（应用启动时调用一次，接 services 的 log_verbose）。
+pub fn set_step_sink(f: LogSink) {
+    if let Ok(mut g) = STEP_SINK.lock() {
+        *g = Some(f);
+    }
+}
+
+/// 写一行分步流水日志（verbose）：成功路径的连接步骤、服务端动作顺序等
+/// 诊断细节走这里——只在开发者模式（全量日志）下落盘，普通模式丢弃。
+/// 失败行不许走这里，走 log()。
+pub(crate) fn log_step(tag: &str, msg: &str) {
+    if let Ok(g) = STEP_SINK.lock() {
         if let Some(f) = *g {
             f(tag, msg);
         }

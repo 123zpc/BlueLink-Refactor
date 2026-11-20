@@ -21,6 +21,8 @@ const state = {
   stagedImage: null,
   transferMap: {},
   quoteFrom: null,
+  favIds: new Set(),
+  pins: [],
   lastFileBubble: null,
   btDevice: null,
   btDeviceName: null,
@@ -192,6 +194,7 @@ function buildMessageEl(m, opts = {}) {
   for (const [label, fn] of btns) {
     const b = document.createElement("button");
     b.textContent = label;
+    if (label === "收藏") { b.classList.add("fav-btn"); paintFavBtn(b, state.favIds.has(m.id)); }
     b.addEventListener("click", fn);
     actions.appendChild(b);
   }
@@ -205,6 +208,7 @@ function buildMessageEl(m, opts = {}) {
   }
   wrap.appendChild(bubble); wrap.appendChild(meta);
   row.appendChild(wrap);
+  row.addEventListener("contextmenu", (e) => { e.preventDefault(); openMsgMenu(m, e.clientX, e.clientY); });
   refreshMessageCategory(m.id, tagsSpan);
   return row;
 }
@@ -241,16 +245,27 @@ async function fillQuote(el, m) {
   } catch (_) { el.textContent = "引用消息"; }
 }
 
+/** 「回到底部」与「回到回复」互斥（v2.5.1）：待返回状态（quoteFrom）存在时
+ * 回到回复优先，回到底部不显示（两钮同角上下叠，用户实测撞车）；待返回
+ * 清除后回到底部按原规矩（离底 >400px）恢复。两钮各自原行为不动。 */
+function syncBottomBtn() {
+  const c = $("messages");
+  const dist = c.scrollHeight - c.scrollTop - c.clientHeight;
+  $("btn-bottom").classList.toggle("hidden", dist <= 400 || !!state.quoteFrom);
+}
+
 /** 点引用块跳到原消息，并亮出「回到回复」按钮一键跳回。 */
 function jumpToQuoted(m) {
   state.quoteFrom = m.id;
   locateMessage(m.conversation_id, m.reply_to);
   const btn = $("back-to-reply");
   btn.classList.remove("hidden");
+  syncBottomBtn();
   btn.onclick = () => {
     btn.classList.add("hidden");
     if (state.quoteFrom) locateMessage(m.conversation_id, state.quoteFrom);
     state.quoteFrom = null;
+    syncBottomBtn();
   };
 }
 
@@ -283,7 +298,7 @@ async function refreshMessageCategory(mid, span) {
       ? `备注：${mc.note}（点击修改分类，右键给分类改名）`
       : `分类：${catName(mc.color)}（点击修改，右键改名）`;
     chip.addEventListener("click", (e) => openCatPop(mid, e.currentTarget));
-    chip.addEventListener("contextmenu", (e) => { e.preventDefault(); openRenamePop(mc.color, e.currentTarget); });
+    chip.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); openRenamePop(mc.color, e.currentTarget); });
     span.appendChild(chip);
   } catch (_) { /* 忽略 */ }
 }
@@ -303,6 +318,7 @@ function appendMessage(container, m, renderedSet, opts) {
   }
   const el = buildMessageEl(m, opts);
   el.dataset.ts = m.created_at;
+  el.dataset.seq = m.seq || 0;
   // 消息分组：同日、同发送者、间隔 < 5 分钟时压缩间距
   if (!newDay && last && last.dataset.sender === m.sender && m.created_at - lastTs < 5 * 60 * 1000) {
     el.classList.add("grouped");
@@ -346,6 +362,7 @@ function switchView(view) {
   $("tags-view").classList.toggle("hidden", view !== "tags");
   $("fav-view").classList.toggle("hidden", view !== "favorites");
   $("settings-view").classList.toggle("hidden", view !== "settings");
+  closePinList();
   applyAside();
   syncDrawer();
   // 视图刚变可见时补量一次输入框高度（隐藏期间 autoGrow 会跳过）
@@ -416,6 +433,7 @@ async function loadConversations() {
 const CHAT_PAGE = 100;
 async function loadChatMessages() {
   if (!state.peerConvId) return;
+  await refreshFavIds();
   await refreshRibbon();
   const msgs = await invoke("list_messages", { conversationId: state.peerConvId, limit: CHAT_PAGE });
   const container = $("messages");
@@ -440,8 +458,10 @@ async function loadOlderChat() {
   if (!first) return;
   state.chatLoadingOlder = true;
   try {
-    const before = Number(first.dataset.ts || 0);
-    const older = await invoke("list_messages", { conversationId: state.peerConvId, before, limit: CHAT_PAGE });
+    // 游标只认本机入账序号 seq（v2.5.1）：旧版按 created_at 严格小于翻页，
+    // 与游标同毫秒的消息会被永久吞掉，且双机时钟差下墙钟序本身就是乱序。
+    const beforeSeq = Number(first.dataset.seq || 0);
+    const older = await invoke("list_messages", { conversationId: state.peerConvId, before: beforeSeq > 0 ? beforeSeq : null, limit: CHAT_PAGE });
     const fresh = older.filter((m) => !state.renderedChat.has(m.id));
     if (!fresh.length) { state.chatHasMore = false; return; }
     if (older.length < CHAT_PAGE) state.chatHasMore = false;
@@ -477,8 +497,7 @@ async function loadOlderChat() {
 $("messages").addEventListener("scroll", () => {
   const c = $("messages");
   if (c.scrollTop < 120) loadOlderChat();
-  const dist = c.scrollHeight - c.scrollTop - c.clientHeight;
-  $("btn-bottom").classList.toggle("hidden", dist <= 400);
+  syncBottomBtn();
 });
 $("btn-bottom").addEventListener("click", () => {
   const c = $("messages");
@@ -513,13 +532,58 @@ async function refreshPinBar() {
   try {
     const pins = await invoke("list_marked", { kind: "pin" });
     const mine = pins.filter((m) => m.conversation_id === state.peerConvId);
+    state.pins = mine;
     const bar = $("pin-bar");
-    if (!mine.length) { bar.classList.add("hidden"); return; }
+    if (!mine.length) { bar.classList.add("hidden"); closePinList(); return; }
     bar.classList.remove("hidden");
-    bar.innerHTML = `${iconUse("i-pin", "ico ico-14")}<span>置顶：${esc(mine[0].body.slice(0, 40))}${mine.length > 1 ? `（共 ${mine.length} 条）` : ""}</span>`;
-    bar.onclick = () => locateMessage(mine[0].conversation_id, mine[0].id);
+    // 1 条：保持现行文案与点击直跳；≥2 条：文案提示可多选，点击先弹列表
+    bar.innerHTML = mine.length === 1
+      ? `${iconUse("i-pin", "ico ico-14")}<span>置顶：${esc(mine[0].body.slice(0, 40))}</span>`
+      : `${iconUse("i-pin", "ico ico-14")}<span>置顶消息 · 共 ${mine.length} 条（点击选择）</span>`;
+    bar.onclick = () => {
+      if (state.pins.length === 1) locateMessage(state.pins[0].conversation_id, state.pins[0].id);
+      else togglePinList();
+    };
   } catch (_) { /* 忽略 */ }
 }
+
+// ---------- 置顶消息列表（≥2 条时点置顶栏弹出，点哪条跳哪条） ----------
+let pinListOpen = false;
+function togglePinList() { pinListOpen ? closePinList() : openPinList(); }
+function openPinList() {
+  const list = $("pin-list");
+  const bar = $("pin-bar");
+  list.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "rl-head";
+  head.innerHTML = `<b>置顶消息 · 共 ${state.pins.length} 条</b>`;
+  list.appendChild(head);
+  for (const m of state.pins) {
+    const item = document.createElement("div");
+    item.className = "rl-item";
+    const main = m.kind === "file" ? `[文件] ${m.body}` : m.body;
+    item.innerHTML = `<div class="rl-note">${esc(main)}</div><div class="rl-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div>`;
+    item.title = main;
+    // 回跳复用 locateMessage：目标不在已加载首屏时它会整段加载兜底定位
+    item.addEventListener("click", () => { closePinList(); locateMessage(m.conversation_id, m.id); });
+    list.appendChild(item);
+  }
+  list.style.top = (bar.offsetTop + bar.offsetHeight + 4) + "px";
+  list.classList.remove("hidden");
+  pinListOpen = true;
+}
+function closePinList() {
+  pinListOpen = false;
+  const list = $("pin-list");
+  if (list) list.classList.add("hidden");
+}
+document.addEventListener("mousedown", (e) => {
+  if (!pinListOpen) return;
+  const list = $("pin-list");
+  const bar = $("pin-bar");
+  if (!list.contains(e.target) && !bar.contains(e.target)) closePinList();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePinList(); });
 
 function setReply(m) {
   state.replyTo = m.id;
@@ -643,6 +707,7 @@ async function sendCurrent() {
   }
   // @AI 路由：这条消息是问 AI 的，不发给对方；问答经事件回推落到当前聊天里
   if (pendingAiRoute && text) {
+    if (!(await aiReadyOrRemind())) return;
     if (chatAiBusy) { showToast("AI 正在回答上一个问题，请稍候"); return; }
     const src = pendingAiRoute;
     pendingAiRoute = null;
@@ -1122,9 +1187,14 @@ $("btn-lan-toggle").addEventListener("click", () => {
   const nowHidden = $("dev-lan-section").classList.toggle("hidden");
   $("lan-toggle-label").textContent = nowHidden ? "进入 ›" : "收起 ›";
 });
-// 开发者模式开关：设置页连点版本号三次（用户 2026-11-18 定版入口，替代原开关）
+// 版本号手势（用户 2026-11-20 定版，覆盖先前分开规格）：统一一个点击计数
+// 处理——连点三下同时触发两件事：撒花彩蛋 + 开发者模式开关，二者合一；
+// 双击什么都不发生。版本号不可选中（CSS user-select:none + 此处拦
+// selectstart/dblclick），手势全程不碰剪贴板（旧版双击会选中文本被系统复制）。
 let versionClicks = 0;
 let versionClickTimer = null;
+$("set-version").addEventListener("selectstart", (e) => e.preventDefault());
+$("set-version").addEventListener("dblclick", (e) => e.preventDefault());
 $("set-version").addEventListener("click", async () => {
   versionClicks += 1;
   clearTimeout(versionClickTimer);
@@ -1132,6 +1202,7 @@ $("set-version").addEventListener("click", async () => {
   if (versionClicks < 3) return;
   versionClicks = 0;
   clearTimeout(versionClickTimer);
+  showVersionEgg();
   const on = !state.devMode;
   try {
     await invoke("set_dev_mode", { on });
@@ -1139,6 +1210,75 @@ $("set-version").addEventListener("click", async () => {
     showToast(on ? "开发者模式已开启" : "开发者模式已关闭");
   } catch (e) { showToast("切换开发者模式失败：" + e); }
 });
+
+/** 三击彩蛋：以版本号为中心喷一波彩带彩花（canvas 轻量实现），配色用彩签
+ * 9 色 + 品牌蓝；标志扣合作引子（小字层动画）。指针穿透不挡操作；重触发
+ * 先清旧场再重播一波；两三秒飘落散尽自清。 */
+let eggAnim = null;
+function showVersionEgg() {
+  const egg = $("ver-egg");
+  const cv = $("egg-canvas");
+  const ctx = cv.getContext("2d");
+  if (eggAnim) cancelAnimationFrame(eggAnim);
+  egg.classList.remove("hidden");
+  const cap = $("egg-caption");
+  cap.classList.remove("play");
+  void cap.offsetWidth;
+  cap.classList.add("play");
+  cv.width = window.innerWidth;
+  cv.height = window.innerHeight;
+  const v = $("set-version").getBoundingClientRect();
+  const ox = v.left + v.width / 2;
+  const oy = v.top + v.height / 2;
+  const colors = [...CAT_COLORS, "#2563EB"];
+  const parts = [];
+  for (let i = 0; i < 170; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const sp = 4 + Math.random() * 9.5;
+    parts.push({
+      x: ox, y: oy,
+      vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp - 4.5,
+      w: 5 + Math.random() * 6, h: 3 + Math.random() * 5,
+      rot: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 0.32,
+      color: colors[i % colors.length],
+      ribbon: Math.random() < 0.35,
+      ph: Math.random() * 6.28,
+    });
+  }
+  const t0 = performance.now();
+  const tick = (t) => {
+    const el = t - t0;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    let alive = false;
+    for (const pt of parts) {
+      pt.vy += 0.16;
+      pt.vx *= 0.99;
+      pt.vy *= 0.995;
+      pt.x += pt.vx + Math.sin(el / 160 + pt.ph) * 0.6;
+      pt.y += pt.vy;
+      pt.rot += pt.vr;
+      const fade = el < 2000 ? 1 : Math.max(0, 1 - (el - 2000) / 800);
+      if (pt.y < cv.height + 30 && fade > 0) {
+        alive = true;
+        ctx.save();
+        ctx.globalAlpha = fade;
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(pt.rot);
+        ctx.fillStyle = pt.color;
+        if (pt.ribbon) ctx.fillRect(-pt.w, -1.2, pt.w * 2, 2.4);
+        else ctx.fillRect(-pt.w / 2, -pt.h / 2, pt.w, pt.h);
+        ctx.restore();
+      }
+    }
+    if (alive && el < 2900) eggAnim = requestAnimationFrame(tick);
+    else {
+      eggAnim = null;
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      egg.classList.add("hidden");
+    }
+  };
+  eggAnim = requestAnimationFrame(tick);
+}
 $("btn-listen").addEventListener("click", async () => {
   $("connect-error").textContent = "";
   try {
@@ -1329,18 +1469,45 @@ async function openCategoryDrawer(color) {
 function closeDrawer() { drawerOpen = false; syncDrawer(); resetCatRenameEdit(); }
 $("drawer-close").addEventListener("click", closeDrawer);
 
+/** 收藏钮的已收藏态绘制（收藏/已收藏 + 强调色，CSS .marked）。 */
+function paintFavBtn(b, on) {
+  b.classList.toggle("marked", !!on);
+  b.textContent = on ? "已收藏" : "收藏";
+}
+
+/** 刷新已收藏 id 集：消息渲染时据此画收藏钮状态（与落库数据一致）。 */
+async function refreshFavIds() {
+  try {
+    const favs = await invoke("list_marked", { kind: "favorite" });
+    state.favIds = new Set(favs.map((m) => m.id));
+  } catch (_) { /* 拿不到就按未收藏画，点了以后端返回为准 */ }
+}
+
 async function toggleMark(mid, kind) {
   try {
     const on = await invoke("toggle_mark", { messageId: mid, kind });
     if (kind === "pin") refreshPinBar();
-    if (kind === "favorite" && state.view === "favorites") loadFavList();
+    if (kind === "favorite") {
+      // 补反馈（v2.5.1）：旧版收藏落库没问题但界面纹丝不动，看起来像没用。
+      // 现在触发点立刻变已收藏态 + toast，取消同理复原。
+      if (on) state.favIds.add(mid); else state.favIds.delete(mid);
+      document.querySelectorAll(`[data-mid="${mid}"] .fav-btn`).forEach((b) => paintFavBtn(b, on));
+      showToast(on ? "已收藏" : "已取消收藏");
+      if (state.view === "favorites") loadFavList();
+    }
     return on;
   } catch (e) { showToast("操作失败：" + e); }
 }
 
 async function loadFavList() {
-  const msgs = await invoke("list_marked", { kind: "favorite" });
   const list = $("fav-list");
+  let msgs;
+  try {
+    msgs = await invoke("list_marked", { kind: "favorite" });
+  } catch (e) {
+    list.innerHTML = `<div class="list-item"><div class="li-sub">收藏加载失败：${esc(String(e))}</div></div>`;
+    return;
+  }
   list.innerHTML = "";
   if (!msgs.length) {
     list.innerHTML = `<div class="list-item"><div class="li-sub">还没有收藏。在任意消息上点“收藏”即可。</div></div>`;
@@ -1412,6 +1579,43 @@ function refreshAllCategoryUI(mid) {
   if (state.view === "tags") loadCategoryList();
 }
 
+/** 复制文字到系统剪贴板（与 AI 回答「复制」同一条 navigator.clipboard 路径），
+ * 成败都给 toast，不静默。 */
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); showToast("已复制"); }
+  catch (_) { showToast("复制失败：当前系统剪贴板不可用"); }
+}
+
+/** 消息右键菜单（v2.5.1 补齐）：文字消息给「复制」；文件消息（含图片——
+ * 都是落盘文件）复用文件菜单，「打开文件位置」「复制文件」都在里面；
+ * 其余项与悬停动作一致（收藏/置顶/引用/问AI）。菜单容器与文件菜单共用
+ * #file-menu（点外关闭逻辑现成）。 */
+function openMsgMenu(m, x, y) {
+  if (m.kind === "file") { openFileMenu(m.id, x, y); return; }
+  if (m.kind === "system") return;
+  const menu = $("file-menu");
+  menu.innerHTML = "";
+  const items = [
+    ["复制", () => copyText(m.body)],
+    ["收藏", () => toggleMark(m.id, "favorite")],
+    ["置顶", () => toggleMark(m.id, "pin")],
+    ["引用", () => setReply(m)],
+    ["问AI", () => askAiAbout(m)],
+  ];
+  for (const [label, fn] of items) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.addEventListener("click", async () => {
+      menu.classList.add("hidden");
+      try { await fn(); } catch (e) { showToast("操作失败：" + e); }
+    });
+    menu.appendChild(b);
+  }
+  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
+  menu.style.top = Math.min(y, window.innerHeight - 240) + "px";
+  menu.classList.remove("hidden");
+}
+
 // ---------- 文件菜单 ----------
 async function openFileMenu(mid, x, y) {
   const menu = $("file-menu");
@@ -1471,7 +1675,7 @@ async function openFileMenu(mid, x, y) {
     const hint = document.createElement("div");
     hint.className = "li-sub";
     hint.style.padding = "4px 10px";
-    hint.textContent = "文件尚未接收完成或已被移动";
+    hint.textContent = "文件已不在原位置（可能尚未接收完成或已被移动）";
     menu.appendChild(hint);
   }
   menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
@@ -1661,6 +1865,7 @@ $("search-input").addEventListener("input", () => {
 
 // ---------- AI ----------
 async function loadAiMessages() {
+  await refreshFavIds();
   const msgs = await invoke("list_messages", { conversationId: state.aiConvId, limit: 200 });
   const container = $("ai-messages");
   container.innerHTML = "";
@@ -1672,6 +1877,7 @@ async function loadAiMessages() {
 async function sendAi() {
   const text = $("ai-input").value.trim();
   if (!text || state.aiGenerating) return;
+  if (!(await aiReadyOrRemind())) return;
   $("ai-input").value = ""; autoGrow($("ai-input"));
   state.aiGenerating = true;
   $("btn-ai-stop").classList.remove("hidden");
@@ -1800,6 +2006,7 @@ $("input").addEventListener("keydown", (e) => {
 /** 聊天页「问AI」：把这条消息作为上下文发给默认 AI，跳到 AI 页看回答并可继续追问。 */
 async function askAiAbout(m) {
   if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
+  if (!(await aiReadyOrRemind())) return;
   switchView("ai");
   state.aiGenerating = true;
   $("btn-ai-stop").classList.remove("hidden");
@@ -1844,6 +2051,38 @@ function showToast(text) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.add("hidden"), 2600);
 }
+/** 带一个动作按钮的 toast（如未配置 AI 时的「去配置」直达设置页）。 */
+function showToastAction(text, label, fn) {
+  const t = $("toast");
+  t.innerHTML = "";
+  const span = document.createElement("span");
+  span.textContent = text;
+  const b = document.createElement("button");
+  b.className = "toast-action";
+  b.textContent = label;
+  b.addEventListener("click", () => { t.classList.add("hidden"); fn(); });
+  t.appendChild(span);
+  t.appendChild(b);
+  t.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add("hidden"), 4500);
+}
+
+/** AI 未配置拦截（v2.5.1）：点任一 AI 入口先判定，不许静默、不许发出去再失败。
+ * - 默认来源 = 对方设备：走对方配置，本机未配置不拦；
+ * - 自动模式且已连接：可经对方转发，不拦（对方未开代理等由后端错误提示）；
+ * - 其余未配置情形：立刻提醒「还没有配置 AI」并给「去配置」直达设置页。 */
+async function aiReadyOrRemind() {
+  try {
+    const src = await invoke("get_ai_source");
+    if (src === "peer") return true;
+    const cfg = await invoke("get_ai_config");
+    if (cfg && cfg.configured) return true;
+    if (src === "auto" && state.connected) return true;
+    showToastAction("还没有配置 AI", "去配置", () => switchView("settings"));
+    return false;
+  } catch (_) { return true; /* 判定本身失败不误拦，交给后端报错 */ }
+}
 
 // ---------- 设置 ----------
 async function loadSettings() {
@@ -1864,9 +2103,19 @@ async function loadSettings() {
   $("ai-stream").checked = cfg.stream !== false;
   await loadGatewaySettings();
   await loadClipboardSync();
-  await loadStorageStats();
+  loadNotifySetting();
+  // 存储统计不在开页主链上等：先画缓存值/占位，统计回来再回填（v2.5.1 修
+  // 设置页开页卡顿——后端统计已挪阻塞线程，前端也不再串行 await 它）
+  loadStorageStats();
   updateAiState();
 }
+async function loadNotifySetting() {
+  try { $("notify-toggle").checked = await invoke("get_sys_notify"); } catch (_) { /* 忽略 */ }
+}
+$("notify-toggle").addEventListener("change", async () => {
+  try { await invoke("set_sys_notify", { on: $("notify-toggle").checked }); }
+  catch (e) { showToast("设置失败：" + e); }
+});
 async function loadGatewaySettings() {
   try {
     const g = await invoke("get_gateway_settings");
@@ -1894,18 +2143,48 @@ async function loadClipboardSync() {
     $("clip-sync-status").textContent = clipStatusText(v);
   } catch (_) { /* 忽略 */ }
 }
+let lastStorageStats = null; // 上次统计结果：进设置页先画它，不让用户对着旧占位干等
 async function loadStorageStats() {
+  if (lastStorageStats) paintStorageStats(lastStorageStats);
+  else {
+    $("store-chat").textContent = "计算中…";
+    $("store-files").textContent = "计算中…";
+    $("store-cache").textContent = "计算中…";
+  }
   try {
     const s = await invoke("storage_stats");
-    $("store-chat").textContent = `${fmtSize(s.chat_bytes)} · ${s.chat_count} 条`;
-    $("store-files").textContent = `${fmtSize(s.files_bytes)} · ${s.files_count} 个`;
-    $("store-cache").textContent = fmtSize(s.cache_bytes);
-    $("store-dir").textContent = s.download_dir || "-";
-    $("store-dir").title = s.download_dir || "";
-    $("store-log").textContent = s.log_dir || "-";
-    $("store-log").title = s.log_dir || "";
+    lastStorageStats = s;
+    paintStorageStats(s);
   } catch (_) { /* 忽略 */ }
 }
+function paintStorageStats(s) {
+  // 都是固定行内的 textContent 回填，不新增/删除节点，不引发布局跳动
+  $("store-chat").textContent = `${fmtSize(s.chat_bytes)} · ${s.chat_count} 条`;
+  $("store-files").textContent = `${fmtSize(s.files_bytes)} · ${s.files_count} 个`;
+  $("store-cache").textContent = fmtSize(s.cache_bytes);
+  $("store-dir").textContent = s.download_dir || "-";
+  $("store-dir").title = s.download_dir || "";
+  $("store-log").textContent = s.log_dir || "-";
+  $("store-log").title = s.log_dir || "";
+}
+$("store-log-change").addEventListener("click", async () => {
+  try {
+    const path = await window.__TAURI__.dialog.open({ multiple: false, directory: true });
+    if (!path) return;
+    const eff = await invoke("set_log_dir", { path });
+    showToast("日志目录已改为：" + eff);
+    lastStorageStats = null;
+    loadStorageStats();
+  } catch (e) { showToast("更改日志目录失败：" + e); }
+});
+$("store-log-reset").addEventListener("click", async () => {
+  try {
+    const eff = await invoke("set_log_dir", { path: null });
+    showToast("日志目录已恢复默认：" + eff);
+    lastStorageStats = null;
+    loadStorageStats();
+  } catch (e) { showToast("恢复默认失败：" + e); }
+});
 $("store-dir-change").addEventListener("click", async () => {
   try {
     const path = await window.__TAURI__.dialog.open({ multiple: false, directory: true });

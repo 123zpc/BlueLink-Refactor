@@ -10,7 +10,7 @@ pub mod classic;
 mod probe;
 pub mod simpleble;
 
-pub use probe::{set_log_sink, take_probe_lines};
+pub use probe::{set_log_sink, set_step_sink, take_probe_lines};
 
 use bluelink_protocol::{read_frame, write_frame, Frame, ProtocolError};
 use std::sync::Arc;

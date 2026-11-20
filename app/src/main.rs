@@ -286,7 +286,7 @@ async fn bt_start_scan(
     };
     // 上一轮扫描可能有没写完的 SCANPROBE 诊断行，先补写
     for line in bluelink_transport::take_probe_lines() {
-        bluelink_services::log_line("classic", &line);
+        bluelink_services::log::log_verbose("classic", &line);
     }
     let is_classic = matches!(central, ScanCentral::Classic(_));
     let tag = central.log_tag();
@@ -310,7 +310,7 @@ async fn bt_start_scan(
         loop {
             // SCANPROBE 诊断行随扫描轮询写出（日志里搜「SCANPROBE」可定位）
             for line in bluelink_transport::take_probe_lines() {
-                bluelink_services::log_line(tag, &line);
+                bluelink_services::log::log_verbose(tag, &line);
             }
             match central.list_found().await {
                 Ok(devices) => {
@@ -375,7 +375,10 @@ fn set_dev_mode(state: State<'_, AppState>, on: bool) -> Result<(), String> {
         .node
         .storage
         .set_setting("dev_mode", if on { "1" } else { "0" })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // 日志分级即时生效：开发者模式 = 全量日志（verbose），关 = 只记必要日志
+    bluelink_services::log::set_verbose(on);
+    Ok(())
 }
 
 /// 读取开发者模式里选定的蓝牙传输（设置键 bt_transport）：classic / ble / simpleble。
@@ -447,8 +450,17 @@ async fn connect_to(
         bluelink_transport::connect_tcp(addr.trim()),
     )
     .await
-    .map_err(|_| "连接超时（20 秒）：对方未响应".to_string())?
-    .map_err(|e| format!("连接失败：{e}"))?;
+    .map_err(|_| {
+        // 失败定案必须落日志（essential，两级日志都要有）——旧版只回前端，
+        // 日志里查不到这次失败（v2.5.1 实测缺口）。
+        bluelink_services::log_line("app", "局域网连接失败：连接超时（20 秒），对方未响应");
+        "连接超时（20 秒）：对方未响应".to_string()
+    })?
+    .map_err(|e| {
+        let m = format!("连接失败：{e}");
+        bluelink_services::log_line("app", &format!("局域网{m}"));
+        m
+    })?;
     // 取消核对（一）：TCP 已连上但尝试已被取消——直接丢弃，不进握手
     if !state.connect_current(gen) {
         drop(conn);
@@ -459,7 +471,11 @@ async fn connect_to(
         .node
         .attach(conn, false, &code_clean)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let m = e.to_string();
+            bluelink_services::log_line("app", &format!("局域网连接失败（握手阶段）：{m}"));
+            m
+        })?;
     // 取消核对（二）：握手期间被取消——立即断开，不进会话
     if !state.connect_current(gen) {
         state.node.disconnect().await;
@@ -519,30 +535,33 @@ async fn bt_connect(
                 .classic_central
                 .clone()
                 .ok_or_else(|| "经典蓝牙不可用".to_string())?;
-            central
-                .connect(&device_id)
-                .await
-                .map_err(|e| format!("经典蓝牙连接失败：{e}"))?
+            central.connect(&device_id).await.map_err(|e| {
+                let m = format!("经典蓝牙连接失败：{e}");
+                bluelink_services::log_line("app", &m);
+                m
+            })?
         }
         "simpleble" => {
             let central = state
                 .sble_central
                 .clone()
                 .ok_or_else(|| "SimpleBLE 不可用".to_string())?;
-            central
-                .connect(&device_id)
-                .await
-                .map_err(|e| format!("SimpleBLE 连接失败：{e}"))?
+            central.connect(&device_id).await.map_err(|e| {
+                let m = format!("SimpleBLE 连接失败：{e}");
+                bluelink_services::log_line("app", &m);
+                m
+            })?
         }
         _ => {
             let central = state
                 .central
                 .clone()
                 .ok_or_else(|| "蓝牙不可用".to_string())?;
-            central
-                .connect(&device_id)
-                .await
-                .map_err(|e| format!("蓝牙连接失败：{e}"))?
+            central.connect(&device_id).await.map_err(|e| {
+                let m = format!("蓝牙连接失败：{e}");
+                bluelink_services::log_line("app", &m);
+                m
+            })?
         }
     };
     // 取消核对（一）：传输层已连上但尝试已被取消（经典 connect 可能阻塞很久
@@ -556,7 +575,11 @@ async fn bt_connect(
         .node
         .attach(conn, false, &code_clean)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let m = e.to_string();
+            bluelink_services::log_line("app", &format!("蓝牙连接失败（握手阶段）：{m}"));
+            m
+        })?;
     // 取消核对（二）：握手期间被取消——立即断开，不进会话
     if !state.connect_current(gen) {
         state.node.disconnect().await;
@@ -897,6 +920,9 @@ struct AiConfigView {
     base_url: String,
     model: String,
     has_key: bool,
+    /// 是否已完整配置（地址/密钥/模型齐全，与 AI 层 is_ready 同口径）：
+    /// 前端据此在点「问AI」/@AI/AI 发送时先提醒未配置，不静默失败。
+    configured: bool,
     stream: bool,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
@@ -907,6 +933,7 @@ struct AiConfigView {
 fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfigView, String> {
     let cfg = load_ai_config(&state.node.storage);
     Ok(AiConfigView {
+        configured: cfg.is_ready(),
         has_key: !cfg.api_key.is_empty(),
         base_url: cfg.base_url,
         model: cfg.model,
@@ -1093,20 +1120,61 @@ struct StorageStatsView {
 }
 
 #[tauri::command]
-fn storage_stats(state: State<'_, AppState>) -> Result<StorageStatsView, String> {
-    let s = state.node.storage_stats();
-    let log_dir = bluelink_services::log::log_path()
-        .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
-        .unwrap_or_default();
+async fn storage_stats(state: State<'_, AppState>) -> Result<StorageStatsView, String> {
+    // 统计要扫下载目录逐个文件取大小，是同步重活：放阻塞线程池跑，
+    // 别占 Tauri 主线程（v2.5.1 修设置页开页卡顿的头号嫌疑即此）。
+    let node = state.node.clone();
+    let (s, log_dir, download_dir) = tokio::task::spawn_blocking(move || {
+        let s = node.storage_stats();
+        let log_dir = bluelink_services::log::log_path()
+            .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        let download_dir = node.download_dir().to_string_lossy().to_string();
+        (s, log_dir, download_dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(StorageStatsView {
         chat_count: s.chat_count,
         chat_bytes: s.chat_bytes,
         files_bytes: s.files_bytes,
         files_count: s.files_count,
         cache_bytes: s.cache_bytes,
-        download_dir: state.node.download_dir().to_string_lossy().to_string(),
+        download_dir,
         log_dir,
     })
+}
+
+/// 修改日志目录（传空 = 恢复默认 <数据目录>/logs），返回生效后的目录。
+/// 旧目录文件不搬不删，只切换后续写入目标；「打开日志目录」走 log_path 自然跟随。
+#[tauri::command]
+fn set_log_dir(state: State<'_, AppState>, path: Option<String>) -> Result<String, String> {
+    let dir = path.as_deref().filter(|s| !s.trim().is_empty());
+    let effective = state
+        .node
+        .set_log_dir(dir.map(std::path::Path::new))
+        .map_err(|e| e.to_string())?;
+    Ok(effective.to_string_lossy().to_string())
+}
+
+/// 系统通知开关（设置键 sys_notify，默认开）：收到对方新消息且窗口不在前台时弹通知。
+#[tauri::command]
+fn get_sys_notify(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state
+        .node
+        .storage
+        .get_setting("sys_notify")
+        .map(|v| v.as_deref() != Some("0"))
+        .unwrap_or(true))
+}
+
+#[tauri::command]
+fn set_sys_notify(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    state
+        .node
+        .storage
+        .set_setting("sys_notify", if on { "1" } else { "0" })
+        .map_err(|e| e.to_string())
 }
 
 /// 修改接收文件保存目录（传空 = 恢复默认），返回生效后的目录。
@@ -1346,6 +1414,64 @@ async fn set_local_api(
     Ok(())
 }
 
+/// 系统通知（v2.5.1）：收到对方新聊天消息时，仅当开关开且窗口不在前台
+/// （隐藏到托盘/最小化/失焦）才弹。窗口可见且有焦点 = 用户正看着应用，不弹。
+/// 只针对聊天新消息；连接/AI 等其他事件不弹。
+/// 注：tauri-plugin-notification 在桌面端不提供通知点击回调，点通知回窗
+/// 这一环桌面端无官方能力，未实现（如实记录，见 QA）。
+fn maybe_notify_new_message(app: &AppHandle, node: &Arc<Node>, m: &Message) {
+    use bluelink_domain::{MessageKind, Sender};
+    use tauri_plugin_notification::NotificationExt as _;
+    if m.sender != Sender::Peer || m.kind == MessageKind::System {
+        return;
+    }
+    let on = node
+        .storage
+        .get_setting("sys_notify")
+        .map(|v| v.as_deref() != Some("0"))
+        .unwrap_or(true);
+    if !on {
+        return;
+    }
+    if let Some(w) = app.get_webview_window("main") {
+        let visible = w.is_visible().unwrap_or(false);
+        let focused = w.is_focused().unwrap_or(false);
+        if visible && focused {
+            return; // 正看着应用，不自扰
+        }
+    }
+    let title = node
+        .storage
+        .list_conversations()
+        .ok()
+        .and_then(|cs| {
+            cs.into_iter()
+                .find(|c| c.id == m.conversation_id)
+                .map(|c| c.title)
+        })
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "对方".to_string());
+    let body = if m.kind == MessageKind::File {
+        let lower = m.body.to_ascii_lowercase();
+        if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+            .iter()
+            .any(|e| lower.ends_with(e))
+        {
+            format!("[图片] {}", m.body)
+        } else {
+            format!("[文件] {}", m.body)
+        }
+    } else {
+        let excerpt: String = m.body.chars().take(60).collect();
+        if m.body.chars().count() > 60 {
+            format!("{excerpt}…")
+        } else {
+            excerpt
+        }
+    };
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
 /// 把节点事件转发给前端（事件名与详细设计第三章一致）。
 fn forward_events(app: AppHandle, node: Arc<Node>) {
     let mut rx = node.subscribe();
@@ -1362,6 +1488,7 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
                     );
                 }
                 Ok(Event::MessageNew(m)) => {
+                    maybe_notify_new_message(&app, &node, &m);
                     let _ = app.emit("message_new", m);
                 }
                 Ok(Event::MessageStatus { id, status }) => {
@@ -1437,6 +1564,7 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
 fn main() {
     // 传输层诊断日志（连接分步日志等）接上运行日志通道
     bluelink_transport::set_log_sink(bluelink_services::log_line);
+    bluelink_transport::set_step_sink(bluelink_services::log::log_verbose);
     tauri::Builder::default()
         // 单实例必须最先注册：第二次启动直接退出，只把已有窗口唤到前台，
         // 避免双开进程抢占经典蓝牙服务端端口（WSA 10048 的主要来源之一）。
@@ -1449,6 +1577,7 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let name = std::env::var("COMPUTERNAME")
@@ -1859,6 +1988,9 @@ fn main() {
             storage_stats,
             set_download_dir,
             open_log_dir,
+            set_log_dir,
+            get_sys_notify,
+            set_sys_notify,
             clean_cache,
             clear_chat_history,
             file_info,

@@ -394,7 +394,7 @@ impl BleCentral {
         let t0 = Instant::now();
         let total = || t0.elapsed().as_millis();
         let step_ms = |t: Instant| t.elapsed().as_millis();
-        crate::probe::log("ble", &format!("连接步骤1/6 开始连接：目标 {device_id}"));
+        crate::probe::log_step("ble", &format!("连接步骤1/6 开始连接：目标 {device_id}"));
         let peripherals = self.adapter.peripherals().await.map_err(ble_err)?;
         let mut target: Option<CentralPeripheral> = None;
         for p in peripherals {
@@ -440,7 +440,7 @@ impl BleCentral {
                 }
             }
         }
-        crate::probe::log(
+        crate::probe::log_step(
             "ble",
             &format!(
                 "连接步骤2/6 完成：无线电已连接（本步耗时 {}ms，总耗时 {}ms）",
@@ -482,7 +482,7 @@ impl BleCentral {
             .iter()
             .map(|s| s.uuid.to_string())
             .collect();
-        crate::probe::log(
+        crate::probe::log_step(
             "ble",
             &format!(
                 "连接步骤3/6 完成：发现 {} 个服务 [{}]（本步耗时 {}ms，总耗时 {}ms）",
@@ -498,7 +498,7 @@ impl BleCentral {
         let chars = peripheral.characteristics();
         let inbox = chars.iter().find(|c| c.uuid == INBOX_UUID).cloned();
         let outbox = chars.iter().find(|c| c.uuid == OUTBOX_UUID).cloned();
-        crate::probe::log(
+        crate::probe::log_step(
             "ble",
             &format!(
                 "连接步骤4/6 特征值检查：写入特征{}、通知特征{}",
@@ -536,7 +536,7 @@ impl BleCentral {
                 ));
             }
         }
-        crate::probe::log(
+        crate::probe::log_step(
             "ble",
             &format!(
                 "连接步骤4/6 完成：已订阅通知，链路就绪，等待握手（步骤5-6/6）（本步耗时 {}ms，总耗时 {}ms）",
@@ -632,6 +632,8 @@ pub async fn start_ble_server(
     if !peripheral.is_powered().await.map_err(ble_err)? {
         return Err(TransportError::Ble("蓝牙未开启，请先打开系统蓝牙".into()));
     }
+    // 关键步骤先落日志再做事：进程若死在动作里，日志尾部即崩溃点（下同）
+    crate::probe::log_step("ble", "服务端：正在发布服务（注册 BlueLink 服务与特征）");
     peripheral
         .add_service(&Service {
             uuid: SERVICE_UUID,
@@ -658,17 +660,18 @@ pub async fn start_ble_server(
         })
         .await
         .map_err(ble_err)?;
-    crate::probe::log(
+    crate::probe::log_step(
         "ble",
         &format!(
             "服务端：服务发布成功（服务 {SERVICE_UUID}，写入特征 {INBOX_UUID}、通知特征 {OUTBOX_UUID}）"
         ),
     );
+    crate::probe::log_step("ble", "服务端：正在启动广播");
     peripheral
         .start_advertising(local_name, &[SERVICE_UUID])
         .await
         .map_err(ble_err)?;
-    crate::probe::log(
+    crate::probe::log_step(
         "ble",
         &format!(
             "服务端：广播启动请求已接受（可连接、可发现）；广播内容：服务 {SERVICE_UUID}、本机名 {local_name}（广播包由系统按已发布服务自动生成）"
@@ -686,7 +689,7 @@ pub async fn start_ble_server(
         match peripheral.is_advertising().await {
             Ok(true) => {
                 advertising = true;
-                crate::probe::log(
+                crate::probe::log_step(
                     "ble",
                     &format!("服务端广播状态确认：已在广播（启动后第 {} 次检查）", i + 1),
                 );
@@ -719,6 +722,14 @@ pub async fn start_ble_server(
                     request,
                     subscribed,
                 } if request.characteristic == OUTBOX_UUID => {
+                    crate::probe::log_step(
+                        "ble",
+                        &format!(
+                            "服务端：收到订阅变更（对方 {}，{}），开始处理",
+                            request.client,
+                            if subscribed { "订阅" } else { "取消订阅" }
+                        ),
+                    );
                     if subscribed {
                         let (stream, ends) = channel_stream();
                         let StreamEnds {
@@ -727,25 +738,64 @@ pub async fn start_ble_server(
                         } = ends;
                         link = Some((request.client.clone(), incoming_tx));
                         let out_peripheral = pump_peripheral.clone();
+                        let out_client = request.client.clone();
                         tokio::spawn(async move {
+                            let mut sent_once = false;
                             while let Some(bytes) = outgoing_rx.recv().await {
                                 let mut p = out_peripheral.lock().await;
                                 let mut failed = false;
                                 for piece in bytes.chunks(ATT_CHUNK) {
-                                    if p.update_characteristic(OUTBOX_UUID, piece.to_vec())
-                                        .await
-                                        .is_err()
+                                    // 通知发送加 5 秒超时与失败定案行（essential）：
+                                    // 2026-11-20 真机实证——HelloAck 在这一段被
+                                    // 静默吞掉（对端记「已回」、本机永收不到），
+                                    // 旧代码 is_err 只 break 不记日志、挂死更是
+                                    // 无声无息。从此失败/超时都在日志留痕。
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        p.update_characteristic(OUTBOX_UUID, piece.to_vec()),
+                                    )
+                                    .await
                                     {
-                                        failed = true;
-                                        break;
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(e)) => {
+                                            crate::probe::log(
+                                                "ble",
+                                                &format!(
+                                                    "服务端：通知发送失败（对方 {out_client}）：{}，链路断开",
+                                                    ble_err(e)
+                                                ),
+                                            );
+                                            failed = true;
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            crate::probe::log(
+                                                "ble",
+                                                &format!(
+                                                    "服务端：通知发送超时（对方 {out_client}，5 秒未完成），链路断开"
+                                                ),
+                                            );
+                                            failed = true;
+                                            break;
+                                        }
                                     }
                                 }
                                 if failed {
                                     break;
                                 }
+                                if !sent_once {
+                                    sent_once = true;
+                                    crate::probe::log_step(
+                                        "ble",
+                                        &format!(
+                                            "服务端：首帧通知已发出（对方 {out_client}，{} 字节）",
+                                            bytes.len()
+                                        ),
+                                    );
+                                }
                             }
                         });
-                        crate::probe::log(
+                        crate::probe::log_step(
                             "ble",
                             &format!(
                                 "服务端：有设备连入并订阅通知（对方 {}），链路建立，等待握手",
@@ -761,7 +811,7 @@ pub async fn start_ble_server(
                         .map(|(c, _)| c == &request.client)
                         .unwrap_or(false)
                     {
-                        crate::probe::log(
+                        crate::probe::log_step(
                             "ble",
                             &format!("服务端：对方取消订阅，链路断开（对方 {}）", request.client),
                         );

@@ -369,6 +369,8 @@ pub struct Node {
     download_dir: std::sync::RwLock<PathBuf>,
     /// 默认保存目录（数据目录下的 downloads），「恢复默认」时回到这里。
     default_download_dir: PathBuf,
+    /// 默认日志目录（数据目录下的 logs），日志目录「恢复默认」时回到这里。
+    default_log_dir: PathBuf,
     peer: Mutex<Option<Arc<PeerSession>>>,
     events: broadcast::Sender<Event>,
     ai_cfg: Mutex<Option<AiConfig>>,
@@ -393,6 +395,7 @@ impl Node {
     pub fn new(data_dir: &Path, device_name: &str) -> Result<Arc<Self>, ServiceError> {
         std::fs::create_dir_all(data_dir)?;
         log::init_log(data_dir);
+        log::install_panic_hook();
         log::log_line(
             "app",
             &format!(
@@ -406,6 +409,18 @@ impl Node {
                 .to_str()
                 .unwrap_or("bluelink.db"),
         )?);
+        // 日志规矩（v2.5.1）：启动时应用已保存的日志目录与日志级别——
+        // dev_mode 开 = 全量日志；运行中切换在 set_dev_mode 命令侧即时调 set_verbose。
+        let default_log_dir = data_dir.join("logs");
+        if let Some(dir) = storage
+            .get_setting("log_dir")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+        {
+            log::set_log_dir(std::path::Path::new(&dir));
+        }
+        log::set_verbose(storage.get_setting("dev_mode").ok().flatten().as_deref() == Some("1"));
         // 保存目录：优先用设置里用户自选的目录（建不出来时回落默认），否则默认目录
         let default_download_dir = data_dir.join("downloads");
         let saved_dir = storage
@@ -436,6 +451,7 @@ impl Node {
             storage,
             download_dir: std::sync::RwLock::new(download_dir),
             default_download_dir,
+            default_log_dir,
             peer: Mutex::new(None),
             events,
             ai_cfg: Mutex::new(None),
@@ -486,6 +502,25 @@ impl Node {
         Ok(target)
     }
 
+    /// 修改日志目录：传 None 恢复默认（<数据目录>/logs）。立即切换写入目标
+    /// 并持久化；旧目录的日志文件不搬不删，只是不再往那里写。
+    pub fn set_log_dir(&self, dir: Option<&Path>) -> Result<PathBuf, ServiceError> {
+        let target = match dir {
+            Some(p) => p.to_path_buf(),
+            None => self.default_log_dir.clone(),
+        };
+        log::set_log_dir(&target)
+            .ok_or_else(|| ServiceError::Other("日志目录不可用，切换失败".into()))?;
+        let saved = if dir.is_some() {
+            target.to_string_lossy().to_string()
+        } else {
+            String::new()
+        };
+        self.storage.set_setting("log_dir", &saved)?;
+        log::log_line("app", &format!("日志目录改为 {}", target.display()));
+        Ok(target)
+    }
+
     /// 订阅事件。
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
@@ -523,7 +558,7 @@ impl Node {
     ) -> Result<Device, ServiceError> {
         let peer = if host {
             // 宿主侧：等对方 Hello，校验连接码
-            log::log_line("conn", "握手步骤5/6：等待对方 Hello");
+            log::log_verbose("conn", "握手步骤5/6：等待对方 Hello");
             match conn.recv().await? {
                 Frame::Control(Control::Hello {
                     device_id,
@@ -531,7 +566,7 @@ impl Node {
                     code,
                     ..
                 }) => {
-                    log::log_line(
+                    log::log_verbose(
                         "conn",
                         &format!("握手步骤5/6：收到 Hello（对方 {device_name}），校验连接码"),
                     );
@@ -553,7 +588,7 @@ impl Node {
                         reason: None,
                     }))
                     .await?;
-                    log::log_line(
+                    log::log_verbose(
                         "conn",
                         &format!("握手步骤6/6：连接码校验通过，已回 HelloAck，握手完成（对方 {device_name}）"),
                     );
@@ -568,7 +603,7 @@ impl Node {
             }
         } else {
             // 发起侧：发 Hello（带目标连接码），等 Ack
-            log::log_line(
+            log::log_verbose(
                 "conn",
                 &format!("握手步骤5/6：发出 Hello（本机名 {}）", self.device_name),
             );
@@ -590,7 +625,7 @@ impl Node {
                         log::log_line("conn", "握手失败于步骤6/6：对方拒绝（连接码不正确）");
                         return Err(ServiceError::Rejected);
                     }
-                    log::log_line(
+                    log::log_verbose(
                         "conn",
                         &format!("握手步骤6/6：收到 HelloAck，握手完成（对方 {device_name}）"),
                     );
@@ -622,7 +657,16 @@ impl Node {
             self.handshake(&conn, host, code_from_peer_or_target),
         )
         .await
-        .map_err(|_| ServiceError::Other("握手超时：对方未在 20 秒内响应".into()))??;
+        .map_err(|_| {
+            // 超时定案行必须落日志（essential）：2026-11-20 真机实证——对端
+            // HelloAck 没送达时发起侧干等到超时，旧版只把错误回给界面，
+            // 日志里无声无息，排查无从下手。
+            log::log_line(
+                "conn",
+                "连接失败于步骤5/6：握手超时（20 秒内未完成 Hello/HelloAck 往返）",
+            );
+            ServiceError::Other("握手超时：对方未在 20 秒内响应".into())
+        })??;
 
         // 落库设备与会话（会话 ID 以对端设备 ID 派生，稳定唯一）
         let mut peer_dev = peer.clone();
@@ -645,6 +689,14 @@ impl Node {
             conversation_id,
         });
         *self.peer.lock().await = Some(session.clone());
+        // 连接结果是 essential：普通模式也要能查到「连上了谁」（握手分步行是 verbose，不能替代结果行）
+        log::log_line(
+            "conn",
+            &format!(
+                "连接已建立：对方 {}（{}）",
+                session.peer.name, session.peer.device_id
+            ),
+        );
         self.emit(Event::ConnectionChanged {
             connected: true,
             peer_name: Some(session.peer.name.clone()),
@@ -675,6 +727,11 @@ impl Node {
         let session = self.peer.lock().await.take();
         if let Some(s) = &session {
             s.conn.close().await;
+            // 断开结果是 essential（旧版只发事件不落日志，普通模式查不到断开记录）
+            log::log_line(
+                "conn",
+                &format!("连接已断开（本机主动）：对方 {}", s.peer.name),
+            );
         }
         drop(session);
         self.clip_peer_on.store(false, Ordering::Relaxed);
@@ -695,6 +752,10 @@ impl Node {
         let mut guard = self.peer.lock().await;
         if let Some(cur) = &*guard {
             if Arc::ptr_eq(cur, &session) {
+                log::log_line(
+                    "conn",
+                    &format!("连接已断开（链路结束）：对方 {}", cur.peer.name),
+                );
                 *guard = None;
                 self.clip_peer_on.store(false, Ordering::Relaxed);
                 self.emit(Event::ConnectionChanged {
@@ -746,7 +807,7 @@ impl Node {
                 reply_to,
                 ts,
             }) => {
-                let m = Message {
+                let mut m = Message {
                     id: msg_id.clone(),
                     conversation_id: session.conversation_id.clone(),
                     sender: Sender::Peer,
@@ -756,8 +817,9 @@ impl Node {
                     reply_to,
                     status: MessageStatus::Received,
                     created_at: ts,
+                    seq: 0,
                 };
-                self.storage.insert_message(&m)?;
+                m.seq = self.storage.insert_message(&m)?;
                 self.emit(Event::MessageNew(m));
                 session
                     .conn
@@ -852,7 +914,7 @@ impl Node {
         reply_to: Option<String>,
     ) -> Result<Message, ServiceError> {
         let session = self.session().await?;
-        let m = Message {
+        let mut m = Message {
             id: new_id(),
             conversation_id: session.conversation_id.clone(),
             sender: Sender::Me,
@@ -862,8 +924,9 @@ impl Node {
             reply_to: reply_to.clone(),
             status: MessageStatus::Sending,
             created_at: now_ms(),
+            seq: 0,
         };
-        self.storage.insert_message(&m)?;
+        m.seq = self.storage.insert_message(&m)?;
         if let Err(e) = session
             .conn
             .send(&Frame::Control(Control::ChatText {
@@ -1128,7 +1191,7 @@ impl Node {
                     .await
                     .is_ok()
                 {
-                    log::log_line("clipboard", &format!("剪贴板同步：已发送文字（{n} 字节）"));
+                    log::log_verbose("clipboard", &format!("剪贴板同步：已发送文字（{n} 字节）"));
                 }
             }
             ClipContent::Image {
@@ -1235,7 +1298,7 @@ impl Node {
     /// 并登记其哈希：本机监视到这份内容时不会再把它发回去。
     async fn apply_remote_clipboard(self: &Arc<Self>, content: ClipContent) {
         if !self.clipboard_local_on() {
-            log::log_line("clipboard", "收到对方剪贴板内容，但本机未开启同步，已忽略");
+            log::log_verbose("clipboard", "收到对方剪贴板内容，但本机未开启同步，已忽略");
             return;
         }
         if let ClipContent::Text(t) = &content {
@@ -1267,7 +1330,7 @@ impl Node {
                     g.suppress = Some(hash.clone());
                     g.last_seen = Some(hash);
                 }
-                log::log_line("clipboard", &format!("剪贴板同步：已写入对方{desc}"));
+                log::log_verbose("clipboard", &format!("剪贴板同步：已写入对方{desc}"));
                 self.emit(Event::ClipboardSynced {
                     kind: kind.to_string(),
                 });
@@ -1302,7 +1365,7 @@ impl Node {
             path: path.to_string_lossy().to_string(),
             mime: None,
         })?;
-        let msg = Message {
+        let mut msg = Message {
             id: new_id(),
             conversation_id: session.conversation_id.clone(),
             sender: Sender::Me,
@@ -1312,8 +1375,9 @@ impl Node {
             reply_to: None,
             status: MessageStatus::Sending,
             created_at: now_ms(),
+            seq: 0,
         };
-        self.storage.insert_message(&msg)?;
+        msg.seq = self.storage.insert_message(&msg)?;
         self.emit(Event::MessageNew(msg.clone()));
 
         // 等待对方的已收区间（续传）
@@ -1469,7 +1533,7 @@ impl Node {
             path: String::new(),
             mime: None,
         })?;
-        let m = Message {
+        let mut m = Message {
             id: msg_id,
             conversation_id: session.conversation_id.clone(),
             sender: Sender::Peer,
@@ -1479,8 +1543,9 @@ impl Node {
             reply_to: None,
             status: MessageStatus::Received,
             created_at: now_ms(),
+            seq: 0,
         };
-        self.storage.insert_message(&m)?;
+        m.seq = self.storage.insert_message(&m)?;
         self.emit(Event::MessageNew(m));
         self.storage.save_transfer(
             &transfer_id,
@@ -1752,7 +1817,7 @@ impl Node {
         source: AiSource,
         text: &str,
     ) -> Result<Message, ServiceError> {
-        let q = Message {
+        let mut q = Message {
             id: new_id(),
             conversation_id: conv_id.to_string(),
             sender: Sender::Me,
@@ -1762,9 +1827,10 @@ impl Node {
             reply_to: None,
             status: MessageStatus::Sent,
             created_at: now_ms(),
+            seq: 0,
         };
         let qid = q.id.clone();
-        self.storage.insert_message(&q)?;
+        q.seq = self.storage.insert_message(&q)?;
         self.emit(Event::MessageNew(q));
         // @ 选择「默认」时按设置里的默认来源走（未设置则自动）
         let source = if source == AiSource::Auto {
@@ -1777,7 +1843,7 @@ impl Node {
             content: text.to_string(),
         }];
         let full = self.chat_core_src(&msgs, None, source).await?;
-        let a = Message {
+        let mut a = Message {
             id: new_id(),
             conversation_id: conv_id.to_string(),
             sender: Sender::Ai,
@@ -1787,8 +1853,9 @@ impl Node {
             reply_to: Some(qid),
             status: MessageStatus::Received,
             created_at: now_ms(),
+            seq: 0,
         };
-        self.storage.insert_message(&a)?;
+        a.seq = self.storage.insert_message(&a)?;
         self.emit(Event::MessageNew(a.clone()));
         Ok(a)
     }
@@ -1800,7 +1867,7 @@ impl Node {
         text: &str,
     ) -> Result<Message, ServiceError> {
         let conv_id = conv_id.to_string();
-        let user_msg = Message {
+        let mut user_msg = Message {
             id: new_id(),
             conversation_id: conv_id.clone(),
             sender: Sender::Me,
@@ -1810,8 +1877,9 @@ impl Node {
             reply_to: None,
             status: MessageStatus::Sent,
             created_at: now_ms(),
+            seq: 0,
         };
-        self.storage.insert_message(&user_msg)?;
+        user_msg.seq = self.storage.insert_message(&user_msg)?;
         self.emit(Event::MessageNew(user_msg));
 
         // 组装上下文（最近 20 条）
@@ -1830,7 +1898,7 @@ impl Node {
 
         let full = self.chat_anywhere(&conv_id, &msgs).await?;
 
-        let ai_msg = Message {
+        let mut ai_msg = Message {
             id: new_id(),
             conversation_id: conv_id.clone(),
             sender: Sender::Ai,
@@ -1840,8 +1908,9 @@ impl Node {
             reply_to: None,
             status: MessageStatus::Received,
             created_at: now_ms(),
+            seq: 0,
         };
-        self.storage.insert_message(&ai_msg)?;
+        ai_msg.seq = self.storage.insert_message(&ai_msg)?;
         self.emit(Event::AiDone {
             conversation_id: conv_id,
             message: ai_msg.clone(),
@@ -1873,7 +1942,7 @@ impl Node {
             })
             .collect();
         let full = self.chat_anywhere(&conv_id, &msgs).await?;
-        let ai_msg = Message {
+        let mut ai_msg = Message {
             id: new_id(),
             conversation_id: conv_id.clone(),
             sender: Sender::Ai,
@@ -1883,8 +1952,9 @@ impl Node {
             reply_to: None,
             status: MessageStatus::Received,
             created_at: now_ms(),
+            seq: 0,
         };
-        self.storage.insert_message(&ai_msg)?;
+        ai_msg.seq = self.storage.insert_message(&ai_msg)?;
         self.emit(Event::AiDone {
             conversation_id: conv_id,
             message: ai_msg.clone(),

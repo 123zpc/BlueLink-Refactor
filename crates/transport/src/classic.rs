@@ -95,12 +95,66 @@ pub fn merge_aep_rssi(devices: &mut [FoundDevice], lookup: &dyn Fn(u64) -> Optio
     }
 }
 
+/// Howard Hinnant 的 days_from_civil：公历日期 → 距 1970-01-01 的天数。
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 平台仅测试引用
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400; // [0, 399]
+    let mp = i64::from((m + 9) % 12); // [0, 11]
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// 本地日期时间字段 → unix 风格秒。只用于与同为本地时的 stLastSeen 互相比较
+/// （两侧同口径相减，时区不影响结论），不表示真实 UTC 时刻。
+/// 年为 0（SYSTEMTIME 空值）或字段非法时返回 None。
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 平台仅测试引用
+fn civil_to_unix_secs(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<i64> {
+    if year <= 0 || !(1..=12).contains(&month) || day == 0 || day > 31 {
+        return None;
+    }
+    let days = days_from_civil(i64::from(year), month, day);
+    Some(days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second))
+}
+
+/// 在场门容差（秒）：Inquiry 开始前刚被系统听到的设备，其 lastSeen 可能
+/// 略早于本轮开始时刻，留 2 秒容差避免误杀真在场设备。
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 平台仅测试引用
+const HEARD_TOLERANCE_SECS: i64 = 2;
+
+/// 在场门（2026-11-20 v2.5.1）：本轮扫描是否真的「听到」了这台设备。
+/// 经典 Inquiry 开了 fReturnRemembered，系统会把记住但不在场的设备也报出来
+/// （用户实证：九个月前最后见到的设备冒充在场、还带着 AEP 缓存旧信号）。
+/// 判定：当前已连接，或 lastSeen 落在本轮扫描窗口内（以轮始为界、带容差）。
+#[cfg_attr(not(windows), allow(dead_code))] // 非 Windows 平台仅测试引用
+fn heard_this_round(last_seen_secs: Option<i64>, connected: bool, round_start_secs: i64) -> bool {
+    if connected {
+        return true;
+    }
+    match last_seen_secs {
+        Some(t) => t + HEARD_TOLERANCE_SECS >= round_start_secs,
+        None => false,
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     // Win32 FFI 结构体（SOCKADDR_BTH / WSAQUERYSETW 等）惯例是先全零再逐字段赋值，
     // 比结构体字面量更不易漏字段，故本模块豁免这条 clippy 规则。
     #![allow(clippy::field_reassign_with_default)]
-    use super::{device_id, mac_from_device_id, mac_to_string, Conn, FoundDevice, TransportError};
+    use super::{
+        civil_to_unix_secs, device_id, heard_this_round, mac_from_device_id, mac_to_string, Conn,
+        FoundDevice, TransportError,
+    };
     use crate::ble::{channel_stream, StreamEnds};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -119,6 +173,7 @@ mod imp {
         RNRSERVICE_DELETE, RNRSERVICE_REGISTER, SD_BOTH, SOCKADDR, SOCKET, SOCKET_ERROR,
         SOCK_STREAM, WSADATA, WSAESETSERVICEOP, WSAQUERYSETW,
     };
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
     /// 标准 SPP 服务 UUID（00001101-0000-1000-8000-00805F9B34FB），与老版本一致：
     /// 服务端用它向 SDP 注册，客户端用它让系统解析 RFCOMM 通道。
@@ -305,9 +360,10 @@ mod imp {
             Ok(())
         }
 
-        /// 最新一轮 Inquiry 的设备快照（不过滤：全部经典设备，与老版本一致；
-        /// 是不是 BlueLink 由连接后的服务层握手判定）。返回前把 AEP 枚举缓存
-        /// 里的信号按地址并入（仅已配对设备、仅绝对 dBm 刻度，见 merge_aep_rssi）。
+        /// 最新一轮 Inquiry 的设备快照：已在 inquiry 建表处过在场门（只含本轮
+        /// 真听到或已连接的设备，见 heard_this_round）；是不是 BlueLink 由连接
+        /// 后的服务层握手判定。返回前把 AEP 枚举缓存里的信号按地址并入——
+        /// 只作用于在场设备（信号门），不在场设备不可能带格出现。
         pub fn list_found(&self) -> Result<Vec<FoundDevice>, TransportError> {
             let mut devs = self.found.lock().map(|f| f.clone()).unwrap_or_default();
             super::merge_aep_rssi(&mut devs, &|mac| {
@@ -376,6 +432,20 @@ mod imp {
     unsafe fn inquiry_on_radio(
         radio: HANDLE,
     ) -> Result<(Vec<FoundDevice>, Vec<String>), TransportError> {
+        // 本轮开始时刻（本地时，与 stLastSeen 同口径换算成 unix 风格秒）：
+        // 在场门的判定界。取不到时用 0——此时 lastSeen 判定会全部放行，
+        // 退回旧行为而不是误杀全部设备。
+        let mut now_st = windows_sys::Win32::Foundation::SYSTEMTIME::default();
+        GetLocalTime(&mut now_st);
+        let round_start = civil_to_unix_secs(
+            i32::from(now_st.wYear),
+            u32::from(now_st.wMonth),
+            u32::from(now_st.wDay),
+            u32::from(now_st.wHour),
+            u32::from(now_st.wMinute),
+            u32::from(now_st.wSecond),
+        )
+        .unwrap_or(0);
         let mut params: BLUETOOTH_DEVICE_SEARCH_PARAMS = std::mem::zeroed();
         params.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_SEARCH_PARAMS>() as u32;
         params.fReturnAuthenticated = 1;
@@ -401,11 +471,32 @@ mod imp {
         }
         let mut out: Vec<FoundDevice> = Vec::new();
         let mut raws: Vec<BLUETOOTH_DEVICE_INFO> = Vec::new();
+        let mut filtered_out = 0usize; // 在场门滤掉的「记住但本轮未应答」台数
         loop {
             let mac = info.Address.Anonymous.ullLong;
             let id = device_id(mac);
             if !raws.iter().any(|r| r.Address.Anonymous.ullLong == mac) {
                 raws.push(info);
+            }
+            // 在场门：记住但本轮没应答的设备不进列表（SCANPROBE dump 仍保留
+            // 全量原始数据，仅日志）。信号门随之成立：list_found 的 AEP 并入
+            // 只作用于出表后的在场设备，不在场者不可能带格出现。
+            let last_seen = civil_to_unix_secs(
+                i32::from(info.stLastSeen.wYear),
+                u32::from(info.stLastSeen.wMonth),
+                u32::from(info.stLastSeen.wDay),
+                u32::from(info.stLastSeen.wHour),
+                u32::from(info.stLastSeen.wMinute),
+                u32::from(info.stLastSeen.wSecond),
+            );
+            if !heard_this_round(last_seen, info.fConnected != 0, round_start) {
+                filtered_out += 1;
+                info = BLUETOOTH_DEVICE_INFO::default();
+                info.dwSize = std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32;
+                if BluetoothFindNextDevice(find, &mut info) == 0 {
+                    break;
+                }
+                continue;
             }
             if !out.iter().any(|d: &FoundDevice| d.id == id) {
                 let end = info
@@ -441,6 +532,12 @@ mod imp {
         for raw in &raws {
             dump.extend(dump_inquiry_device(raw));
         }
+        dump.push(format!(
+            "SCANPROBE 在场门：本轮原始 {} 台，滤掉记住未应答 {} 台，列表保留 {} 台",
+            raws.len(),
+            filtered_out,
+            out.len()
+        ));
         dump.push("SCANPROBE 经典Inquiry 一节结束".to_string());
         Ok((out, dump))
     }
@@ -1236,5 +1333,38 @@ mod tests {
         merge_aep_rssi(&mut devs2, &|mac| cache2.get(&mac).copied());
         assert_eq!(devs2[0].rssi, Some(-25));
         assert_eq!(devs2[1].rssi, None);
+    }
+
+    /// 在场门三类设备（2026-11-20 v2.5.1）：本轮刚听到→进；九个月前最后一次
+    /// 见到的记住设备（用户实证 LAPTOP-QN3CQGC7 lastSeen=2026-02-24）→出；
+    /// 已连接→进（哪怕 lastSeen 旧）；无 lastSeen 且未连接→出；容差边界内→进。
+    #[test]
+    fn 在场门三类设备() {
+        // 2026-11-19 09:30:00 UTC 一轮扫描开始（unix 秒经 date 核对）
+        let round_start = 1_795_080_600_i64;
+        // 本轮内刚听到（晚于轮始 3 秒）
+        assert!(heard_this_round(Some(round_start + 3), false, round_start));
+        // 容差边界：轮始前 2 秒内仍算本轮（容差常量 2）
+        assert!(heard_this_round(Some(round_start - 2), false, round_start));
+        // 轮始前 3 秒：出
+        assert!(!heard_this_round(Some(round_start - 3), false, round_start));
+        // 九个月前（2026-02-24 12:00 UTC = 1771934400，用户实证 QN3CQGC7）：出
+        assert!(!heard_this_round(Some(1_771_934_400), false, round_start));
+        // lastSeen 旧但当前已连接：进
+        assert!(heard_this_round(Some(1_771_934_400), true, round_start));
+        // 没有 lastSeen 且未连接（纯记住条目）：出
+        assert!(!heard_this_round(None, false, round_start));
+        // 没有 lastSeen 但已连接：进
+        assert!(heard_this_round(None, true, round_start));
+        // civil→unix 换算自检（数值经 date -u 核对）
+        assert_eq!(civil_to_unix_secs(1970, 1, 1, 0, 0, 0), Some(0));
+        assert_eq!(
+            civil_to_unix_secs(2026, 2, 24, 12, 0, 0),
+            Some(1_771_934_400)
+        );
+        assert_eq!(
+            civil_to_unix_secs(2026, 11, 19, 9, 30, 0),
+            Some(1_795_080_600)
+        );
     }
 }

@@ -208,7 +208,7 @@ mod imp {
         pub async fn connect(&self, device_id: &str) -> Result<Conn, TransportError> {
             // 连接分步日志（与 ble 路同一口径，步骤1–4/6，5–6 是服务层握手）
             let t0 = std::time::Instant::now();
-            crate::probe::log(
+            crate::probe::log_step(
                 "simpleble",
                 &format!("连接步骤1/6 开始连接：目标 {device_id}"),
             );
@@ -234,10 +234,12 @@ mod imp {
             let flag = abandoned.clone();
             let p_conn = peripheral.clone();
             let join = tokio::task::spawn_blocking(move || {
-                crate::probe::log("simpleble", "连接步骤2/6 发起无线电连接（阻塞调用）");
+                crate::probe::log_step("simpleble", "连接步骤2/6 发起无线电连接（阻塞调用）");
                 let tc = std::time::Instant::now();
                 let r = p_conn.connect();
-                crate::probe::log(
+                // 步骤结果行归全量：失败情形紧接着另有「连接失败于步骤2/6」
+                // 定案行走 essential，两种模式都不会漏掉失败。
+                crate::probe::log_step(
                     "simpleble",
                     &format!(
                         "连接步骤2/6 无线电连接返回：{}（本步耗时 {}ms）",
@@ -279,7 +281,7 @@ mod imp {
                     ));
                 }
             }
-            crate::probe::log(
+            crate::probe::log_step(
                 "simpleble",
                 &format!(
                     "连接步骤2/6 完成：无线电已连接（总耗时 {}ms）",
@@ -293,7 +295,7 @@ mod imp {
             let outbox_s = outbox_uuid();
             let services = peripheral.services().map_err(sble_err)?;
             let svc_list: Vec<String> = services.iter().map(|s| s.uuid()).collect();
-            crate::probe::log(
+            crate::probe::log_step(
                 "simpleble",
                 &format!(
                     "连接步骤3/6 完成：发现 {} 个服务 [{}]（总耗时 {}ms）",
@@ -319,7 +321,7 @@ mod imp {
             let outbox = chars
                 .iter()
                 .find(|c| c.uuid().eq_ignore_ascii_case(&outbox_s));
-            crate::probe::log(
+            crate::probe::log_step(
                 "simpleble",
                 &format!(
                     "连接步骤4/6 特征值检查：写入特征{}、通知特征{}",
@@ -341,7 +343,7 @@ mod imp {
             }
 
             let mut values = peripheral.notify(&svc, &outbox_s).map_err(sble_err)?;
-            crate::probe::log(
+            crate::probe::log_step(
                 "simpleble",
                 &format!(
                     "连接步骤4/6 完成：已订阅通知，链路就绪，等待握手（步骤5-6/6）（总耗时 {}ms）",
@@ -460,6 +462,11 @@ mod imp {
                 return Err(TransportError::Ble("蓝牙未开启，请先打开系统蓝牙".into()));
             }
             let local = adapter.create_local_peripheral().map_err(sble_err)?;
+            // 关键步骤先落日志再做事：进程若死在动作里，日志尾部即崩溃点
+            crate::probe::log_step(
+                "simpleble",
+                "服务端：正在发布服务（注册 BlueLink 服务与特征）",
+            );
             let service = local.add_service(&service_uuid()).map_err(sble_err)?;
             let inbox = service
                 .add_characteristic(
@@ -489,8 +496,9 @@ mod imp {
                 .add_advertised_service(&service_uuid())
                 .map_err(sble_err)?;
             local.set_connectable(true).map_err(sble_err)?;
+            crate::probe::log_step("simpleble", "服务端：正在启动广播");
             local.start().map_err(sble_err)?;
-            crate::probe::log(
+            crate::probe::log_step(
                 "simpleble",
                 &format!(
                     "服务端：服务发布与广播启动成功（广播带 BlueLink 服务 {}，可连接）",
@@ -523,14 +531,14 @@ mod imp {
                 while let Some(event) = client_events.next().await {
                     match event {
                         ClientEvent::Connected(addr) => {
-                            crate::probe::log(
+                            crate::probe::log_step(
                                 "simpleble",
                                 &format!("服务端：有设备连入（对方 {addr}）"),
                             );
                             *client_addr.lock().unwrap() = Some(addr);
                         }
                         ClientEvent::Disconnected(addr) => {
-                            crate::probe::log(
+                            crate::probe::log_step(
                                 "simpleble",
                                 &format!("服务端：对方断开（对方 {addr}）"),
                             );
@@ -554,7 +562,7 @@ mod imp {
                 while let Some(event) = outbox_events.next().await {
                     match event {
                         Ev::Subscribed => {
-                            crate::probe::log(
+                            crate::probe::log_step(
                                 "simpleble",
                                 "服务端：对方已订阅通知，链路建立，等待握手",
                             );

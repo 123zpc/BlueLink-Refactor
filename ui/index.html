@@ -220,6 +220,7 @@
         </div>
       </header>
       <div id="pin-bar" class="hidden"></div>
+      <div id="pin-list" class="hidden"></div>
       <div id="messages"></div>
       <div id="tag-ribbon"></div>
       <div id="ribbon-list" class="hidden"></div>
@@ -305,6 +306,11 @@
         <div class="setting-row"><span>设备名称</span><b id="set-name">-</b></div>
         <div class="setting-row"><span>连接码</span><b id="set-code">-</b></div>
         <div class="setting-row"><span>下载目录</span><span id="set-dl" class="muted small">-</span></div>
+        <div class="setting-row">
+          <span>系统通知</span>
+          <label class="switch"><input type="checkbox" id="notify-toggle" checked><span class="switch-track"></span></label>
+        </div>
+        <p class="muted small">收到对方新消息时，若窗口不在前台（托盘/最小化/失焦）弹系统通知；正看着应用时不弹。默认开启。</p>
         <h3>AI 接口（OpenAI 兼容）</h3>
         <label class="field">接口地址<input id="ai-base" type="text" placeholder="https://api.openai.com/v1"></label>
         <label class="field">密钥<input id="ai-key" type="password" placeholder="留空表示不修改"></label>
@@ -361,7 +367,7 @@
         <div class="setting-row"><span>接收文件</span><span id="store-files" class="muted small">-</span></div>
         <div class="setting-row"><span>缓存（未完成的传输）</span><span id="store-cache" class="muted small">-</span></div>
         <div class="setting-row"><span>接收文件保存目录</span><span class="row-gap"><span id="store-dir" class="muted small path-text">-</span><button id="store-dir-change" class="btn small-btn">更改…</button><button id="store-dir-reset" class="btn small-btn">恢复默认</button></span></div>
-        <div class="setting-row"><span>运行日志</span><span class="row-gap"><span id="store-log" class="muted small path-text">-</span><button id="store-log-open" class="btn small-btn">打开日志目录</button></span></div>
+        <div class="setting-row"><span>运行日志</span><span class="row-gap"><span id="store-log" class="muted small path-text">-</span><button id="store-log-change" class="btn small-btn">更改…</button><button id="store-log-reset" class="btn small-btn">恢复默认</button><button id="store-log-open" class="btn small-btn">打开日志目录</button></span></div>
         <div class="row-gap">
           <button id="btn-clean-cache" class="btn">清理缓存</button>
           <button id="btn-clear-history" class="btn danger-btn">清空聊天记录</button>
@@ -374,7 +380,10 @@
         </div>
         <p class="muted small">在下方「关于」里连续点击版本号三次，可开启或关闭开发者模式。开启后，连接页可切换蓝牙传输方式（经典 / BLE / SimpleBLE），并多出局域网测试通道（仅供开发调试）。正式使用请用经典蓝牙。</p>
         <h3>关于</h3>
-        <p class="muted small">BlueLink <span id="set-version"></span> — 离线聊天与文件传输（重构版）。</p>
+        <p class="muted small version-line">BlueLink <span id="set-version"></span> — 离线聊天与文件传输（重构版）。</p>
+        <div class="setting-row"><span>作者</span><b>ZPC</b></div>
+        <div class="setting-row"><span>邮箱</span><span class="muted small">privacyporton@proton.me</span></div>
+        <div class="setting-row"><span>项目</span><span class="muted small">https://github.com/123zpc/BlueLink</span></div>
        </div>
       </div>
     </section>
@@ -441,6 +450,14 @@
         <button id="modal-cancel" class="btn">取消</button>
         <button id="modal-ok" class="btn danger-btn">确定</button>
       </div>
+    </div>
+  </div>
+  <div id="ver-egg" class="hidden">
+    <canvas id="egg-canvas"></canvas>
+    <div id="egg-caption">
+      <svg viewBox="0 0 48 48" class="logo-mark egg-mark"><g class="ring-me"><rect x="9" y="18.25" width="21" height="11.5" rx="5.75" transform="rotate(-45 19.5 24)"/></g><g class="ring-peer"><rect x="18" y="18.25" width="21" height="11.5" rx="5.75" transform="rotate(-45 28.5 24)"/></g></svg>
+      <div class="egg-text">无需网络，扣合即连。</div>
+      <div class="egg-sub">BlueLink · 作者 ZPC</div>
     </div>
   </div>
   <div id="toast" class="hidden"></div>

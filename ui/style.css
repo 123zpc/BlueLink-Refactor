@@ -126,9 +126,9 @@ section { display: flex; flex-direction: column; height: 100%; }
    布局规矩（用户三轮纠正定版）：两栏结构等高（满高 grid，同顶同底，不靠内容撑高度）；
    右栏 overflow 滚动、左面板列表区独立滚动；每卡按内容收高不留死空；
    末卡（连接步骤）flex-grow 吃剩余高度，卡内收尾行钉卡底。 */
-#connect-view { padding: 16px 24px; overflow: hidden; }
+#connect-view { padding: 12px 20px; overflow: hidden; }
 .connect-wrap { display: flex; flex-direction: column; height: 100%; min-height: 0; max-width: 1240px; width: 100%; margin: 0 auto; }
-.connect-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex: none; }
+.connect-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex: none; }
 .connect-head h1 { font-size: 20px; font-weight: 700; }
 .head-left { display: flex; align-items: center; gap: 10px; }
 .capsule { display: inline-flex; align-items: center; gap: 8px; background: var(--panel);
@@ -181,24 +181,24 @@ section { display: flex; flex-direction: column; height: 100%; }
    2026-11-19 用户新规矩：默认正常状态下右栏不出现滚动条——卡间距/内边距/行高已按
    默认窗口（1180×760）收紧到各常态卡栈完整塞下；overflow-y:auto 只作自适应兜底
    （窗口变矮、开发者模式多一张卡等内容变多时才滚）。 */
-.connect-side { display: flex; flex-direction: column; gap: 12px; overflow-y: auto; min-height: 0; padding-right: 2px; }
-.side-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 13px 18px; flex: none; }
-.side-card-title { font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
+.connect-side { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; min-height: 0; padding-right: 2px; }
+.side-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 11px 16px; flex: none; }
+.side-card-title { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
 .side-card-title.strong { font-size: 14.5px; font-weight: 600; color: var(--text); }
 .side-name { font-size: 16.5px; font-weight: 600; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.my-code-big { font-size: 34px; font-weight: 700; letter-spacing: 3px; line-height: 1.2; margin: 2px 0 4px; }
-.card-btns { display: flex; gap: 10px; align-items: center; margin: 10px 0 0; }
+.my-code-big { font-size: 30px; font-weight: 700; letter-spacing: 3px; line-height: 1.2; margin: 0 0 2px; }
+.card-btns { display: flex; gap: 10px; align-items: center; margin: 8px 0 0; }
 .btn.text-btn { background: none; border: none; color: var(--muted); padding: 8px 6px; }
 .btn.text-btn:hover { color: var(--text); background: none; }
 .btn.text-btn:disabled { opacity: 0.5; }
 .side-divider { border-top: 1px solid var(--border); margin: 10px 0; }
 /* 状态卡：每行一个圆点 + 文案；异常行橙色并带说明小字 */
-.status-line { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; line-height: 1.45; color: var(--text-2); padding: 2px 0; }
+.status-line { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; line-height: 1.45; color: var(--text-2); padding: 1px 0; }
 .status-line .status-dot { margin-top: 6px; }
 .status-line.warn { color: var(--warn); }
 .status-note { font-size: 12px; color: var(--muted); margin: 2px 0 4px 16px; line-height: 1.5; }
 /* 输码卡 */
-#bt-peer-code { width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px;
+#bt-peer-code { width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--bg); color: var(--text); font-size: 15px; letter-spacing: 1px; }
 #bt-peer-code:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: none; }
 #bt-peer-code.input-error { border-color: var(--err); }
@@ -210,7 +210,7 @@ section { display: flex; flex-direction: column; height: 100%; }
 /* 步骤卡（末卡）：吃剩余高度，步骤行距拉开、分隔线与提示钉卡底 */
 .steps-card { flex: 1 0 auto; display: flex; flex-direction: column; }
 .steps-list { display: flex; flex-direction: column; gap: 12px; line-height: 1.45; }
-#steps-guide { gap: 18px; }
+#steps-guide { gap: 12px; }
 .step-row { display: flex; gap: 10px; align-items: flex-start; font-size: 13.5px; }
 .step-num { width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: #fff;
   font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center; flex: none; margin-top: 1px; }
@@ -315,6 +315,9 @@ section { display: flex; flex-direction: column; height: 100%; }
 .msg:hover .msg-actions { visibility: visible; }
 .msg-actions button { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 11px; padding: 1px 6px; border-radius: 4px; }
 .msg-actions button:hover { color: var(--accent); background: var(--hover); }
+/* 已收藏态：收藏钮当场变样（v2.5.1 补反馈——旧版点了毫无反应像没生效） */
+.msg-actions button.marked { color: var(--accent); font-weight: 600; }
+#pin-bar { cursor: pointer; }
 .tag-chip { display: inline-block; background: var(--accent-soft); border: 1px solid transparent; border-radius: 6px;
   font-size: 11px; padding: 0 7px; margin-right: 4px; color: var(--accent); cursor: pointer; line-height: 1.7; }
 /* 小片悬浮不做染色等视觉变化：悬浮时只以提示（title）显示备注——用户 2026-11-18 21:34 澄清。
@@ -487,14 +490,17 @@ section { display: flex; flex-direction: column; height: 100%; }
 
 #ribbon-list { position: absolute; right: 150px; top: 76px; width: 300px; max-height: 46vh; overflow-y: auto; z-index: 7;
   background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16); padding: 6px; }
-#ribbon-list .rl-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; font-size: 13px; }
+/* 置顶消息列表（v2.5.1）：与彩签悬停列表同一套 .rl-* 条目口径，位置在置顶栏正下方（top 由 JS 按置顶栏实测设） */
+#pin-list { position: absolute; left: 12px; top: 76px; width: 320px; max-width: calc(100% - 24px); max-height: 46vh; overflow-y: auto; z-index: 7;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16); padding: 6px; }
+#ribbon-list .rl-head, #pin-list .rl-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; font-size: 13px; }
 #ribbon-list .rl-head .cs-dot { width: 11px; height: 11px; border-radius: 50%; }
-#ribbon-list .rl-item { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
-#ribbon-list .rl-item:hover { background: var(--hover); }
+#ribbon-list .rl-item, #pin-list .rl-item { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+#ribbon-list .rl-item:hover, #pin-list .rl-item:hover { background: var(--hover); }
 /* 悬停列表条目单行不换行：备注过长只显示一行省略号，完整备注靠条目悬停提示（title）看，
    保证每个分类的列表宽度一致（列表宽已固定 300px）——用户 2026-11-18 裁定。 */
-#ribbon-list .rl-note { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#ribbon-list .rl-sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#ribbon-list .rl-note, #pin-list .rl-note { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#ribbon-list .rl-sub, #pin-list .rl-sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .quote-block { border-left: 3px solid var(--muted); background: rgba(127, 127, 127, 0.10); border-radius: 4px;
   padding: 5px 8px; margin-bottom: 6px; font-size: 12.5px; color: var(--text-2); cursor: pointer;
@@ -535,6 +541,35 @@ section { display: flex; flex-direction: column; height: 100%; }
   border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 8px; font-size: 13px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2); }
 #toast.hidden { display: none; }
+#toast .toast-action { margin-left: 10px; border: none; background: none; color: var(--accent);
+  font: inherit; font-weight: 600; cursor: pointer; padding: 0; }
+/* 版本号不可选中：双击/三击手势不再顺带选中文本（旧版双击会复制的成因） */
+#set-version { user-select: none; -webkit-user-select: none; cursor: default; }
+.version-line { user-select: none; -webkit-user-select: none; }
+/* 版本号三击彩蛋（v2.5.1）：canvas 彩花全屏喷射，指针穿透不挡操作 */
+#ver-egg { position: fixed; inset: 0; z-index: 90; pointer-events: none; }
+#ver-egg.hidden { display: none; }
+#egg-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+#egg-caption { position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%);
+  display: flex; flex-direction: column; align-items: center; gap: 4px; opacity: 0; }
+#egg-caption.play { animation: egg-cap 2.8s ease forwards; }
+#egg-caption .egg-mark { width: 54px; height: 54px; }
+#egg-caption .egg-mark .ring-peer { opacity: 0.35; }
+#egg-caption.play .egg-mark .ring-peer { animation: egg-ring 2.8s ease forwards; }
+.egg-text { font-size: 15px; color: var(--text); letter-spacing: 0.04em; }
+.egg-sub { font-size: 12px; color: var(--muted); }
+@keyframes egg-cap {
+  0% { opacity: 0; transform: translate(-50%, -46%) scale(0.92); }
+  12% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  78% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -54%) scale(1); }
+}
+@keyframes egg-ring {
+  0% { opacity: 0.35; }
+  18% { opacity: 1; }
+  78% { opacity: 1; }
+  100% { opacity: 0.35; }
+}
 .range-input { width: 180px; accent-color: var(--accent); }
 .field textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; margin-top: 5px;
   background: var(--bg); color: var(--text); box-sizing: border-box; font: inherit; resize: vertical; }

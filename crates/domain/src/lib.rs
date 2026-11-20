@@ -106,6 +106,12 @@ pub struct Message {
     pub reply_to: Option<String>,
     pub status: MessageStatus,
     pub created_at: i64,
+    /// 本机落库序号（messages 表 rowid）：显示顺序的唯一依据（2026-11-20 v2.5.1）。
+    /// created_at 是发送方墙钟，双机时钟不一致时按它排序必然乱序；seq 是本机
+    /// 入账的单调序号，发送与接收都按入账先后，永不被墙钟污染。
+    /// 0 = 尚未落库（构造后、insert 前）；insert_message 返回并由调用方回填。
+    #[serde(default)]
+    pub seq: i64,
 }
 
 /// 文件元信息。

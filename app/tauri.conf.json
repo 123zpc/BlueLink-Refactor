@@ -6,11 +6,11 @@
     },
     "windows": [
       {
-        "height": 760,
-        "minHeight": 600,
-        "minWidth": 900,
+        "height": 740,
+        "minHeight": 740,
+        "minWidth": 1120,
         "title": "BlueLink",
-        "width": 1180
+        "width": 1120
       }
     ],
     "withGlobalTauri": true
@@ -31,5 +31,5 @@
   },
   "identifier": "app.bluelink.desktop",
   "productName": "BlueLink",
-  "version": "2.5.0"
+  "version": "2.5.1"
 }

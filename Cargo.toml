@@ -11,8 +11,14 @@ members = [
     "app",
 ]
 
+# ble-peripheral-rust 用仓库内 vendored 副本：原版 0.2.0 的 WinRT 事件回调里
+# 大量 unwrap，回调 panic 穿越 FFI 会让进程 abort（真机实证对端被连入时闪退）。
+# 补丁内容与原因见 third-party/ble-peripheral-rust/README.bluelink.md。
+[patch.crates-io]
+ble-peripheral-rust = { path = "third-party/ble-peripheral-rust" }
+
 [workspace.package]
-version = "2.5.0"
+version = "2.5.1"
 edition = "2021"
 license = "MIT"
 

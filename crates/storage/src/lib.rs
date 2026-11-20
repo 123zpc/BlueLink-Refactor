@@ -204,26 +204,24 @@ impl Storage {
     }
 
     // ---------- 消息 ----------
-    pub fn insert_message(&self, m: &Message) -> Result<(), StorageError> {
+    /// 插入消息，返回本机落库序号（rowid）——显示顺序的唯一依据，调用方
+    /// 应回填到 Message.seq 再发给前端（实时消息也要有真 seq 才能参与分页）。
+    pub fn insert_message(&self, m: &Message) -> Result<i64, StorageError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO messages(id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![m.id, m.conversation_id, sender_str(m.sender), msg_kind_str(m.kind), m.body, m.file_id, m.reply_to, status_str(m.status), m.created_at],
         )?;
+        let rowid: i64 = tx.last_insert_rowid();
         if m.kind == MessageKind::Text {
-            let rowid: i64 = tx.query_row(
-                "SELECT rowid FROM messages WHERE id=?1",
-                params![m.id],
-                |r| r.get(0),
-            )?;
             tx.execute(
                 "INSERT INTO messages_fts(rowid, body) VALUES(?1, ?2)",
                 params![rowid, m.body],
             )?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(rowid)
     }
 
     /// 删除一条消息（供 AI 重新生成替换旧回复用），连带清理全文索引与标记。
@@ -259,7 +257,7 @@ impl Storage {
 
     pub fn get_message(&self, id: &str) -> Result<Option<Message>, StorageError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at FROM messages WHERE id=?1")?;
+        let mut stmt = conn.prepare("SELECT rowid,id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at FROM messages WHERE id=?1")?;
         let mut rows = stmt.query_map(params![id], map_message)?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
@@ -267,7 +265,9 @@ impl Storage {
         }
     }
 
-    /// 按时间正序取会话消息；before 为分页游标（取该时间之前的消息），配合 limit 取最近一页后在内存中翻正。
+    /// 按入账序（rowid）正序取会话消息；before 为分页游标（取 seq 小于它的
+    /// 消息），配合 limit 取最近一页后在内存中翻正。排序只认本机落库序号，
+    /// 永不按发送方墙钟 created_at——双机时钟差下墙钟序必然乱（v2.5.1 定案）。
     pub fn list_messages(
         &self,
         conversation_id: &str,
@@ -276,8 +276,8 @@ impl Storage {
     ) -> Result<Vec<Message>, StorageError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at FROM messages
-             WHERE conversation_id=?1 AND (?2 IS NULL OR created_at<?2) ORDER BY created_at DESC LIMIT ?3")?;
+            "SELECT rowid,id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at FROM messages
+             WHERE conversation_id=?1 AND (?2 IS NULL OR rowid<?2) ORDER BY rowid DESC LIMIT ?3")?;
         let rows = stmt.query_map(params![conversation_id, before, limit], map_message)?;
         let mut v: Vec<Message> = rows.collect::<Result<_, _>>()?;
         v.reverse();
@@ -296,9 +296,9 @@ impl Storage {
             .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at
+            "SELECT rowid,id,conversation_id,sender,kind,body,file_id,reply_to,status,created_at
              FROM messages
-             WHERE body LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC LIMIT 200",
+             WHERE body LIKE ?1 ESCAPE '\\' ORDER BY created_at DESC, rowid DESC LIMIT 200",
         )?;
         let rows = stmt.query_map(params![pattern], map_message)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -375,9 +375,9 @@ impl Storage {
     pub fn list_messages_by_tag(&self, tag_name: &str) -> Result<Vec<Message>, StorageError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT m.id,m.conversation_id,m.sender,m.kind,m.body,m.file_id,m.reply_to,m.status,m.created_at
+            "SELECT m.rowid,m.id,m.conversation_id,m.sender,m.kind,m.body,m.file_id,m.reply_to,m.status,m.created_at
              FROM messages m JOIN message_tags mt ON mt.message_id=m.id JOIN tags t ON t.id=mt.tag_id
-             WHERE t.name=?1 COLLATE NOCASE ORDER BY m.created_at")?;
+             WHERE t.name=?1 COLLATE NOCASE ORDER BY m.created_at, m.rowid")?;
         let rows = stmt.query_map(params![tag_name], map_message)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -464,14 +464,14 @@ impl Storage {
     ) -> Result<Vec<CategorizedMessage>, StorageError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT m.id,m.conversation_id,m.sender,m.kind,m.body,m.file_id,m.reply_to,m.status,m.created_at, mc.note
+            "SELECT m.rowid,m.id,m.conversation_id,m.sender,m.kind,m.body,m.file_id,m.reply_to,m.status,m.created_at, mc.note
              FROM messages m JOIN message_category mc ON mc.message_id=m.id
-             WHERE mc.color=?1 ORDER BY m.created_at",
+             WHERE mc.color=?1 ORDER BY m.created_at, m.rowid",
         )?;
         let rows = stmt.query_map(params![color], |r| {
             Ok(CategorizedMessage {
                 message: map_message(r)?,
-                note: r.get(9)?,
+                note: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -505,8 +505,8 @@ impl Storage {
     pub fn list_marked(&self, kind: MarkKind) -> Result<Vec<Message>, StorageError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT m.id,m.conversation_id,m.sender,m.kind,m.body,m.file_id,m.reply_to,m.status,m.created_at
-             FROM messages m JOIN message_marks mk ON mk.message_id=m.id WHERE mk.kind=?1 ORDER BY m.created_at")?;
+            "SELECT m.rowid,m.id,m.conversation_id,m.sender,m.kind,m.body,m.file_id,m.reply_to,m.status,m.created_at
+             FROM messages m JOIN message_marks mk ON mk.message_id=m.id WHERE mk.kind=?1 ORDER BY m.created_at, m.rowid")?;
         let rows = stmt.query_map(params![kind.as_str()], map_message)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -632,30 +632,31 @@ impl Storage {
 
 fn map_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
-        id: r.get(0)?,
-        conversation_id: r.get(1)?,
-        sender: match r.get::<_, String>(2)?.as_str() {
+        seq: r.get(0)?,
+        id: r.get(1)?,
+        conversation_id: r.get(2)?,
+        sender: match r.get::<_, String>(3)?.as_str() {
             "me" => Sender::Me,
             "ai" => Sender::Ai,
             "system" => Sender::System,
             _ => Sender::Peer,
         },
-        kind: match r.get::<_, String>(3)?.as_str() {
+        kind: match r.get::<_, String>(4)?.as_str() {
             "file" => MessageKind::File,
             "system" => MessageKind::System,
             _ => MessageKind::Text,
         },
-        body: r.get(4)?,
-        file_id: r.get(5)?,
-        reply_to: r.get(6)?,
-        status: match r.get::<_, String>(7)?.as_str() {
+        body: r.get(5)?,
+        file_id: r.get(6)?,
+        reply_to: r.get(7)?,
+        status: match r.get::<_, String>(8)?.as_str() {
             "sending" => MessageStatus::Sending,
             "sent" => MessageStatus::Sent,
             "delivered" => MessageStatus::Delivered,
             "failed" => MessageStatus::Failed,
             _ => MessageStatus::Received,
         },
-        created_at: r.get(8)?,
+        created_at: r.get(9)?,
     })
 }
 
@@ -689,6 +690,7 @@ mod tests {
             reply_to: None,
             status: MessageStatus::Sent,
             created_at: ts,
+            seq: 0,
         }
     }
 
@@ -759,9 +761,8 @@ mod tests {
         let page = s.list_messages(&c.id, None, 20).unwrap();
         assert_eq!(page.len(), 20);
         assert_eq!(page[0].id, "m10");
-        let older = s
-            .list_messages(&c.id, Some(page[0].created_at), 20)
-            .unwrap();
+        // 分页游标 = 入账序号 seq（v2.5.1 起，不再是 created_at）
+        let older = s.list_messages(&c.id, Some(page[0].seq), 20).unwrap();
         assert_eq!(older.len(), 10);
         let hits = s.search_messages("苹果").unwrap();
         assert_eq!(hits.len(), 30);
@@ -868,6 +869,43 @@ mod tests {
         assert_eq!(
             s.get_setting("download_dir").unwrap().as_deref(),
             Some("/tmp/dl")
+        );
+    }
+
+    /// 显示顺序只认本机入账序号（2026-11-20 v2.5.1）：created_at 故意倒序、
+    /// 同毫秒混杂插入，list_messages 必须按入账序返回；游标分页按 seq 向前
+    /// 翻，同毫秒消息一条不吞。
+    #[test]
+    fn 消息按入账序而非墙钟序() {
+        let (s, c) = 准备();
+        // 入账顺序 m1..m5，created_at 分别 5000/1000/3000/3000/2000（模拟对端
+        // 时钟差与同毫秒连发）：按旧口径 ORDER BY created_at 会得到
+        // m2,m5,m3/m4(并列序不稳),m1 的乱序。
+        let stamps = [5000_i64, 1000, 3000, 3000, 2000];
+        for (i, ts) in stamps.iter().enumerate() {
+            let m = 消息(&format!("m{}", i + 1), &c.id, "x", *ts);
+            s.insert_message(&m).unwrap();
+        }
+        let all = s.list_messages(&c.id, None, 10).unwrap();
+        let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["m1", "m2", "m3", "m4", "m5"]);
+        // seq 即 rowid：严格递增且与返回一致
+        assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+        // 分页：先取最近 2 条，再以首条 seq 为游标向前翻——同毫秒的 m3 必须在内
+        let page1 = s.list_messages(&c.id, None, 2).unwrap();
+        assert_eq!(
+            page1.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["m4", "m5"]
+        );
+        let page2 = s.list_messages(&c.id, Some(page1[0].seq), 2).unwrap();
+        assert_eq!(
+            page2.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["m2", "m3"]
+        );
+        let page3 = s.list_messages(&c.id, Some(page2[0].seq), 2).unwrap();
+        assert_eq!(
+            page3.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["m1"]
         );
     }
 }

@@ -36,6 +36,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_Devices_Bluetooth",
     "Win32_System_Com",
+    "Win32_System_SystemInformation",
 ] }
 # RSSI 探针走 WinRT DeviceWatcher（windows-sys 不含 WinRT 绑定，故另用 windows 包）：
 # 仅日志诊断经典设备的 AEP SignalStrength 属性是否填充，见 classic.rs 探针一节。
