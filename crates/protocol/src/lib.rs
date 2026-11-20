@@ -64,6 +64,12 @@ pub enum Control {
         size: u64,
         sha256: String,
         mime: Option<String>,
+        /// 图片组归属（v2.6.0）：Some 时表示本文件是某图片组的一员。
+        /// 老版本（≤v2.5.2）反序列化时按 serde 默认规则忽略这个未知
+        /// 字段，照常把每张图当独立文件消息接收——即天然逐张降级；
+        /// 新版本据此把成员收进同一条组消息而不是逐张建消息。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<GroupRef>,
     },
     FileAccept {
         transfer_id: String,
@@ -129,6 +135,15 @@ impl Control {
             Control::Pong => 0x31,
         }
     }
+}
+
+/// 图片组归属（随 FileOffer 承载）：组消息 ID + 本成员在组内的
+/// 顺序下标（0 起）+ 组内总数。接收方据此把成员按序收进组清单。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupRef {
+    pub group_id: String,
+    pub index: u32,
+    pub total: u32,
 }
 
 /// 文件分片帧（类型码 0x12，二进制承载）。
@@ -376,5 +391,84 @@ mod tests {
         let mut cursor = std::io::Cursor::new(bytes);
         let got = read_frame(&mut cursor).await.unwrap().unwrap();
         assert_eq!(got, f);
+    }
+
+    #[tokio::test]
+    async fn 图片组要约往返一致() {
+        let f = Frame::Control(Control::FileOffer {
+            transfer_id: "t1".into(),
+            msg_id: "member-1".into(),
+            name: "a.jpg".into(),
+            size: 123,
+            sha256: "ab".into(),
+            mime: None,
+            group: Some(GroupRef {
+                group_id: "g1".into(),
+                index: 2,
+                total: 5,
+            }),
+        });
+        let bytes = encode(&f).unwrap();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let got = read_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(got, f);
+        // 无 group 时不写出该字段（与老版本帧逐字节同构）
+        let plain = Frame::Control(Control::FileOffer {
+            transfer_id: "t1".into(),
+            msg_id: "m".into(),
+            name: "a.jpg".into(),
+            size: 1,
+            sha256: "ab".into(),
+            mime: None,
+            group: None,
+        });
+        let s = String::from_utf8(encode(&plain).unwrap()).unwrap();
+        assert!(!s.contains("group"), "无组时不应出现 group 字段：{s}");
+    }
+
+    /// 降级锚点：用「老版本形态」的枚举（FileOffer 没有 group 字段，
+    /// 其余与 v2.5.2 相同）解析新版本带 group 的帧 JSON——serde 默认
+    /// 忽略未知字段，解析必须成功且字段不丢。老版本真机行为以
+    /// v2.5.2 源码 worktree 双端实测为准（见 QA），此测只锁线格式。
+    #[test]
+    fn 老形态枚举能解析带组字段的要约() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum OldControl {
+            FileOffer {
+                transfer_id: String,
+                msg_id: String,
+                name: String,
+                size: u64,
+                sha256: String,
+                mime: Option<String>,
+            },
+        }
+        let new = Control::FileOffer {
+            transfer_id: "t1".into(),
+            msg_id: "member-1".into(),
+            name: "a.jpg".into(),
+            size: 123,
+            sha256: "ab".into(),
+            mime: None,
+            group: Some(GroupRef {
+                group_id: "g1".into(),
+                index: 0,
+                total: 4,
+            }),
+        };
+        let json = serde_json::to_vec(&new).unwrap();
+        let old: OldControl = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            old,
+            OldControl::FileOffer {
+                transfer_id: "t1".into(),
+                msg_id: "member-1".into(),
+                name: "a.jpg".into(),
+                size: 123,
+                sha256: "ab".into(),
+                mime: None,
+            }
+        );
     }
 }

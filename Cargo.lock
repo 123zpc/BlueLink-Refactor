@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-ai"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "futures-util",
  "reqwest 0.12.28",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-app"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "bluelink-ai",
  "bluelink-domain",
@@ -417,16 +417,17 @@ dependencies = [
 
 [[package]]
 name = "bluelink-domain"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "uuid",
 ]
 
 [[package]]
 name = "bluelink-node"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "bluelink-ai",
  "bluelink-domain",
@@ -438,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-protocol"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "bluelink-domain",
  "serde",
@@ -450,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-services"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "arboard",
  "bluelink-ai",
@@ -469,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-storage"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "bluelink-domain",
  "rusqlite",
@@ -479,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "bluelink-transport"
-version = "2.5.2"
+version = "2.6.0"
 dependencies = [
  "ble-peripheral-rust",
  "bluelink-protocol",
@@ -2193,6 +2194,12 @@ dependencies = [
  "http-body",
  "pin-project-lite",
 ]
+
+[[package]]
+name = "http-range"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2149c4b4b83390c71fab669730347d578ec6bdf759f2160c581ad8b8819733b4"
 
 [[package]]
 name = "httparse"
@@ -4957,6 +4964,7 @@ dependencies = [
  "gtk",
  "heck 0.5.0",
  "http",
+ "http-range",
  "jni 0.21.1",
  "libc",
  "log",

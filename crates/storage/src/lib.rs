@@ -60,6 +60,7 @@ fn msg_kind_str(k: MessageKind) -> &'static str {
         MessageKind::Text => "text",
         MessageKind::File => "file",
         MessageKind::System => "system",
+        MessageKind::ImageGroup => "imagegroup",
     }
 }
 fn status_str(s: MessageStatus) -> &'static str {
@@ -252,6 +253,14 @@ impl Storage {
             "UPDATE messages SET status=?2 WHERE id=?1",
             params![id, status_str(status)],
         )?;
+        Ok(())
+    }
+
+    /// 只更新消息正文（图片组接收端逐张追加清单用）：不动 rowid，
+    /// 消息的落库序号（显示顺序）保持首次插入时的位置。
+    pub fn update_message_body(&self, id: &str, body: &str) -> Result<(), StorageError> {
+        let conn = self.lock();
+        conn.execute("UPDATE messages SET body=?2 WHERE id=?1", params![id, body])?;
         Ok(())
     }
 
@@ -644,6 +653,7 @@ fn map_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         kind: match r.get::<_, String>(4)?.as_str() {
             "file" => MessageKind::File,
             "system" => MessageKind::System,
+            "imagegroup" => MessageKind::ImageGroup,
             _ => MessageKind::Text,
         },
         body: r.get(5)?,

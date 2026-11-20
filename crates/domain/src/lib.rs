@@ -102,6 +102,53 @@ pub enum MessageKind {
     Text,
     File,
     System,
+    /// 图片组（v2.6.0）：多张图片合并为一条消息，body 存 JSON 清单
+    /// （见 GroupItem / group_manifest）。file_id 恒为 None，成员文件
+    /// 各自走普通文件传输，清单按发送顺序排列。
+    ImageGroup,
+}
+
+/// 图片组成员清单项（组消息 body 的 JSON 结构，一项一张图）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupItem {
+    /// 成员自己的消息 ID（传输进度/状态事件按它回指；成员本身不是
+    /// 独立消息行，只是组消息清单里的一项）。
+    pub msg_id: String,
+    /// 成员文件在 files 表里的 ID。
+    pub file_id: String,
+    /// 文件名（展示与「保存全部」时取扩展名用）。
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+    /// 在组内的发送顺序下标（0 起）：接收端成员可能乱序到达（断线
+    /// 重发等），清单一律按 idx 排序还原发送顺序。
+    #[serde(default)]
+    pub idx: u32,
+}
+
+/// 组消息 body 的清单 JSON（版本化，前向兼容：读方忽略未知字段）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupManifest {
+    pub v: u32,
+    pub items: Vec<GroupItem>,
+}
+
+/// 把成员清单编码为组消息 body。序列化失败理论上不会发生（纯数据
+/// 结构），兜底给空清单 JSON 而不是 panic。
+pub fn group_manifest_json(items: &[GroupItem]) -> String {
+    let m = GroupManifest {
+        v: 1,
+        items: items.to_vec(),
+    };
+    serde_json::to_string(&m).unwrap_or_else(|_| "{\"v\":1,\"items\":[]}".to_string())
+}
+
+/// 解析组消息 body 的清单；格式不对时返回空清单（查看器/气泡按空组
+/// 降级展示，不许让一条坏数据把消息列表带崩）。
+pub fn parse_group_manifest(body: &str) -> Vec<GroupItem> {
+    serde_json::from_str::<GroupManifest>(body)
+        .map(|m| m.items)
+        .unwrap_or_default()
 }
 
 /// 消息状态。
@@ -320,5 +367,38 @@ mod tests {
             Vec::<(u64, u64)>::new()
         );
         assert_eq!(missing_ranges(&vec![], 10), vec![(0, 10)]);
+    }
+
+    #[test]
+    fn 图片组清单往返与坏数据降级() {
+        let items = vec![
+            GroupItem {
+                msg_id: "m1".into(),
+                file_id: "f1".into(),
+                name: "甲.jpg".into(),
+                size: 10,
+                sha256: "aa".into(),
+                idx: 0,
+            },
+            GroupItem {
+                msg_id: "m2".into(),
+                file_id: "f2".into(),
+                name: "b.png".into(),
+                size: 20,
+                sha256: "bb".into(),
+                idx: 1,
+            },
+        ];
+        let body = group_manifest_json(&items);
+        assert_eq!(parse_group_manifest(&body), items);
+        // 坏数据/空清单一律降级为空，不 panic
+        assert!(parse_group_manifest("not json").is_empty());
+        assert!(parse_group_manifest("").is_empty());
+        assert!(parse_group_manifest("{}").is_empty());
+        // MessageKind 序列化口径与存储层一致
+        assert_eq!(
+            serde_json::to_string(&MessageKind::ImageGroup).unwrap(),
+            "\"imagegroup\""
+        );
     }
 }
