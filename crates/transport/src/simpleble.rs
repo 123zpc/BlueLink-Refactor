@@ -23,8 +23,8 @@ pub fn simpleble_compiled() -> bool {
 mod imp {
     use super::{FoundDevice, TransportError};
     use crate::ble::{
-        channel_stream, merge_same_name, StreamEnds, ATT_CHUNK, CONNECT_TIMEOUT, INBOX_UUID,
-        OUTBOX_UUID, SERVICE_UUID,
+        channel_stream, merge_same_name, SliceDecoder, SliceEncoder, StreamEnds, CONNECT_TIMEOUT,
+        INBOX_UUID, OUTBOX_UUID, SERVICE_UUID,
     };
     use crate::Conn;
     use futures_util::StreamExt;
@@ -53,27 +53,41 @@ mod imp {
         OUTBOX_UUID.to_string()
     }
 
-    /// 一条链路的入站字节发送端（会话级）：多个生产者（通知流 / 写事件）共用，
+    /// 一条链路的入站切片发送端（会话级）：多个生产者（通知流 / 写事件）共用，
     /// 断链时 take 掉并 drop，Conn 读端随即收到 EOF，与 ble 模块的语义一致。
+    /// v2.6.2：入站先过切片序号验收（与 ble 模块同一套 SliceDecoder）；
+    /// 喂流改 send().await 等待背压——旧版 try_send 满即丢片是字节流
+    /// 失步的实锤来源之一，绝不许再静默丢字节。
     #[derive(Clone)]
-    struct SessionTx(Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>);
+    struct SessionTx {
+        tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+        slicer: Arc<Mutex<SliceDecoder>>,
+    }
 
     impl SessionTx {
         fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
-            Self(Arc::new(Mutex::new(Some(tx))))
+            Self {
+                tx: Arc::new(Mutex::new(Some(tx))),
+                slicer: Arc::new(Mutex::new(SliceDecoder::new("simpleble"))),
+            }
         }
 
-        fn send(&self, data: Vec<u8>) {
-            let guard = self.0.lock().unwrap();
-            if let Some(tx) = guard.as_ref() {
-                // 通道满时丢弃（与 ble 服务端 try_send 行为一致）：协议帧有校验，
-                // 上层会以断链/重传收场，不会静默错乱。
-                let _ = tx.try_send(data);
+        async fn send(&self, data: Vec<u8>) {
+            let bytes = {
+                let mut dec = self.slicer.lock().unwrap();
+                dec.decode(&data)
+            };
+            let Some(bytes) = bytes else {
+                return; // 重复/损坏片已在解码器里计数落日志
+            };
+            let tx = self.tx.lock().unwrap().clone();
+            if let Some(tx) = tx {
+                let _ = tx.send(bytes).await;
             }
         }
 
         fn close(&self) {
-            self.0.lock().unwrap().take();
+            self.tx.lock().unwrap().take();
         }
     }
 
@@ -399,7 +413,7 @@ mod imp {
             let in_session = session.clone();
             tokio::spawn(async move {
                 while let Some(ValueChangedEvent::ValueUpdated(data)) = values.next().await {
-                    in_session.send(data);
+                    in_session.send(data).await;
                 }
                 in_session.close();
             });
@@ -420,7 +434,7 @@ mod imp {
             let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
             let mut outgoing_rx = outgoing_rx;
             tokio::spawn(async move {
-                while let Some(bytes) = outgoing_rx.recv().await {
+                while let Some((bytes, _slot)) = outgoing_rx.recv().await {
                     if std_tx.send(bytes).is_err() {
                         break;
                     }
@@ -429,10 +443,10 @@ mod imp {
             let p_write = peripheral.clone();
             let w_session = session.clone();
             std::thread::spawn(move || {
+                let mut slicer = SliceEncoder::new();
                 while let Ok(bytes) = std_rx.recv() {
                     let mut failed = false;
-                    for piece in bytes.chunks(ATT_CHUNK) {
-                        let data = piece.to_vec();
+                    for data in slicer.encode(&bytes) {
                         let r = if write_command {
                             p_write.write_command(&svc, &inbox_s, &data)
                         } else {
@@ -617,10 +631,11 @@ mod imp {
                             let out_char = outbox_pump.clone();
                             let w_session = session.clone();
                             tokio::spawn(async move {
-                                while let Some(bytes) = outgoing_rx.recv().await {
+                                let mut slicer = SliceEncoder::new();
+                                while let Some((bytes, _slot)) = outgoing_rx.recv().await {
                                     let mut failed = false;
-                                    for piece in bytes.chunks(ATT_CHUNK) {
-                                        if out_char.set_value(piece).is_err() {
+                                    for piece in slicer.encode(&bytes) {
+                                        if out_char.set_value(&piece).is_err() {
                                             failed = true;
                                             break;
                                         }
@@ -661,7 +676,7 @@ mod imp {
                     if let Ev::Written(data) = event {
                         let session = link.lock().unwrap().clone();
                         if let Some(session) = session {
-                            session.send(data);
+                            session.send(data).await;
                         }
                     }
                 }

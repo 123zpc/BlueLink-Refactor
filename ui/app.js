@@ -26,6 +26,11 @@ const state = {
   catEditId: null,
   pendingFiles: [],
   transferMap: {},
+  // 滚动定版（v2.6.2，用户亲自收口）：每容器一个跟随开关——贴底时
+  // 为 true；用户手势（滚轮/触摸/拖滚动条/键盘）一出立即置 false，
+  // 不靠位置猜；恢复只由自滚回底/点回到最新/本人发送触发。
+  follow: { chat: true, ai: true },
+  chatWaitRow: null,
   quoteFrom: null,
   favIds: new Set(),
   pins: [],
@@ -85,7 +90,21 @@ function md(s) {
       const id = ++MD_CODE_SEQ;
       MD_CODE_BLOCKS.set(id, raw);
       const lang = fence[1] || "代码";
-      out += `<div class="md-code"><div class="md-code-head"><span>${esc(lang)}</span><button type="button" class="md-copy" data-mdcopy="${id}">复制</button></div><pre><code>${esc(raw)}</code></pre></div>`;
+      // #7 代码高亮（v2.6.2）：已闭合的代码块按围栏语言走查看器同一
+      // 套 tokenizer 上色（浅/深同主题）；流式中未闭合的块先素色，
+      // 收尾闭合后在下一片重渲染时自然补上高亮，不拖卡流式。
+      const closedBlock = i <= lines.length && buf.length >= 0 && (i - 1 < lines.length) && /^```\s*$/.test(lines[i - 1] || "");
+      let codeHtml = esc(raw);
+      const fl = closedBlock && typeof langOfFence === "function" ? langOfFence(fence[1]) : null;
+      if (fl && fl !== "text") {
+        let st = { block: false, tpl: false };
+        codeHtml = buf.map((ln) => {
+          const r = tvTokenizeLine(ln, fl, st);
+          st = r.st;
+          return r.html;
+        }).join("\n");
+      }
+      out += `<div class="md-code"><div class="md-code-head"><span>${esc(lang)}</span><button type="button" class="md-copy" data-mdcopy="${id}">复制</button></div><pre><code>${codeHtml}</code></pre></div>`;
       continue;
     }
     const h = line.match(/^(#{1,6})\s+(.*)$/);
@@ -190,8 +209,20 @@ function autoGrow(el) {
   // 元素所在视图隐藏时没有布局，scrollHeight 为 0，量出来会把输入框压成一条缝；
   // 隐藏时跳过，等视图切回来再量（switchView 末尾会补调）。
   if (el.offsetParent === null) return;
-  el.style.height = "auto";
-  el.style.height = Math.min(Math.max(el.scrollHeight, COMPOSER_MIN_H), COMPOSER_MAX_H) + "px";
+  // #8 万行粘贴防冻：超长内容必然是多行，直接钉上限高度，跳过对
+  // 整段文本的 scrollHeight 测量（那会触发整篇布局、冻住界面）。
+  if (el.value.length > 3000) {
+    el.style.height = COMPOSER_MAX_H + "px";
+  } else {
+    el.style.height = "auto";
+    el.style.height = Math.min(Math.max(el.scrollHeight, COMPOSER_MIN_H), COMPOSER_MAX_H) + "px";
+  }
+  // #4 思考胶囊对齐：AI 输入行单行时居中、多行时与发送键同排（CSS
+  // 按 .grown 切换对齐方式，与聊天输入框的底排逻辑一致）。
+  if (el.id === "ai-input") {
+    const row = el.closest(".composer-row");
+    if (row) row.classList.toggle("grown", el.scrollHeight > COMPOSER_MIN_H + 4 || el.value.length > 3000);
+  }
 }
 function wireAutoGrow(id) {
   const el = $(id);
@@ -222,12 +253,13 @@ function buildMessageEl(m, opts = {}) {
     fillQuote(q, m);
   }
   if (m.kind === "imagegroup") {
+    row.classList.add("img-row");
     buildGroupBubble(bubble, m, row);
   } else if (m.kind === "file") {
     bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div><div class="progress hidden"><div></div></div><div class="progress-meta hidden"></div><button class="progress-cancel hidden">取消</button><button class="transfer-retry hidden">重试</button>`;
     state.lastFileBubble = bubble;
     // ㉑ 单张图片在气泡里直接出预览（详见 attachImagePreview）
-    if (isImageExt(fileExt(m.body))) attachImagePreview(bubble, m.id);
+    if (isImageExt(fileExt(m.body))) attachImagePhoto(bubble, m.id);
     bubble.addEventListener("click", (e) => {
       if (e.target.closest("button")) return;
       openFileSmart(m, e.clientX, e.clientY);
@@ -283,6 +315,9 @@ function buildMessageEl(m, opts = {}) {
   // 聊天里的 @AI 回答同样给复制/重新生成（v2.6.1 ⑭：此前只有 AI 页有，
   // 聊天侧点了没反应/没入口）；重新生成走 chat_regenerate_ai 按原问题重答
   if (!opts.ai && m.sender === "ai") btns.push(["复制", () => navigator.clipboard.writeText(m.body)], ["重新生成", () => chatRegenerateAi(m)]);
+  // #10 AI 回复收起（v2.6.2）：长回复看过一遍可折成收缩条，状态按
+  // 消息 id 持久化（localStorage，重启不丢），两处（AI 页/聊天）同效。
+  if (m.sender === "ai") btns.push([aiCollapsed(m.id) ? "展开" : "收起", (e) => toggleAiCollapse(m, bubble, e.currentTarget)]);
   for (const [label, fn] of btns) {
     const b = document.createElement("button");
     b.textContent = label;
@@ -291,6 +326,7 @@ function buildMessageEl(m, opts = {}) {
     b.addEventListener("click", fn);
     actions.appendChild(b);
   }
+  if (m.sender === "ai" && aiCollapsed(m.id)) applyAiCollapse(bubble, m);
   meta.appendChild(status); meta.appendChild(time); meta.appendChild(actions);
   // 聊天里的 AI 回答（@AI 提问产生）加一个「AI 回答」标记，与对方消息区分
   if (!opts.ai && m.sender === "ai") {
@@ -304,6 +340,33 @@ function buildMessageEl(m, opts = {}) {
   row.addEventListener("contextmenu", (e) => { e.preventDefault(); openMsgMenu(m, e.clientX, e.clientY); });
   refreshMessageCategory(m.id, tagsSpan);
   return row;
+}
+
+// ---------- #10 AI 回复收起 ----------
+function aiCollapsedSet() {
+  try { return new Set(JSON.parse(localStorage.getItem("bl-collapsed-msgs") || "[]")); }
+  catch (_) { return new Set(); }
+}
+function aiCollapsed(mid) { return aiCollapsedSet().has(mid); }
+function applyAiCollapse(bubble, m) {
+  const first = (m.body || "").split("\n").map((l) => l.replace(/[#>*`\-]/g, "").trim()).find((l) => l) || "AI 回复";
+  bubble.innerHTML = "";
+  const bar = document.createElement("div");
+  bar.className = "ai-collapsed-bar";
+  bar.innerHTML = `<span class="ai-collapsed-text">${esc(first.slice(0, 48))}</span><span class="ai-collapsed-hint">已收起 · 点击展开</span>`;
+  bar.addEventListener("click", () => toggleAiCollapse(m, bubble, null));
+  bubble.appendChild(bar);
+}
+function toggleAiCollapse(m, bubble, btn) {
+  const set = aiCollapsedSet();
+  if (set.has(m.id)) set.delete(m.id); else set.add(m.id);
+  localStorage.setItem("bl-collapsed-msgs", JSON.stringify([...set].slice(-500)));
+  if (set.has(m.id)) {
+    applyAiCollapse(bubble, m);
+  } else {
+    bubble.innerHTML = md(m.body);
+  }
+  if (btn) btn.textContent = set.has(m.id) ? "展开" : "收起";
 }
 
 /** 消息状态展示：失败时标红可点重试（文本原地重发；文件重发会生成新气泡并移除旧的）。 */
@@ -420,10 +483,15 @@ function appendMessage(container, m, renderedSet, opts) {
   }
   container.appendChild(el);
   renderedSet.add(m.id);
-  // ⑥ 跟随滚动要有分寸：本来就在底部附近（≤80px）才跟随到底；
-  // 用户上滑看历史时新消息/流式落库不许把视图抢走。整页加载走
-  // loadChatMessages/loadAiMessages 的显式滚底，不经这里。
-  if (nearBottomEl(container)) container.scrollTop = container.scrollHeight;
+  // #5 等待占位锚定：@AI 的问题行落库渲染时，把等待行挪到问题行
+  // 正下方——等待行不落库、无 seq，旧版先挂末尾、问题行随后追加，
+  // 等待气泡反而跑到问题上方甚至越过日期分隔线。
+  if (container.id === "messages" && state.chatWaitRow && state.chatWaitRow.isConnected && m.sender === "me") {
+    el.after(state.chatWaitRow);
+  }
+  // 滚动定版：跟随开着才贴底；关着时 scrollTop 分毫不动。
+  const fkey = container.id === "ai-messages" ? "ai" : "chat";
+  if (state.follow[fkey]) container.scrollTop = container.scrollHeight;
   if (container.id === "messages") syncBottomBtn();
   if (container.id === "ai-messages") syncAiBottomBtn();
 }
@@ -491,7 +559,8 @@ function syncOfflineUI() {
  * 未连接=灰点「未连接」；连的就是本会话=绿点「已连接」；连的是别的
  * 设备=绿点并写明「当前连接：X」，不假装本会话可发。 */
 function syncPeerHead() {
-  if (state.peerConvTitle) $("peer-name").textContent = state.peerConvTitle;
+  // #2：没有打开任何会话时不摆名为「未连接」的假会话标题
+  $("peer-name").textContent = state.peerConvTitle || "暂无会话";
   const dot = $("peer-dot");
   const txt = $("peer-state-text");
   if (!state.connected) {
@@ -524,7 +593,12 @@ function switchView(view) {
   closePinList();
   applyAside();
   syncDrawer();
-  if (view === "chat") syncOfflineUI();
+  if (view === "chat") {
+    syncOfflineUI();
+    // 首次进聊天页且尚未渲染任何消息时才加载历史；已渲染过则保持
+    // 浏览位置（导航互切不丢在看的会话与滚动位置）。
+    if (state.peerConvId && state.renderedChat.size === 0) loadChatMessages();
+  }
   // 视图刚变可见时补量一次输入框高度（隐藏期间 autoGrow 会跳过）
   autoGrow($("input"));
   autoGrow($("ai-input"));
@@ -690,6 +764,7 @@ $("messages").addEventListener("scroll", () => {
   syncBottomBtn();
 });
 $("btn-bottom").addEventListener("click", () => {
+  state.follow.chat = true;
   const c = $("messages");
   c.scrollTo({ top: c.scrollHeight, behavior: "smooth" });
 });
@@ -880,7 +955,9 @@ function detectDocument(text) {
     const ext = FENCE_EXT[(fence[1] || "txt").toLowerCase()] || "txt";
     return { name: "代码片段." + ext, kind: "code" };
   }
-  const lines = t.split("\n");
+  // #8 万行粘贴防冻（v2.6.2）：代码信号只扫前 300 行——判定结论与
+  // 全扫一致（前 300 行足够定性），万行文本不再整篇逐行跑正则。
+  const lines = t.split("\n", 300);
   if (lines.length >= 4) {
     let codeLines = 0;
     let firstName = null;
@@ -898,7 +975,14 @@ function detectDocument(text) {
   return null;
 }
 
+let docBarTimer = 0;
 function updateDocBar() {
+  // 粘贴/输入事件高频触发：实际检测合并到 120ms 尾沿，主线程不被
+  // 逐键检测堵住（#8：发送点击永远有响应）。
+  if (docBarTimer) return;
+  docBarTimer = setTimeout(() => { docBarTimer = 0; updateDocBarNow(); }, 120);
+}
+function updateDocBarNow() {
   docSuggestion = docDismissed ? null : detectDocument($("input").value);
   if (docSuggestion) {
     $("doc-bar-text").textContent = docSuggestion.kind === "code"
@@ -961,6 +1045,7 @@ function renderAttachBar() {
   } else {
     grow.classList.add("hidden");
   }
+  $("attach-count").textContent = state.pendingFiles.length ? `待发送 ${state.pendingFiles.length} 个文件` : "";
   bar.classList.toggle("hidden", state.pendingFiles.length === 0);
 }
 $("attach-group-toggle").addEventListener("change", () => { state.attachGroupTouched = true; });
@@ -1055,6 +1140,8 @@ async function sendCurrent() {
   const raw = $("input").value;
   const text = raw.trim();
   if (!text && !state.pendingFiles.length) return;
+  // 滚动定版：本人点发送 = 主动回到当前，立即贴底并恢复跟随
+  state.follow.chat = true;
   // 待发文件队列先逐个发（文件气泡由后端事件回推，与选文件发送一致；
   // 每个文件一条消息、各自进度；单个失败提示并跳过、不堵住后面）
   if (state.pendingFiles.length) {
@@ -1109,9 +1196,10 @@ async function sendCurrent() {
       await invoke("chat_ask_ai", { conversationId: state.peerConvId, source: src, text, thinking: currentThinking() });
     } catch (e) {
       showToast("问AI 失败：" + e);
-    } finally { waitRow.remove(); chatAiBusy = false; }
+    } finally { waitRow.remove(); state.chatWaitRow = null; chatAiBusy = false; }
     return;
   }
+  if (docBarTimer) { clearTimeout(docBarTimer); docBarTimer = 0; updateDocBarNow(); }
   const asDoc = docSuggestion;
   const replyTo = state.replyTo;
   $("input").value = ""; autoGrow($("input"));
@@ -1153,16 +1241,30 @@ $("input").addEventListener("input", () => {
 });
 
 $("btn-file").addEventListener("click", async () => {
+  // #17 防重入：选择器开着时连点不叠开第二个（叠开时后一个结果会
+  // 把前一个吞掉，表现为「选了没入队」）。
+  if (state.pickingFiles) return;
+  state.pickingFiles = true;
   try {
     // 多选入待发队列（与粘贴/拖放同一条队列，点发送键统一逐个发）
     const picked = await window.__TAURI__.dialog.open({ multiple: true, directory: false });
     if (!picked) return;
-    await stageFilePaths(Array.isArray(picked) ? picked : [picked]);
+    const paths = Array.isArray(picked) ? picked : [picked];
+    const added = await stageFilePaths(paths);
+    // 选了却一个都没新增必须明示原因，不许静默（多半是已在队列里）
+    if (paths.length && added === 0) showToast("所选文件已在待发队列中");
     $("input").focus();
   } catch (e) { showToast("选择文件失败：" + e); }
+  finally { state.pickingFiles = false; }
 });
 
 $("btn-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
+// 重连横幅的「停止重连」：走断开命令——无会话时后端同样会作废
+// 重连代号并清目标（见 services disconnect 的无会话分支）。
+$("reconnect-stop").addEventListener("click", async () => {
+  await invoke("disconnect");
+  $("reconnect-banner").classList.add("hidden");
+});
 $("btn-connected-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
 $("btn-goto-chat").addEventListener("click", () => switchView("chat"));
 
@@ -2025,7 +2127,12 @@ async function openFileMenu(mid, x, y) {
   const exists = !!(info && info.exists && info.path);
   menu.innerHTML = "";
   const items = [
-    ["打开", exists, async () => { await invoke("open_file", { path: info.path }); }, ""],
+    ["打开", exists, async () => {
+      // #9：后端按扩展名分类——文本/脚本回 "viewer" 走内置查看器，
+      // 可执行类后端只做文件夹定位、其余系统打开，都不会执行脚本。
+      const r = await invoke("open_file", { path: info.path });
+      if (r === "viewer") openTextViewer(info);
+    }, ""],
     ["打开文件位置", exists, async () => { await invoke("reveal_file", { path: info.path }); }, ""],
     ["复制文件", exists, async () => {
       // 首选后端原生实现：Windows 写 CF_HDROP 文件本体（等同资源管理器
@@ -2285,12 +2392,43 @@ $("search-input").addEventListener("input", () => {
 // AI 会话与聊天（设备）会话是两回事：AI 页自带会话条，可新建、切换、
 // 双击改名；发送跟随当前打开的会话（state.aiConvId）。ai-default
 // 「AI 助手」是默认会话，问AI 的落点也固定在它。
+let aiConvLoading = false;
 async function loadAiConversations() {
+  if (aiConvLoading) return;
+  aiConvLoading = true;
+  try {
+    await loadAiConversationsInner();
+  } finally {
+    aiConvLoading = false;
+  }
+}
+async function loadAiConversationsInner() {
   let convs;
   try {
     convs = await invoke("list_conversations");
   } catch (_) { return; }
-  const aiConvs = convs.filter((c) => c.kind === "ai");
+  let aiConvs = convs.filter((c) => c.kind === "ai");
+  // 「AI 助手」（ai-default）必须常驻会话条：它原先只在首次发 AI 消息
+  // 时才落库，此前不显胶囊、删除回落也会被下面的有效性检查顶掉。
+  // 缺行时补建（后端 INSERT OR IGNORE 幂等）后重拉一次。
+  if (!aiConvs.some((c) => c.id === "ai-default")) {
+    try {
+      await invoke("ensure_ai_conversation");
+      const again = await invoke("list_conversations");
+      const refiltered = again.filter((c) => c.kind === "ai");
+      aiConvs.length = 0;
+      aiConvs.push(...refiltered);
+    } catch (_) { /* 补建失败不挡列表渲染 */ }
+  }
+  // #3 胶囊顺序持久化：localStorage 存 id 顺序，拖拽排序后写回；
+  // 新会话排在末尾（稳定排序，不打乱既有顺序）。
+  let order = [];
+  try { order = JSON.parse(localStorage.getItem("bl-ai-order") || "[]"); } catch (_) { order = []; }
+  const rank = (id) => {
+    const i = order.indexOf(id);
+    return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+  };
+  aiConvs.sort((a, b) => rank(a.id) - rank(b.id));
   if (!aiConvs.some((c) => c.id === state.aiConvId)) {
     state.aiConvId = aiConvs.length ? aiConvs[0].id : "ai-default";
   }
@@ -2300,13 +2438,104 @@ async function loadAiConversations() {
     const chip = document.createElement("button");
     chip.className = "ai-conv-chip" + (c.id === state.aiConvId ? " active" : "");
     chip.textContent = c.title || "AI 会话";
-    chip.title = "点击打开；双击改名";
+    chip.title = "点击打开；右键改名/删除；拖拽排序";
+    chip.dataset.cid = c.id;
     // 已打开的会话点它不做任何事：重渲染会把紧接着的双击（改名）打断
-    chip.addEventListener("click", () => { if (c.id !== state.aiConvId) openAiConversation(c.id); });
+    chip.addEventListener("click", () => {
+      if (chip._dragged) { chip._dragged = false; return; }
+      if (c.id !== state.aiConvId) openAiConversation(c.id);
+    });
     chip.addEventListener("dblclick", (ev) => { ev.stopPropagation(); renameAiChip(chip, c); });
+    // #3 右键菜单：明确有「重命名」「删除」，不再只靠双击的隐形入口
+    chip.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openAiChipMenu(chip, c, ev.clientX, ev.clientY);
+    });
+    // #3 拖拽排序：按下移动超过 6px 才算拖拽（不干扰点击/双击）
+    chip.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0) return;
+      const startX = ev.clientX;
+      let dragging = false;
+      const move = (mv) => {
+        if (!dragging && Math.abs(mv.clientX - startX) > 6) {
+          dragging = true;
+          chip.classList.add("dragging");
+        }
+        if (!dragging) return;
+        const siblings = [...list.querySelectorAll(".ai-conv-chip")];
+        const target = siblings.find((el) => el !== chip
+          && mv.clientX >= el.getBoundingClientRect().left
+          && mv.clientX <= el.getBoundingClientRect().right);
+        if (target) {
+          const rect = target.getBoundingClientRect();
+          if (mv.clientX < rect.left + rect.width / 2) list.insertBefore(chip, target);
+          else list.insertBefore(chip, target.nextSibling);
+        }
+      };
+      const up = () => {
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        if (dragging) {
+          chip.classList.remove("dragging");
+          chip._dragged = true;
+          setTimeout(() => { chip._dragged = false; }, 50);
+          const ids = [...list.querySelectorAll(".ai-conv-chip")].map((el) => el.dataset.cid);
+          localStorage.setItem("bl-ai-order", JSON.stringify(ids));
+        }
+      };
+      document.addEventListener("pointermove", move);
+      document.addEventListener("pointerup", up);
+    });
     list.appendChild(chip);
     if (c.id === state.aiConvId) $("ai-title").textContent = c.title || "AI 助手";
   }
+}
+
+/** #3 AI 会话胶囊右键菜单（与文件菜单共用 #file-menu 容器）：
+ * 重命名（走既有 renameAiChip，菜单关闭不重渲染、输入框不被打断）、
+ * 删除（两步确认；默认会话「AI 助手」不可删，菜单里直接不给）。 */
+function openAiChipMenu(chip, conv, x, y) {
+  const menu = $("file-menu");
+  menu.innerHTML = "";
+  const entries = [
+    ["重命名", () => renameAiChip(chip, conv), ""],
+  ];
+  if (conv.id !== "ai-default") {
+    entries.push(["删除会话", null, "fm-danger"]);
+  }
+  for (const [label, fn, cls] of entries) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (cls) b.className = cls;
+    b.addEventListener("click", async () => {
+      if (label === "删除会话") {
+        // 两步确认：第一下把按钮变成确认文案，第二下才真删
+        if (!b.dataset.armed) {
+          b.dataset.armed = "1";
+          b.textContent = "确认删除？（含全部消息）";
+          return;
+        }
+        menu.classList.add("hidden");
+        try {
+          await invoke("delete_ai_conversation", { conversationId: conv.id });
+          if (state.aiConvId === conv.id) {
+            state.aiConvId = "ai-default";
+            await loadAiMessages();
+          }
+          await loadAiConversations();
+          showToast("会话已删除");
+        } catch (e) { showToast("删除失败：" + e); }
+        return;
+      }
+      menu.classList.add("hidden");
+      try { await fn(); } catch (e) { showToast("操作失败：" + e); }
+    });
+    menu.appendChild(b);
+  }
+  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
+  menu.style.top = Math.min(y, window.innerHeight - 160) + "px";
+  menu.classList.remove("hidden");
 }
 
 function openAiConversation(id) {
@@ -2379,6 +2608,27 @@ async function loadAiMessages() {
 function nearBottomEl(el, px = 80) {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= px;
 }
+/** 滚动定版的手势侧（v2.6.2）：手势一出立即停跟随；自滚回底
+ * （距底 ≤4px）恢复跟随。程序滚动不经过手势事件，不会误停。 */
+function watchScrollDiscipline(el, key) {
+  if (!el) return;
+  const off = () => { state.follow[key] = false; };
+  el.addEventListener("wheel", off, { passive: true });
+  el.addEventListener("touchmove", off, { passive: true });
+  el.addEventListener("pointerdown", (e) => {
+    // 拖滚动条：指针落在容器右缘滚动条区域（clientWidth 之外）
+    const r = el.getBoundingClientRect();
+    if (e.clientX >= r.left + el.clientWidth) off();
+  });
+  el.addEventListener("keydown", (e) => {
+    if (["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End", " "].includes(e.key)) off();
+  });
+  el.addEventListener("scroll", () => {
+    if (!state.follow[key] && nearBottomEl(el, 4)) state.follow[key] = true;
+  });
+}
+watchScrollDiscipline($("messages"), "chat");
+watchScrollDiscipline($("ai-messages"), "ai");
 function syncAiBottomBtn() {
   const c = $("ai-messages");
   $("btn-ai-bottom").classList.toggle("hidden", nearBottomEl(c, 80));
@@ -2432,6 +2682,7 @@ async function sendAi() {
   const ref = state.pendingAskRef;
   if (state.aiGenerating) return;
   if (!text && !ref) return;
+  state.follow.ai = true;
   if (!(await aiReadyOrRemind())) return;
   $("ai-input").value = ""; autoGrow($("ai-input"));
   state.aiGenerating = true;
@@ -2534,7 +2785,10 @@ function appendChatAiWaiting(peer) {
   row.innerHTML = `<div class="msg"><div class="bubble ai-waiting"><span class="wait-dots"><i></i><i></i><i></i></span>${aiWaitingText(peer)}</div></div>`;
   const c = $("messages");
   c.appendChild(row);
-  c.scrollTop = c.scrollHeight;
+  // #5：登记等待行——问题行随后落库渲染时 appendMessage 会把它
+  // 锚定到问题行正下方（见 appendMessage 的锚定逻辑）。
+  state.chatWaitRow = row;
+  if (state.follow.chat) c.scrollTop = c.scrollHeight;
   return row;
 }
 
@@ -2552,6 +2806,7 @@ async function chatRegenerateAi(m) {
     showToast("重新生成失败：" + e);
   } finally {
     waitRow.remove();
+    state.chatWaitRow = null;
     chatAiBusy = false;
   }
 }
@@ -2651,6 +2906,7 @@ $("btn-ai-stop").addEventListener("click", () => invoke("ai_stop"));
 // ⑥ AI 页「回到最新」：上滑后出现，点按回底并恢复跟随
 $("ai-messages").addEventListener("scroll", syncAiBottomBtn);
 $("btn-ai-bottom").addEventListener("click", () => {
+  state.follow.ai = true;
   const c = $("ai-messages");
   c.scrollTop = c.scrollHeight;
   syncAiBottomBtn();
@@ -3103,6 +3359,20 @@ async function wireEvents() {
     $("clip-sync-toggle").checked = !!v.local;
     $("clip-sync-status").textContent = clipStatusText(v);
   });
+  await listen("reconnect_state", (e) => {
+    const v = e.payload || {};
+    const banner = $("reconnect-banner");
+    if (v.state === "trying") {
+      banner.classList.remove("hidden");
+      $("reconnect-text").textContent = `与 ${v.peer_name || "对方"} 的连接中断，正在自动重连（第 ${v.attempt || 1} 次）…`;
+    } else if (v.state === "connected") {
+      banner.classList.add("hidden");
+      showToast(`已自动重连到 ${v.peer_name || "对方"}`);
+    } else if (v.state === "gave_up") {
+      banner.classList.add("hidden");
+      showToast(`自动重连失败：未能恢复与 ${v.peer_name || "对方"} 的连接，请手动重连`);
+    }
+  });
   await listen("clipboard_synced", (e) => {
     const kind = e.payload && e.payload.kind === "image" ? "图片" : "文字";
     $("clip-sync-status").textContent = `已同步（刚刚收到${kind}）`;
@@ -3122,6 +3392,29 @@ async function wireEvents() {
     if (!b) return;
     const bar = b.querySelector(".progress");
     const fill = b.querySelector(".progress > div");
+    // #18 图片气泡：进度走贴底细条 + 胶囊明示「发送中/接收中」，
+    // 与「校验中」严格分开（校验是传输完成后的独立状态）。
+    if (b.classList.contains("img-bubble") && b._imgWrap) {
+      const strip = b._imgWrap.querySelector(".img-strip");
+      const sfill = b._imgWrap.querySelector(".img-strip > div");
+      const cap = b._imgWrap.querySelector(".img-cap");
+      const pct = total ? Math.floor((received / total) * 100) : 0;
+      if (strip && sfill) {
+        strip.classList.remove("hidden");
+        sfill.style.width = pct + "%";
+      }
+      if (cap) {
+        cap.classList.remove("hidden");
+        const mine = b.closest(".msg-row")?.dataset.sender === "me";
+        cap.textContent = mine ? `发送中 ${pct}%` : `接收中 ${pct}%`;
+      }
+      if (received < total && !b.dataset.flowing) {
+        const side = b.closest(".msg-row")?.dataset.sender === "me" ? "me" : "peer";
+        b.dataset.flowing = side;
+        ringSet(side, true);
+      }
+      return;
+    }
     if (bar && fill) {
       bar.classList.remove("hidden");
       const pct = total ? Math.floor((received / total) * 100) : 0;
@@ -3161,6 +3454,36 @@ async function wireEvents() {
     if (cancel) cancel.classList.add("hidden");
     // 传输结束（完成/取消/校验失败）：停掉对应环的持续特效
     if (b.dataset.flowing) { ringSet(b.dataset.flowing, false); delete b.dataset.flowing; }
+    // #1/#18 图片气泡的状态机：细条与胶囊承载全部状态，失败换失败卡
+    if (b.classList.contains("img-bubble") && b._imgWrap) {
+      const wrap = b._imgWrap;
+      const strip = wrap.querySelector(".img-strip");
+      const sfill = wrap.querySelector(".img-strip > div");
+      const cap = wrap.querySelector(".img-cap");
+      const fail = wrap.querySelector(".img-fail");
+      const photo = wrap.querySelector(".img-photo");
+      if (tstate === "verifying") {
+        if (strip && sfill) { strip.classList.remove("hidden"); sfill.style.width = "100%"; }
+        if (cap) { cap.classList.remove("hidden"); cap.textContent = "校验中"; }
+      } else if (tstate === "done") {
+        if (mid) attachImagePhoto(b, mid);
+        setTimeout(() => {
+          if (strip) strip.classList.add("hidden");
+          if (cap) cap.classList.add("hidden");
+        }, 400);
+      } else if (tstate === "verify_failed") {
+        if (strip) strip.classList.add("hidden");
+        if (cap) cap.classList.add("hidden");
+        if (photo) photo.classList.add("hidden");
+        if (fail) fail.classList.remove("hidden");
+        if (retry) retry.classList.remove("hidden");
+      } else if (tstate === "cancelled") {
+        if (strip) strip.classList.add("hidden");
+        if (cap) { cap.classList.remove("hidden"); cap.textContent = "已取消"; }
+        if (retry) retry.classList.remove("hidden");
+      }
+      return;
+    }
     if (tstate === "done") {
       if (meta) meta.textContent = "已完成";
       // ㉑ 接收完成补挂图片预览（气泡渲染时文件还没落盘的情况）
@@ -3207,8 +3530,8 @@ async function wireEvents() {
     }
     state.streamText += e.payload.delta;
     state.streamEl.innerHTML = md(state.streamText);
-    // ⑥ 仅距底 ≤80px 才跟随；用户上滑后停钉底，「回到最新」按钮接管
-    if (nearBottomEl(container)) container.scrollTop = container.scrollHeight;
+    // 滚动定版：跟随开着才贴底；手势停跟随后流式再长也不动 scrollTop
+    if (state.follow.ai) container.scrollTop = container.scrollHeight;
     syncAiBottomBtn();
   });
   await listen("ai_done", (e) => {
@@ -3434,9 +3757,9 @@ $("update-action").addEventListener("click", async () => {
   await loadConversations();
   loadLastPeer();
   if (state.identity.connected) state.connected = true;
-  switchView("chat");
-  // ㉛ 冷启默认打开的会话直接渲染本地历史，连接与否都一样
-  loadChatMessages();
+  // #2 入口定版（v2.6.2，用户确认）：冷启动默认停在连接页，不恢复
+  // 上次页面；历史经会话列表进入聊天页时才加载（switchView 兜底）。
+  switchView("connect");
   // ㉘ 主界面已就绪：立刻撤外壳并通知后端显示窗口（外壳不设最短停留，
   // 就绪多快就多快切）。ui_ready 只在进程启动这一次调用。
   $("splash").classList.add("done");
@@ -3454,7 +3777,7 @@ $("update-action").addEventListener("click", async () => {
 
 // ---------- 文件类型口径（查看器分流/图片组共用） ----------
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "ico"];
-const TEXT_EXTS = new Set(["txt", "md", "log", "json", "xml", "csv", "tsv", "ini", "cfg", "conf", "yaml", "yml", "toml", "properties", "env", "java", "js", "mjs", "ts", "jsx", "tsx", "rs", "py", "go", "c", "h", "cpp", "hpp", "cc", "cs", "php", "rb", "sh", "bash", "zsh", "sql", "html", "htm", "css", "scss", "vue", "kt", "swift", "pl", "r", "lua", "diff", "patch", "dockerfile", "gitignore", "gradle", "cmake"]);
+const TEXT_EXTS = new Set(["txt", "md", "log", "json", "xml", "csv", "tsv", "ini", "cfg", "conf", "yaml", "yml", "toml", "properties", "env", "java", "js", "mjs", "ts", "jsx", "tsx", "rs", "py", "go", "c", "h", "cpp", "hpp", "cc", "cs", "php", "rb", "sh", "bash", "zsh", "bat", "cmd", "ps1", "psm1", "vbs", "sql", "html", "htm", "css", "scss", "vue", "kt", "swift", "pl", "r", "lua", "diff", "patch", "dockerfile", "gitignore", "gradle", "cmake"]);
 const VIDEO_EXTS = ["mp4", "webm", "mkv", "mov", "m4v", "avi"];
 const AUDIO_EXTS = ["mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"];
 const OFFICE_EXTS = ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf"];
@@ -3508,8 +3831,8 @@ function buildGroupBubble(bubble, m, row) {
   bubble._gcount = items.length;
   bubble.innerHTML = `
     <div class="gstack">
-      <div class="gstack-card c2"></div>
-      <div class="gstack-card c1"></div>
+      <img class="gstack-card c2" alt="" draggable="false">
+      <img class="gstack-card c1" alt="" draggable="false">
       <div class="gstack-main">
         <img class="gstack-img hidden" alt="" draggable="false">
         <div class="gstack-ph">${iconUse("i-file", "ico ico-28")}<span class="gstack-ph-name"></span></div>
@@ -3527,6 +3850,24 @@ function buildGroupBubble(bubble, m, row) {
   const showCard = async () => {
     const files = await groupFilesOf(m.id);
     if (!items.length) return;
+    // #1 身后两层用其他照片的真实缩略图（卡牌叠放感）：c1 是第 2 张、
+    // c2 是第 3 张（没有就隐藏该层）；只在文件清单变化时重设一次。
+    const stack = bubble.querySelector(".gstack");
+    const sig = files.map((f) => (f && f.exists ? f.path : "")).join("|");
+    if (stack && bubble._gsig !== sig) {
+      bubble._gsig = sig;
+      const layers = [[1, ".gstack-card.c1"], [2, ".gstack-card.c2"]];
+      for (const [idx, sel] of layers) {
+        const el = bubble.querySelector(sel);
+        const f = files[idx];
+        if (el && f && f.exists && f.path) {
+          try { el.src = await assetUrl(f.path); el.classList.remove("hidden"); }
+          catch (_) { el.classList.add("hidden"); }
+        } else if (el) {
+          el.classList.add("hidden");
+        }
+      }
+    }
     const i = Math.max(0, Math.min(bubble._gidx, items.length - 1));
     bubble._gidx = i;
     // 页码指示已移入图片查看器（vi-count），气泡面不再挂第二个徽标（⑰）
@@ -3538,6 +3879,18 @@ function buildGroupBubble(bubble, m, row) {
         img.src = await assetUrl(f.path);
         img.classList.remove("hidden");
         ph.classList.add("hidden");
+        // #1 封面定尺寸：按封面图宽高比（最大 320），与单图同口径
+        if (!img._ratioBound) {
+          img._ratioBound = true;
+          img.addEventListener("load", () => {
+            const nw = img.naturalWidth || 4, nh = img.naturalHeight || 3;
+            const scale = Math.min(320 / nw, 320 / nh, 1);
+            if (stack) {
+              stack.style.width = Math.max(96, Math.round(nw * scale)) + "px";
+              stack.style.height = Math.max(72, Math.round(nh * scale)) + "px";
+            }
+          });
+        }
         return;
       } catch (_) { /* 落到占位 */ }
     }
@@ -3696,28 +4049,55 @@ function openGroupMenu(m, x, y) {
 /** 文件气泡点击分流（v2.6.0）：文本/代码→内置文本查看器，图片→
  * 图片查看器，音视频→内置播放，PDF/Office→系统程序打开（本轮不做
  * 内置），其余与文件不存在时维持原文件菜单。 */
-/** ㉑ 单张图片气泡预览：图片类文件消息在文件卡顶部挂一张缩略预览，
- * 气泡里直接能看，点击仍走气泡既有点击 → openFileSmart 进图片查看器。
- * 尺寸靠 CSS 约束（max 240×180、cover、圆角同气泡规范），img 带
- * lazy/async 解码，不把原图整张反复解码塞进布局；文件还没落盘
- * （接收中）时不出预览，由传输完成事件再补挂一次（transfer_state）。
- * 非图片/文件已删/加载失败一律不挂，文件卡原样。 */
-async function attachImagePreview(bubble, messageId) {
-  if (bubble.querySelector(".img-preview")) return;
+/** #1/#14 单张图片气泡（v2.6.2 定稿）：气泡即图片本体——透明底、
+ * 零内边距、圆角 18、按原宽高比定尺寸（最大 320）；状态（发送中/
+ * 校验中）用贴下沿的 4px 进度细条 + 图角小胶囊呈现，绝不撑高；
+ * 校验失败时照片不展示，只给紧凑失败卡（文件名+失败+重试）。
+ * 未落盘（接收中/未验）不出预览，保持文件卡原样等传输事件补挂。 */
+async function attachImagePhoto(bubble, messageId) {
+  if (bubble.dataset.photoDone) return;
   let info = null;
   try { info = await invoke("file_info", { messageId }); } catch (_) { return; }
   if (!info || !info.exists || !info.path) return;
   if (!isImageExt(fileExt(info.name || ""))) return;
-  if (!bubble.isConnected || bubble.querySelector(".img-preview")) return;
-  const img = document.createElement("img");
-  img.className = "img-preview";
-  img.alt = info.name || "";
-  img.loading = "lazy";
-  img.decoding = "async";
-  img.draggable = false;
-  img.addEventListener("error", () => img.remove());
-  try { img.src = await assetUrl(info.path); } catch (_) { return; }
-  bubble.insertBefore(img, bubble.firstChild);
+  if (!bubble.isConnected || bubble.dataset.photoDone) return;
+  bubble.dataset.photoDone = "1";
+  bubble.classList.add("img-bubble");
+  const row = bubble.closest(".msg-row");
+  if (row) row.classList.add("img-row");
+  const inner = bubble.querySelector(".file-card-inner");
+  if (inner) inner.classList.add("hidden");
+  const legacyBar = bubble.querySelector(".progress");
+  if (legacyBar) legacyBar.classList.add("hidden");
+  const legacyMeta = bubble.querySelector(".progress-meta");
+  if (legacyMeta) legacyMeta.classList.add("hidden");
+  const cancel = bubble.querySelector(".progress-cancel");
+  if (cancel) cancel.classList.add("hidden");
+  const wrap = document.createElement("div");
+  wrap.className = "img-wrap";
+  wrap.innerHTML = `<img class="img-photo" alt="" draggable="false">
+    <div class="img-strip hidden"><div></div></div>
+    <span class="img-cap hidden"></span>
+    <div class="img-fail hidden"><span class="img-fail-name"></span><span class="img-fail-text">校验失败，文件不完整</span></div>`;
+  const retry = bubble.querySelector(".transfer-retry");
+  if (retry) wrap.appendChild(retry);
+  bubble.insertBefore(wrap, bubble.firstChild);
+  bubble._imgWrap = wrap;
+  wrap.querySelector(".img-fail-name").textContent = info.name || "";
+  const img = wrap.querySelector(".img-photo");
+  img.addEventListener("load", () => {
+    const nw = img.naturalWidth || 4, nh = img.naturalHeight || 3;
+    const scale = Math.min(320 / nw, 320 / nh, 1);
+    wrap.style.width = Math.max(72, Math.round(nw * scale)) + "px";
+    wrap.style.height = Math.max(54, Math.round(nh * scale)) + "px";
+  });
+  img.addEventListener("error", () => { wrap.classList.add("img-broken"); });
+  try { img.src = await assetUrl(info.path); } catch (_) { /* 保持占位 */ }
+}
+
+/** 旧名兼容：传输完成事件仍以 attachImagePreview 名义补挂图片。 */
+async function attachImagePreview(bubble, messageId) {
+  return attachImagePhoto(bubble, messageId);
 }
 
 async function openFileSmart(m, x, y) {
@@ -3925,6 +4305,7 @@ const TV_FULL_HL = 4000;
 const TV_FONT = '13px ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace';
 
 function tvReset() {
+  TV.degraded = false;
   TV.text = ""; TV.origText = ""; TV.lines = []; TV.starts = [];
   TV.sel = null; TV.hl.clear(); TV.stateAt = null;
   TV.findQ = ""; TV.findHits = []; TV.findPos = -1; TV.transformed = null;
@@ -4012,13 +4393,17 @@ async function openTextViewer(info) {
     const msg = String(e);
     closeViewer();
     if (msg.startsWith("TOO_LARGE")) {
-      showToast("文件超过 10 MB，改用系统程序打开");
-      try { await invoke("open_file", { path: info.path }); } catch (_) { /* 忽略 */ }
+      // #9：超 100MB 的文本也不许回退系统打开（脚本类会变执行）——
+      // 只在文件夹中定位，明示原因。
+      showToast("文件过大（超过 100 MB），已在文件夹中定位，请用专业工具查看");
+      try { await invoke("reveal_file", { path: info.path }); } catch (_) { /* 忽略 */ }
     } else {
       showToast("打开失败：" + msg);
     }
     return;
   }
+  TV.degraded = !!data.degraded;
+  if (TV.degraded) showToast("文件较大，已以纯文本模式打开（关闭语法高亮）");
   const dec = decodeTextBytes(base64ToBytes(data.base64));
   TV.origText = dec.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   TV.encoding = dec.enc;
@@ -4129,7 +4514,7 @@ function tvLineHtml(i) {
       at = line.indexOf(TV.findQ, at + 1);
     }
   }
-  const body = TV.hl.get(i) ?? esc(TV.lines[i]);
+  const body = TV.degraded ? esc(TV.lines[i]) : (TV.hl.get(i) ?? esc(TV.lines[i]));
   return rects.join("") + `<span class="tv-code">${body}</span>`;
 }
 

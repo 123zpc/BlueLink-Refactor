@@ -47,29 +47,57 @@ fn ble_err<E: std::fmt::Display>(e: E) -> TransportError {
 
 /// 字节流的平台侧端点：平台层把收到的字节推进 incoming_tx，把 outgoing_rx 的字节发出去。
 /// 字段对 crate 内开放：经典蓝牙（classic 模块）的 socket 泵同样走这套通道流。
+/// outgoing 的每条消息附带一个出站队列许可（见 OUT_QUEUE_FRAMES）：泵取走
+/// 消息时许可随消息一起被丢弃、槽位归还，写端由此获得背压。
 pub struct StreamEnds {
     pub(crate) incoming_tx: mpsc::Sender<Vec<u8>>,
-    pub(crate) outgoing_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub(crate) outgoing_rx: mpsc::UnboundedReceiver<(Vec<u8>, tokio::sync::OwnedSemaphorePermit)>,
 }
+
+/// 出站队列深度（帧数）：有界是刻意的（v2.6.2）——旧版无界队列把
+/// 「已交给传输层」冒充「已发出」，BLE 上 42KB 的图实际还在空中慢慢
+/// 滴灌时发送端就报了 100%、把整段传输尾巴误标成「等待校验」。
+/// 有界后 Conn::send 在队列满时自然等待（背压），进度与状态才诚实；
+/// 深度 8 足够让泵不饿死，又把「排队未发」压在最多 8 帧内。
+/// 实现：tokio mpsc 没有 poll_reserve，改走信号量——写端先拿许可再
+/// 入队，许可随消息旅行、泵取走消息时释放。
+pub const OUT_QUEUE_FRAMES: usize = 8;
 
 /// 基于 mpsc 通道的字节流：一端交给 Conn 当 AsyncRead/AsyncWrite，
 /// 另一端（StreamEnds）由 BLE 平台泵任务驱动。字节边界不保留，与 TCP 流语义一致。
-/// 发送侧用无界通道：帧本身有 16MiB 上限且发送由用户操作与文件流程节速，不会无界堆积。
 pub struct ChannelStream {
     incoming: mpsc::Receiver<Vec<u8>>,
     read_buf: VecDeque<u8>,
     /// 写端发送通道；shutdown 时置 None 关掉，平台出站泵随之结束并拆链。
-    outgoing: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    outgoing: Option<mpsc::UnboundedSender<(Vec<u8>, tokio::sync::OwnedSemaphorePermit)>>,
+    /// 出站队列槽位信号量（与泵共享同一实例）。
+    out_slots: Arc<tokio::sync::Semaphore>,
+    /// 正在等待槽位的 acquire future（poll_write 跨调用保留，负责登记唤醒）。
+    out_acquire: Option<
+        std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tokio::sync::OwnedSemaphorePermit,
+                            tokio::sync::AcquireError,
+                        >,
+                    > + Send,
+            >,
+        >,
+    >,
 }
 
 pub fn channel_stream() -> (ChannelStream, StreamEnds) {
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(128);
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    let slots = Arc::new(tokio::sync::Semaphore::new(OUT_QUEUE_FRAMES));
     (
         ChannelStream {
             incoming: in_rx,
             read_buf: VecDeque::new(),
             outgoing: Some(out_tx),
+            out_slots: slots,
+            out_acquire: None,
         },
         StreamEnds {
             incoming_tx: in_tx,
@@ -108,15 +136,41 @@ impl AsyncRead for ChannelStream {
 
 impl AsyncWrite for ChannelStream {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let sent = match self.outgoing.as_ref() {
-            Some(tx) => tx.send(buf.to_vec()),
-            None => Err(mpsc::error::SendError(buf.to_vec())),
+        // 有界队列背压：先等一个出站槽位（future 登记唤醒、队列有空位
+        // 时自动续写），拿到许可才把字节连同许可一起入队；泵取走消息
+        // 时许可被丢弃、槽位归还。发送方由此被真实发送节奏节速。
+        if self.outgoing.is_none() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "蓝牙发送通道已关闭",
+            )));
+        }
+        if self.out_acquire.is_none() {
+            let slots = self.out_slots.clone();
+            self.out_acquire = Some(Box::pin(async move { slots.acquire_owned().await }));
+        }
+        let permit = {
+            let fut = self.out_acquire.as_mut().unwrap();
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(p)) => {
+                    self.out_acquire = None;
+                    p
+                }
+                Poll::Ready(Err(_)) => {
+                    self.out_acquire = None;
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "蓝牙发送通道已关闭",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         };
-        match sent {
+        match self.outgoing.as_ref().unwrap().send((buf.to_vec(), permit)) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(_) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -133,6 +187,109 @@ impl AsyncWrite for ChannelStream {
         // 关掉发送通道：平台出站泵读到通道结束即拆链（BLE 断开、经典关 socket）
         self.outgoing = None;
         Poll::Ready(Ok(()))
+    }
+}
+
+// ================= ATT 切片序号层（BLE / SimpleBLE 共用） =================
+
+/// 切片头魔数（'S'）：每片 = [魔数 1B][序号 u16 LE][载荷]。
+pub(crate) const SLICE_MAGIC: u8 = 0x53;
+/// 切片头长度。
+pub(crate) const SLICE_HEADER: usize = 3;
+/// 单片载荷上限（ATT_CHUNK 含头）。
+pub(crate) const SLICE_DATA: usize = ATT_CHUNK - SLICE_HEADER;
+
+/// 切片编码器（每条链路一个方向一个）：给每片盖递增序号。
+/// 旧版裸切片无序号：空中丢一片/重一片，接收端字节流悄悄错位，
+/// 直到帧长读出天文数字才整条连接暴毙（2026-11-21 真机实锤）。
+#[derive(Debug)]
+pub(crate) struct SliceEncoder {
+    seq: u16,
+}
+
+impl SliceEncoder {
+    pub fn new() -> Self {
+        Self { seq: 0 }
+    }
+
+    /// 把一段字节切成带序号的片（空输入不产片）。
+    pub fn encode(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        data.chunks(SLICE_DATA)
+            .map(|piece| {
+                let mut v = Vec::with_capacity(SLICE_HEADER + piece.len());
+                v.push(SLICE_MAGIC);
+                v.extend_from_slice(&self.seq.to_le_bytes());
+                v.extend_from_slice(piece);
+                self.seq = self.seq.wrapping_add(1);
+                v
+            })
+            .collect()
+    }
+}
+
+/// 切片解码器：按序号验收每一片。
+/// - 重复片（序号 = 上一片）：丢弃并计数——重复字节进流必然错位。
+/// - 序号跳跃（丢片）：计数并落 essential 日志，载荷照常交付——帧层
+///   解码器会丢掉受损帧并重新对齐，在这一层把后续好片全扔掉只会
+///   扩大损失。
+/// - 头魔数不对：整片丢弃并计数（不是本协议的片或已污染）。
+#[derive(Debug)]
+pub(crate) struct SliceDecoder {
+    expect: Option<u16>,
+    tag: &'static str,
+    pub gaps: u64,
+    pub dups: u64,
+    pub corrupt: u64,
+}
+
+impl SliceDecoder {
+    pub fn new(tag: &'static str) -> Self {
+        Self {
+            expect: None,
+            tag,
+            gaps: 0,
+            dups: 0,
+            corrupt: 0,
+        }
+    }
+
+    /// 验收一片：返回应喂入字节流的载荷；None 表示该片应丢弃。
+    pub fn decode(&mut self, slice: &[u8]) -> Option<Vec<u8>> {
+        if slice.len() < SLICE_HEADER || slice[0] != SLICE_MAGIC {
+            self.corrupt += 1;
+            if self.corrupt == 1 || self.corrupt % 100 == 0 {
+                crate::probe::log(
+                    self.tag,
+                    &format!("切片头无效，整片丢弃（累计 {} 次）", self.corrupt),
+                );
+            }
+            return None;
+        }
+        let seq = u16::from_le_bytes([slice[1], slice[2]]);
+        match self.expect {
+            None => self.expect = Some(seq.wrapping_add(1)),
+            Some(exp) if seq == exp => self.expect = Some(exp.wrapping_add(1)),
+            Some(exp) if seq == exp.wrapping_sub(1) => {
+                self.dups += 1;
+                crate::probe::log(
+                    self.tag,
+                    &format!("切片重复（序号 {seq}），丢弃（累计 {} 次）", self.dups),
+                );
+                return None;
+            }
+            Some(exp) => {
+                self.gaps += 1;
+                crate::probe::log(
+                    self.tag,
+                    &format!(
+                        "切片序号跳跃：期望 {exp} 收到 {seq}（累计丢片事件 {} 次），帧层将重新对齐",
+                        self.gaps
+                    ),
+                );
+                self.expect = Some(seq.wrapping_add(1));
+            }
+        }
+        Some(slice[SLICE_HEADER..].to_vec())
     }
 }
 
@@ -599,15 +756,22 @@ impl BleCentral {
             mut outgoing_rx,
         } = ends;
 
-        // 入站泵：通知字节 → 流。流结束必须落 essential——旧版静默退出，
+        // 入站泵：通知字节 → 切片序号验收 → 流。流结束必须落 essential——旧版静默退出，
         // 客户端对链路死亡毫无察觉（会话靠服务层心跳才判死，日志里还
         // 要有这条传输侧原因行才对得上账）
         let mut notifications = peripheral.notifications().await.map_err(ble_err)?;
         let in_tx = incoming_tx.clone();
         tokio::spawn(async move {
             let mut local_close = false;
+            let mut slicer = SliceDecoder::new("ble");
             while let Some(n) = notifications.next().await {
-                if n.uuid == OUTBOX_UUID && in_tx.send(n.value).await.is_err() {
+                if n.uuid != OUTBOX_UUID {
+                    continue;
+                }
+                let Some(bytes) = slicer.decode(&n.value) else {
+                    continue; // 重复/损坏片已在解码器里计数落日志
+                };
+                if in_tx.send(bytes).await.is_err() {
                     local_close = true; // 本机流已关（会话收尾中），不是对端断链
                     break;
                 }
@@ -631,10 +795,11 @@ impl BleCentral {
         };
         let peer = peripheral.clone();
         tokio::spawn(async move {
-            while let Some(bytes) = outgoing_rx.recv().await {
+            let mut slicer = SliceEncoder::new();
+            while let Some((bytes, _slot)) = outgoing_rx.recv().await {
                 let mut failed = false;
-                for piece in bytes.chunks(ATT_CHUNK) {
-                    if let Err(e) = peer.write(&inbox, piece, write_type).await {
+                for piece in slicer.encode(&bytes) {
+                    if let Err(e) = peer.write(&inbox, &piece, write_type).await {
                         // 写失败是会话死因之一，落 essential 再拆链（旧版静默）
                         crate::probe::log(
                             "ble",
@@ -778,7 +943,7 @@ pub async fn start_ble_server(
     // 服务端事件循环：订阅建立链路，写入喂字节，取消订阅即断链
     let pump_peripheral = peripheral.clone();
     tokio::spawn(async move {
-        let mut link: Option<(String, mpsc::Sender<Vec<u8>>)> = None;
+        let mut link: Option<(String, mpsc::Sender<Vec<u8>>, SliceDecoder)> = None;
         while let Some(event) = event_rx.recv().await {
             match event {
                 PeripheralEvent::CharacteristicSubscriptionUpdate {
@@ -797,17 +962,24 @@ pub async fn start_ble_server(
                         let (stream, ends) = channel_stream();
                         let StreamEnds {
                             incoming_tx,
-                            mut outgoing_rx,
+                            outgoing_rx: mut outgoing_rx,
                         } = ends;
-                        link = Some((request.client.clone(), incoming_tx));
+                        link = Some((
+                            request.client.clone(),
+                            incoming_tx,
+                            SliceDecoder::new("ble"),
+                        ));
                         let out_peripheral = pump_peripheral.clone();
                         let out_client = request.client.clone();
                         tokio::spawn(async move {
                             let mut sent_once = false;
-                            while let Some(bytes) = outgoing_rx.recv().await {
-                                let mut p = out_peripheral.lock().await;
+                            let mut slicer = SliceEncoder::new();
+                            while let Some((bytes, _slot)) = outgoing_rx.recv().await {
                                 let mut failed = false;
-                                for piece in bytes.chunks(ATT_CHUNK) {
+                                for piece in slicer.encode(&bytes) {
+                                    // 锁只罩单片（旧版罩整帧：256KB 一帧上千片
+                                    // 全程持锁，订阅事件/状态查询都被堵在后面）
+                                    let mut p = out_peripheral.lock().await;
                                     // 通知发送加 5 秒超时与失败定案行（essential）：
                                     // 2026-11-20 真机实证——HelloAck 在这一段被
                                     // 静默吞掉（对端记「已回」、本机永收不到），
@@ -815,7 +987,7 @@ pub async fn start_ble_server(
                                     // 无声无息。从此失败/超时都在日志留痕。
                                     match tokio::time::timeout(
                                         std::time::Duration::from_secs(5),
-                                        p.update_characteristic(OUTBOX_UUID, piece.to_vec()),
+                                        p.update_characteristic(OUTBOX_UUID, piece),
                                     )
                                     .await
                                     {
@@ -871,7 +1043,7 @@ pub async fn start_ble_server(
                         }
                     } else if link
                         .as_ref()
-                        .map(|(c, _)| c == &request.client)
+                        .map(|(c, _, _)| c == &request.client)
                         .unwrap_or(false)
                     {
                         // 会话结束的原因行升 essential：普通模式下也要能查到
@@ -889,16 +1061,23 @@ pub async fn start_ble_server(
                     responder,
                     ..
                 } => {
-                    let target = link.as_ref().filter(|(client, _)| {
-                        request.characteristic == INBOX_UUID && client == &request.client
-                    });
-                    if let Some((_, tx)) = target {
-                        if tx.try_send(value).is_err() {
-                            // 通道满/已关时旧版静默丢帧：字节流缺一片即失步，
-                            // 会话随后无声而死。从此丢帧必落 essential。
+                    // 切片序号验收后喂流；通道满时**等**而不是丢（v2.6.2）：
+                    // 旧版 try_send 满即丢片是字节流失步的实锤来源之一。
+                    // 事件循环在此短暂等待只是把背压传给对端的写请求，
+                    // 读端排空很快，不会久堵；通道已关（会话收尾）才放弃。
+                    let mut deliver: Option<Vec<u8>> = None;
+                    let mut target_tx: Option<mpsc::Sender<Vec<u8>>> = None;
+                    if let Some((client, tx, slicer)) = link.as_mut() {
+                        if request.characteristic == INBOX_UUID && client == &request.client {
+                            deliver = slicer.decode(&value);
+                            target_tx = Some(tx.clone());
+                        }
+                    }
+                    if let (Some(bytes), Some(tx)) = (deliver, target_tx) {
+                        if tx.send(bytes).await.is_err() {
                             crate::probe::log(
                                 "ble",
-                                "服务端：入站通道已满或已关闭，丢弃一帧入站数据（字节流可能失步）",
+                                "服务端：入站通道已关闭，丢弃一帧入站数据（会话收尾中）",
                             );
                         }
                     }
@@ -1004,7 +1183,7 @@ mod tests {
         let mut a_out = ends_a.outgoing_rx;
         let b_in = ends_b.incoming_tx.clone();
         tokio::spawn(async move {
-            while let Some(bytes) = a_out.recv().await {
+            while let Some((bytes, _slot)) = a_out.recv().await {
                 for piece in bytes.chunks(64) {
                     if b_in.send(piece.to_vec()).await.is_err() {
                         return;
@@ -1015,7 +1194,7 @@ mod tests {
         let mut b_out = ends_b.outgoing_rx;
         let a_in = ends_a.incoming_tx.clone();
         tokio::spawn(async move {
-            while let Some(bytes) = b_out.recv().await {
+            while let Some((bytes, _slot)) = b_out.recv().await {
                 for piece in bytes.chunks(64) {
                     if a_in.send(piece.to_vec()).await.is_err() {
                         return;
@@ -1035,5 +1214,93 @@ mod tests {
         });
         b.send(&big).await.unwrap();
         assert_eq!(a.recv().await.unwrap(), big);
+    }
+
+    /// 首发成功率回归（v2.6.2 验收线）：与生产泵同构的切片通道
+    /// （SliceEncoder 逐片 → SliceDecoder 验收）连续传 200 帧大小
+    /// 不一的文件片，逐帧核对完整到达——目标零首发失败。
+    #[tokio::test]
+    async fn 切片泵连续二百次传输零失败() {
+        let (stream_a, ends_a) = channel_stream();
+        let (stream_b, ends_b) = channel_stream();
+        let mut a_out = ends_a.outgoing_rx;
+        let b_in = ends_b.incoming_tx.clone();
+        tokio::spawn(async move {
+            let mut enc = SliceEncoder::new();
+            let mut dec = SliceDecoder::new("test");
+            while let Some((bytes, _slot)) = a_out.recv().await {
+                for piece in enc.encode(&bytes) {
+                    if let Some(frame_bytes) = dec.decode(&piece) {
+                        if b_in.send(frame_bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let a = Conn::new(stream_a, "ble:rate-a".into());
+        let b = Conn::new(stream_b, "ble:rate-b".into());
+        // 简易 LCG 伪随机填充，内容逐帧可复现校验
+        let mut seed: u32 = 0x2545;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            (seed >> 16) as u8
+        };
+        for i in 0..200 {
+            let size = 1024 + (i * 733 % 63_000);
+            let data: Vec<u8> = (0..size).map(|_| rnd()).collect();
+            let frame = Frame::Chunk(bluelink_protocol::FileChunk {
+                transfer_id: "12345678-1234-1234-1234-1234567890ab".to_string(),
+                offset: 0,
+                compression: bluelink_protocol::COMP_NONE,
+                data,
+            });
+            a.send(&frame).await.unwrap();
+            let got = b.recv().await.unwrap();
+            assert_eq!(got, frame, "第 {i} 帧内容不一致（首发失败）");
+        }
+    }
+
+    /// 切片序号验收（v2.6.2）：重复片被丢弃计数、丢片被计数且不
+    /// 连累后续片、正常流逐字节无损。
+    #[test]
+    fn 切片序号异常被检出() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let mut enc = SliceEncoder::new();
+        let slices = enc.encode(&data);
+        assert!(slices.len() > 10);
+        // 正常流无损
+        let mut dec = SliceDecoder::new("t");
+        let mut out = Vec::new();
+        for s in &slices {
+            out.extend(dec.decode(s).unwrap());
+        }
+        assert_eq!(out, data);
+        // 重复片：丢弃计数，内容仍无损
+        let mut dec = SliceDecoder::new("t");
+        let mut out = Vec::new();
+        for (i, s) in slices.iter().enumerate() {
+            if let Some(b) = dec.decode(s) {
+                out.extend(b);
+            }
+            if i == 2 {
+                assert!(dec.decode(s).is_none(), "重复片应被丢弃");
+            }
+        }
+        assert_eq!(out, data);
+        assert_eq!(dec.dups, 1);
+        // 丢片：缺口计数，剩余载荷仍交付（受损帧由帧层 CRC 兜底）
+        let mut dec = SliceDecoder::new("t");
+        let mut got = 0usize;
+        for (i, s) in slices.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            if let Some(b) = dec.decode(s) {
+                got += b.len();
+            }
+        }
+        assert_eq!(dec.gaps, 1);
+        assert!(got < data.len());
     }
 }

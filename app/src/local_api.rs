@@ -3,7 +3,7 @@
 //! 上游密钥只存在真正调用上游的一侧，永远不过蓝牙、也不经过本接口回传。
 //! 只绑回环地址、不对外监听；设置里可另加本机访问密钥（Authorization: Bearer <密钥>）。
 
-use bluelink_ai::ChatMessage;
+use bluelink_ai::RichMessage;
 use bluelink_services::Node;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -247,16 +247,28 @@ async fn chat_completions(
         Err(_) => return respond_error(sock, 400, "请求不是有效 JSON").await,
     };
     let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    let mut msgs: Vec<ChatMessage> = Vec::new();
+    // 富消息解析（v2.6.2，#13）：content 原样、tool_calls/tool_call_id
+    // 完整保留——旧版在这里就压平成纯文本，对端组装时工具调用历史
+    // 必然残缺、被上游拒收（TRAE 长历史必 422 的第一现场）。
+    let mut msgs: Vec<RichMessage> = Vec::new();
     if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
         for m in arr {
-            msgs.push(ChatMessage {
+            msgs.push(RichMessage {
                 role: m
                     .get("role")
                     .and_then(|r| r.as_str())
                     .unwrap_or("user")
                     .to_string(),
-                content: message_content_text(m.get("content")),
+                content: m.get("content").cloned(),
+                tool_calls: m.get("tool_calls").cloned(),
+                tool_call_id: m
+                    .get("tool_call_id")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.to_string()),
+                reasoning_content: m
+                    .get("reasoning_content")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.to_string()),
             });
         }
     }
@@ -276,7 +288,10 @@ async fn chat_completions(
     let created = secs_now();
 
     if !stream {
-        let prompt_chars: usize = msgs.iter().map(|m| m.content.chars().count()).sum();
+        let prompt_chars: usize = msgs
+            .iter()
+            .map(|m| message_content_text(m.content.as_ref()).chars().count())
+            .sum();
         let mut sink = |_: &str| {};
         return match node.gateway_chat(&msgs, &opts, &mut sink).await {
             Ok(full) => {

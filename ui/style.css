@@ -884,3 +884,119 @@ section { display: flex; flex-direction: column; height: 100%; }
   background: var(--panel-2); }
 /* ㉚ 来源下拉收窄到内容宽度 */
 #ai-source { max-width: 118px; }
+
+/* ================= v2.6.2 修复轮 ================= */
+/* #1 图片消息行上下间距收紧（明显小于文本消息的 16px） */
+.msg-row.img-row { margin-bottom: 6px; }
+.msg-row.img-row.grouped { margin-bottom: 4px; }
+
+/* #1 单张图片气泡定稿：透明底、零内边距，照片直接落在聊天背景上，
+   只留圆角 + 轻阴影 + 1px 细描边；发送端也不再有蓝板。 */
+.msg-row .bubble.img-bubble { background: transparent; border-color: transparent;
+  padding: 0; box-shadow: none; min-width: 0; }
+.msg-row.me .bubble.img-bubble { background: transparent; border-color: transparent; color: inherit; }
+.img-wrap { position: relative; width: 240px; height: 180px; border-radius: 18px;
+  overflow: hidden; flex: none; }
+.img-photo { display: block; width: 100%; height: 100%; object-fit: cover;
+  border-radius: 18px; border: 1px solid var(--border); box-sizing: border-box;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.16); background: var(--panel-2); cursor: pointer; }
+.img-wrap.img-broken .img-photo { opacity: 0.35; }
+/* 状态细条：贴下沿 4px，绝不撑高 */
+.img-strip { position: absolute; left: 0; right: 0; bottom: 0; height: 4px;
+  background: rgba(10, 10, 12, 0.28); z-index: 3; }
+.img-strip > div { height: 100%; width: 0; background: var(--accent); transition: width 0.15s linear; }
+.img-strip.hidden { display: none; }
+/* 状态胶囊：图角小胶囊（发送中/接收中/校验中/已取消） */
+.img-cap { position: absolute; right: 8px; bottom: 10px; z-index: 3;
+  background: rgba(15, 15, 16, 0.55); color: #fff; font-size: 11px; line-height: 1.5;
+  padding: 1px 8px; border-radius: 999px; pointer-events: none; }
+.img-cap.hidden { display: none; }
+/* 失败态：紧凑卡（缩回小尺寸，文件名 + 失败原因 + 重试） */
+.img-wrap:has(.img-fail:not(.hidden)) { width: 232px !important; height: 62px !important; }
+.img-fail { position: absolute; inset: 0; z-index: 4; display: flex; flex-direction: column;
+  justify-content: center; gap: 1px; padding: 8px 12px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 18px; }
+.img-fail.hidden { display: none; }
+.img-fail-name { font-size: 12.5px; font-weight: 600; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
+.img-fail-text { font-size: 11.5px; color: var(--err); }
+.img-wrap .transfer-retry { position: absolute; right: 8px; bottom: 8px; z-index: 5;
+  border: 1px solid var(--border-strong); background: var(--panel); color: var(--accent);
+  border-radius: 999px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.img-wrap .transfer-retry.hidden { display: none; }
+
+/* #1 图片组定稿：气泡透明零垫；封面端正，身后两层是其他照片的真实
+   缩略图，向右上错开约 10px 并带 -2.5°/-5° 轻微旋转（卡牌叠放感）；
+   「共 N 张」深色半透明胶囊浮封面右下角；进度贴下沿细条呈现。 */
+.msg-row .bubble.group-card { background: transparent; border-color: transparent;
+  padding: 0; min-width: 0; box-shadow: none; position: relative; }
+.gstack { width: 240px; height: 180px; margin: 22px 24px 2px 2px; z-index: 0; }
+.gstack-card { position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; border-radius: 18px; border: 1px solid var(--border);
+  background: var(--panel-2); }
+.gstack-card.c1 { transform: translate(10px, -10px) rotate(-2.5deg); z-index: 0; }
+.gstack-card.c2 { transform: translate(20px, -20px) rotate(-5deg); z-index: -1; }
+.gstack-card.hidden { display: none; }
+.gstack-main { border-radius: 18px; z-index: 1; box-shadow: 0 1px 5px rgba(0, 0, 0, 0.16); }
+.gstack-img { border-radius: 18px; }
+.gstack-count { top: auto; bottom: 8px; right: 8px; z-index: 2;
+  background: rgba(15, 15, 16, 0.55); }
+.bubble.group-card .progress { position: absolute; left: 2px; right: 24px; bottom: 0;
+  height: 4px; margin: 0; z-index: 3; background: rgba(10, 10, 12, 0.22); }
+.bubble.group-card .progress-meta { position: absolute; left: 10px; bottom: 12px; z-index: 3;
+  background: rgba(15, 15, 16, 0.55); color: #fff; font-size: 11px; line-height: 1.5;
+  padding: 1px 8px; border-radius: 999px; }
+.bubble.group-card .progress-cancel, .bubble.group-card .transfer-retry {
+  position: absolute; right: 30px; bottom: 12px; z-index: 4;
+  border: 1px solid var(--border-strong); background: var(--panel); color: var(--accent);
+  border-radius: 999px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+
+/* #3 AI 会话条：滚动条极细弱化、悬停才显；拖拽中的胶囊半透明 */
+#ai-conv-list { scrollbar-width: none; }
+#ai-conv-list::-webkit-scrollbar { height: 4px; }
+#ai-conv-list::-webkit-scrollbar-thumb { background: transparent; border-radius: 2px; }
+#ai-conv-list:hover::-webkit-scrollbar-thumb { background: var(--border-strong); }
+.ai-conv-chip.dragging { opacity: 0.55; }
+
+/* #4 思考胶囊对齐：单行时整行居中；多行（.grown）时底排与发送键同排 */
+#ai-composer .composer-row { align-items: center; }
+#ai-composer .composer-row.grown { align-items: flex-end; }
+#ai-thinking-wrap { height: 34px; box-sizing: border-box; }
+
+/* #10 AI 回复收起条 */
+.ai-collapsed-bar { display: flex; align-items: center; gap: 10px; cursor: pointer;
+  padding: 2px 0; min-width: 200px; }
+.ai-collapsed-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 300px; color: var(--text-2); }
+.ai-collapsed-hint { flex: none; font-size: 11.5px; color: var(--accent); }
+
+/* #16 待发队列：首行钉住（计数/合并/清空），chips 区限高约两行、区内滚动 */
+#attach-bar { flex-direction: column; align-items: stretch; gap: 4px; }
+#attach-head { display: flex; align-items: center; gap: 10px; min-height: 24px; }
+#attach-count { font-size: 12px; color: var(--text-2); flex: none; }
+#attach-head #attach-group-row { padding: 0; }
+#attach-list { max-height: 60px; overflow-y: auto; align-content: flex-start; }
+#attach-list::-webkit-scrollbar { width: 6px; }
+#attach-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+.attach-chip { padding: 1px 4px 1px 8px; font-size: 12px; max-width: 260px; }
+
+/* 自动重连横幅（v2.6.2）：固定在窗口顶部中央，任何视图都可见 */
+#reconnect-banner { position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+  z-index: 300; display: flex; align-items: center; gap: 10px; padding: 7px 12px;
+  background: var(--panel); border: 1px solid var(--warn); border-radius: 999px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22); font-size: 12.5px; color: var(--text); }
+#reconnect-banner.hidden { display: none; }
+#reconnect-banner .rb-dot { width: 8px; height: 8px; border-radius: 50%;
+  background: var(--warn); animation: rbPulse 1.1s ease-in-out infinite; flex: none; }
+@keyframes rbPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* #12 连接步骤卡响应式：窄宽（≤1080px）时连接页改单列纵排，步骤卡
+   占满整行不再被挤在 320px 侧栏里；列内滚动兜底（老规矩：滚动条
+   只是自适应兜底）。宽屏布局不变。 */
+@media (max-width: 1080px) {
+  .connect-cols { display: flex; flex-direction: column; overflow-y: auto; padding-right: 2px; }
+  .device-panel { flex: none; max-height: 42vh; }
+  .connect-side { flex: none; overflow: visible; }
+  .steps-card { flex: none; }
+  .steps-list { gap: 8px; }
+}

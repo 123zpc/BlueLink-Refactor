@@ -28,10 +28,7 @@ fn 超预算从最老丢弃且最新无条件保留() {
     let from = ai_kept_from(&bodies);
     assert!(from > 0, "应当丢弃最老的一部分");
     // 保留段估算不超预算
-    let kept_tokens: usize = bodies[from..]
-        .iter()
-        .map(|b| estimate_tokens(b) + 4)
-        .sum();
+    let kept_tokens: usize = bodies[from..].iter().map(|b| estimate_tokens(b) + 4).sum();
     assert!(
         kept_tokens <= AI_HISTORY_TOKEN_BUDGET,
         "保留段估算 {kept_tokens} 超预算 {}",

@@ -205,10 +205,10 @@ mod imp {
     };
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Networking::WinSock::{
-        accept, bind, closesocket, connect, getsockname, listen, recv, send, shutdown, socket,
-        WSAGetLastError, WSASetServiceW, WSAStartup, CSADDR_INFO, INVALID_SOCKET,
+        accept, bind, closesocket, connect, getsockname, listen, recv, send, setsockopt, shutdown,
+        socket, WSAGetLastError, WSASetServiceW, WSAStartup, CSADDR_INFO, INVALID_SOCKET,
         RNRSERVICE_DELETE, RNRSERVICE_REGISTER, SD_BOTH, SOCKADDR, SOCKET, SOCKET_ERROR,
-        SOCK_STREAM, WSADATA, WSAESETSERVICEOP, WSAQUERYSETW,
+        SOCK_STREAM, SOL_SOCKET, SO_SNDTIMEO, WSADATA, WSAESETSERVICEOP, WSAQUERYSETW,
     };
     use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
 
@@ -278,6 +278,22 @@ mod imp {
     /// socket 的关闭归写泵：发送通道关闭（Conn 被丢弃）或发送失败时关 socket，
     /// 读泵随之出错退出并给出 EOF，服务层据此结束会话。
     fn conn_from_socket(sock: SOCKET, peer: String) -> Conn {
+        // 写超时（v2.6.2，#11 审计）：写泵是阻塞 send、无超时——适配器
+        // 假死/对端不读时 send 会永久挂住，连接收尾（关通道）也唤不醒
+        // 它，socket 永远关不掉、读泵也等不到 EOF，会话只能僵在原地。
+        // 30 秒发送超时后 send 报错，写泵照常关 socket 走 EOF 路径，
+        // 服务层按故障断开处理（并触发自动重连）。正常流量下单次
+        // send 远不及 30 秒，不影响吞吐。
+        unsafe {
+            let timeout_ms: u32 = 30_000;
+            setsockopt(
+                sock,
+                SOL_SOCKET,
+                SO_SNDTIMEO,
+                &timeout_ms as *const u32 as *const u8,
+                std::mem::size_of::<u32>() as i32,
+            );
+        }
         let (stream, ends) = channel_stream();
         let StreamEnds {
             incoming_tx,
@@ -302,7 +318,7 @@ mod imp {
         }
         // 写泵：通道 → socket
         std::thread::spawn(move || {
-            while let Some(bytes) = outgoing_rx.blocking_recv() {
+            while let Some((bytes, _slot)) = outgoing_rx.blocking_recv() {
                 let mut off = 0usize;
                 let mut failed = false;
                 while off < bytes.len() {

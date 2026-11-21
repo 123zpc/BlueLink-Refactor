@@ -469,6 +469,10 @@ async fn connect_to(
         drop(conn);
         return Err("连接已取消".into());
     }
+    state
+        .node
+        .set_pending_route(format!("tcp:{}", addr.trim()))
+        .await;
     let code_clean: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
     let peer = state
         .node
@@ -550,9 +554,7 @@ async fn bt_connect(
             // 一次，不让用户手动重扫重连。
             bluelink_services::log_line(
                 resolved,
-                &format!(
-                    "首次连接失败（疑似缓存旧端点：{e}），清缓存并重新扫描后自动重试一次"
-                ),
+                &format!("首次连接失败（疑似缓存旧端点：{e}），清缓存并重新扫描后自动重试一次"),
             );
             match rescan_fresh_id(&state, resolved, &device_id, &name).await {
                 Some(fresh_id) => {
@@ -563,10 +565,7 @@ async fn bt_connect(
                     bt_connect_once(&state, gen, resolved, &fresh_id, &code_clean).await
                 }
                 None => {
-                    bluelink_services::log_line(
-                        resolved,
-                        "重扫 8 秒内未再发现目标设备，放弃重试",
-                    );
+                    bluelink_services::log_line(resolved, "重扫 8 秒内未再发现目标设备，放弃重试");
                     Err(e)
                 }
             }
@@ -646,6 +645,12 @@ async fn bt_connect_once(
     device_id: &str,
     code_clean: &str,
 ) -> Result<String, String> {
+    // 自动重连路线登记（v2.6.2）：attach 成功时被服务层消费为回拨
+    // 目标；连接失败则留着也无妨（下次 attach 前会被覆盖）。
+    state
+        .node
+        .set_pending_route(format!("bt:{resolved}:{device_id}"))
+        .await;
     let conn = match resolved {
         "classic" => {
             let central = state
@@ -702,6 +707,114 @@ async fn bt_connect_once(
         return Err("连接已取消".into());
     }
     Ok(peer.name)
+}
+
+/// 自动重连拨号器（v2.6.2）：服务层在意外断线时回调。按 attach 时
+/// 登记的路线重新拨号——"tcp:<addr>" 走局域网（开发者模式测试路），
+/// "bt:<kind>:<扫描id>" 走对应蓝牙中心端；BLE/SimpleBLE 首次失败时
+/// 按「缓存旧端点」家族处理：清缓存、按设备名重扫找回、重试一次
+/// （与 bt_connect 的手动路径同策略）。握手沿用连接码校验（attach）。
+fn make_reconnect_dialer(
+    central: Option<std::sync::Arc<bluelink_transport::ble::BleCentral>>,
+    classic: Option<std::sync::Arc<bluelink_transport::classic::ClassicCentral>>,
+    sble: Option<std::sync::Arc<bluelink_transport::simpleble::SbleCentral>>,
+) -> bluelink_services::ReconnectDialer {
+    std::sync::Arc::new(move |node, target, gen| {
+        let (central, classic, sble) = (central.clone(), classic.clone(), sble.clone());
+        Box::pin(async move {
+            let conn = dial_reconnect_route(&central, &classic, &sble, &target).await?;
+            if !node.reconnect_should_continue(gen) {
+                drop(conn);
+                return Err("重连已被取消".to_string());
+            }
+            node.attach(conn, false, &target.code)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    })
+}
+
+async fn dial_reconnect_route(
+    central: &Option<std::sync::Arc<bluelink_transport::ble::BleCentral>>,
+    classic: &Option<std::sync::Arc<bluelink_transport::classic::ClassicCentral>>,
+    sble: &Option<std::sync::Arc<bluelink_transport::simpleble::SbleCentral>>,
+    target: &bluelink_services::ReconnectTarget,
+) -> Result<bluelink_transport::Conn, String> {
+    if let Some(addr) = target.route.strip_prefix("tcp:") {
+        return bluelink_transport::connect_tcp(addr)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    let rest = target
+        .route
+        .strip_prefix("bt:")
+        .ok_or_else(|| "未知重连路线".to_string())?;
+    let (kind, id) = rest
+        .split_once(':')
+        .ok_or_else(|| "重连路线格式错误".to_string())?;
+    match kind {
+        "classic" => {
+            let c = classic.clone().ok_or("经典蓝牙不可用")?;
+            c.connect(id).await.map_err(|e| e.to_string())
+        }
+        "simpleble" => {
+            let c = sble.clone().ok_or("SimpleBLE 不可用")?;
+            match c.connect(id).await {
+                Ok(conn) => Ok(conn),
+                Err(_) => {
+                    // 缓存旧端点兜底：清缓存按名重扫找回后重试一次
+                    c.forget_device(id).await;
+                    let _ = c.start_scan().await;
+                    let fresh = poll_found_by_name(8, &target.name, || c.list_found()).await;
+                    match fresh {
+                        Some(fid) => c.connect(&fid).await.map_err(|e| e.to_string()),
+                        None => Err("重扫未找到目标设备".to_string()),
+                    }
+                }
+            }
+        }
+        _ => {
+            let c = central.clone().ok_or("蓝牙不可用")?;
+            match c.connect(id).await {
+                Ok(conn) => Ok(conn),
+                Err(_) => {
+                    c.forget_device(id).await;
+                    let _ = c.start_scan().await;
+                    let fresh = poll_found_by_name(8, &target.name, || c.list_found()).await;
+                    match fresh {
+                        Some(fid) => c.connect(&fid).await.map_err(|e| e.to_string()),
+                        None => Err("重扫未找到目标设备".to_string()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 在给定秒数内轮询扫描结果，按设备名找新鲜条目（重连兜底用）。
+async fn poll_found_by_name<F, Fut>(secs: u64, name: &str, mut list: F) -> Option<String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<
+            Vec<bluelink_transport::ble::FoundDevice>,
+            bluelink_transport::TransportError,
+        >,
+    >,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Ok(devices) = list().await {
+            if let Some(d) = devices.iter().find(|d| d.name == name) {
+                return Some(d.id.clone());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 #[tauri::command]
@@ -1011,6 +1124,28 @@ fn rename_ai_conversation(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn delete_ai_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<(), String> {
+    state
+        .node
+        .delete_ai_conversation(&conversation_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 确保默认会话「AI 助手」（ai-default）的行存在（v2.6.2 补）：它原先
+/// 只在首次发 AI 消息时才落库，会话条在那之前不显它、删除回落也被
+/// 顶掉。前端加载会话条时缺了就调本命令补行（INSERT OR IGNORE 幂等）。
+#[tauri::command]
+fn ensure_ai_conversation(state: State<'_, AppState>) -> Result<String, String> {
+    state
+        .node
+        .ensure_ai_conversation()
+        .map_err(|e| e.to_string())
+}
+
 /// 聊天页「问AI」：把指定聊天消息作为上下文发给默认 AI，问答落在 AI 会话。
 #[tauri::command]
 async fn ai_ask_message(
@@ -1249,10 +1384,7 @@ fn log_frontend(msg: String) {
 /// 写进系统剪贴板（解码 + arboard 写图都在 services，阻塞活放
 /// spawn_blocking）。成功返回尺寸文案供前端 toast。
 #[tauri::command]
-async fn copy_image_clipboard(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<String, String> {
+async fn copy_image_clipboard(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let node = state.node.clone();
     let p = std::path::PathBuf::from(path);
     let (w, h) = tokio::task::spawn_blocking(move || node.copy_image_blocking(&p))
@@ -1454,7 +1586,9 @@ fn open_log_dir(state: State<'_, AppState>) -> Result<(), String> {
     let _ = &state;
     let path = bluelink_services::log::log_path().ok_or("日志尚未初始化")?;
     let dir = path.parent().ok_or("日志目录不存在")?;
-    bluelink_services::open_file(dir).map_err(|e| e.to_string())
+    bluelink_services::open_file(dir)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1492,19 +1626,31 @@ fn file_info(
         }))
 }
 
+/// 打开文件（#9 定版）：返回 "viewer" 表示应走内置查看器（文本/
+/// 代码/脚本，前端据此开查看器）；"ok" 表示后端已处理（系统打开
+/// 或文件夹定位，可执行类只定位、永不打开）。
 #[tauri::command]
-fn open_file(path: String) -> Result<(), String> {
-    bluelink_services::open_file(std::path::Path::new(&path)).map_err(|e| e.to_string())
+fn open_file(path: String) -> Result<String, String> {
+    match bluelink_services::open_file(std::path::Path::new(&path)).map_err(|e| e.to_string())? {
+        bluelink_services::OpenOutcome::Viewer => Ok("viewer".to_string()),
+        bluelink_services::OpenOutcome::Done => Ok("ok".to_string()),
+    }
 }
 
-/// 文本查看器的数据上限：超过 10MB 不整载（定版内存口径），
-/// 前端收到 TOO_LARGE 后回退系统程序打开。
-const TEXT_VIEWER_MAX: u64 = 10 * 1024 * 1024;
+/// 文本查看器的数据上限（v2.6.2 修订）：#9 定版——文本/代码大文件
+/// 在查看器内降级打开（关高亮+虚拟渲染），不再以 10MB 为由回退
+/// 系统打开（脚本类回退系统打开等于执行）。上限放宽到 100MB，
+/// 超过才报错，且前端只许定位显示、不许系统打开。
+const TEXT_VIEWER_MAX: u64 = 100 * 1024 * 1024;
+/// 超过这个大小进入降级模式（关语法高亮，只保留虚拟滚动渲染）。
+const TEXT_VIEWER_DEGRADE: u64 = 10 * 1024 * 1024;
 
 #[derive(Serialize)]
 struct TextFileView {
     size: u64,
     base64: String,
+    /// 降级模式（大文件关高亮），前端据此跳过 tokenizer。
+    degraded: bool,
 }
 
 /// 文本查看器数据源（v2.6.0）：读文件原始字节回前端（base64）。
@@ -1522,6 +1668,7 @@ fn read_text_file(path: String) -> Result<TextFileView, String> {
     let bytes = std::fs::read(&path).map_err(|e| format!("读取失败（{e}）"))?;
     Ok(TextFileView {
         size: bytes.len() as u64,
+        degraded: meta.len() > TEXT_VIEWER_DEGRADE,
         base64: base64_encode(&bytes),
     })
 }
@@ -1997,6 +2144,16 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
                 Ok(Event::ClipboardSynced { kind }) => {
                     let _ = app.emit("clipboard_synced", serde_json::json!({"kind": kind}));
                 }
+                Ok(Event::ReconnectState {
+                    peer_name,
+                    attempt,
+                    state,
+                }) => {
+                    let _ = app.emit(
+                        "reconnect_state",
+                        serde_json::json!({"peer_name": peer_name, "attempt": attempt, "state": state}),
+                    );
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }
@@ -2327,6 +2484,19 @@ fn main() {
                     }
                 });
             }
+            // 自动重连拨号器注册（v2.6.2）：服务层在意外断线时按
+            // 路线回调这里重新拨号（蓝牙走各中心端、局域网走 TCP）。
+            {
+                let dialer = make_reconnect_dialer(
+                    central.clone(),
+                    classic_central.clone(),
+                    sble_central.clone(),
+                );
+                let node_reg = node.clone();
+                tauri::async_runtime::spawn(async move {
+                    node_reg.set_reconnect_dialer(dialer).await;
+                });
+            }
             app.manage(AppState {
                 node,
                 data_dir,
@@ -2489,6 +2659,8 @@ fn main() {
             ai_send,
             create_ai_conversation,
             rename_ai_conversation,
+            delete_ai_conversation,
+            ensure_ai_conversation,
             ai_ask_message,
             chat_ask_ai,
             chat_regenerate_ai,

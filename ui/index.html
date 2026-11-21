@@ -57,6 +57,7 @@
   </defs>
 </svg>
 
+<div id="reconnect-banner" class="hidden"><span class="rb-dot"></span><span id="reconnect-text">连接中断，正在重连…</span><button id="reconnect-stop" class="btn small-btn">停止重连</button></div>
 <div id="app">
   <!-- 一级导航 -->
   <nav id="nav">
@@ -249,12 +250,16 @@
       <div id="typing-hint" class="muted small hidden">对方正在输入…</div>
       <div id="composer">
         <div id="attach-bar" class="hidden">
-          <div id="attach-list"></div>
-          <div id="attach-group-row" class="hidden">
-            <label class="switch"><input type="checkbox" id="attach-group-toggle" checked><span class="switch-track"></span></label>
-            <span id="attach-group-label">合并为图片组发送</span>
+          <div id="attach-head">
+            <span id="attach-count"></span>
+            <div id="attach-group-row" class="hidden">
+              <label class="switch"><input type="checkbox" id="attach-group-toggle" checked><span class="switch-track"></span></label>
+              <span id="attach-group-label">合并为图片组发送</span>
+            </div>
+            <span class="flex-spacer"></span>
+            <button id="attach-clear" class="btn small-btn">清空</button>
           </div>
-          <button id="attach-clear" class="btn small-btn">清空</button>
+          <div id="attach-list"></div>
         </div>
         <div id="reply-bar" class="hidden"></div>
         <div id="ai-route-bar" class="hidden"></div>

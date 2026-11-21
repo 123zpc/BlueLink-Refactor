@@ -5,7 +5,7 @@ pub mod log;
 mod machine_id;
 pub use log::log_line;
 
-use bluelink_ai::{AiClient, AiConfig, ChatMessage};
+use bluelink_ai::{AiClient, AiConfig, ChatMessage, RichMessage};
 use bluelink_domain::*;
 use bluelink_protocol::{
     ClipboardImage, Control, FileChunk, Frame, GroupRef, CHUNK_SIZE, COMP_NONE, COMP_ZLIB_LEGACY,
@@ -97,7 +97,50 @@ pub enum Event {
     /// 思考模式开关没生效（v2.6.1）：请求带了开关，但实际执行一侧的上游
     /// 接口不支持 thinking 参数——前端在回答区给一次性小字提示，不许假装开了。
     AiThinkingNote,
+    /// 自动重连状态（v2.6.2，派生自 #11）：意外断线后自动重连期间
+    /// 发出，前端据此明示「重连中」。state: trying（第 attempt 次尝试）/
+    /// connected（已恢复）/ gave_up（总时限到、停手）。
+    ReconnectState {
+        peer_name: String,
+        attempt: u32,
+        state: String,
+    },
 }
+
+/// 自动重连目标：一次成功出站连接留下的回拨信息（route 是应用层
+/// 的拨号路线，如 "bt:ble:<扫描id>" 或 "tcp:<addr>"，服务层不解读、
+/// 只原样交给注册进来的拨号器；code 为对端连接码，由设备 ID 派生）。
+#[derive(Debug, Clone)]
+pub struct ReconnectTarget {
+    pub peer_id: String,
+    pub name: String,
+    pub code: String,
+    pub route: String,
+}
+
+/// 应用层注册的拨号器：按 route 重新拨号并 attach，成功返回 Ok。
+/// gen 为重连代号，拨号器应在 attach 前用 reconnect_should_continue
+/// 核对（用户中途主动断开/新连接建立都会让代号失效）。
+/// 会话结束的性质（v2.6.2）：决定断开后是否触发自动重连——
+/// 只有 Fault（链路结束/心跳判死/发送失败等意外中断）才重连；
+/// User（用户主动断开）绝不触发；Replaced（被新连接替换）也不触发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    User,
+    Replaced,
+    Fault,
+}
+
+pub type ReconnectDialer = std::sync::Arc<
+    dyn Fn(
+            Arc<Node>,
+            ReconnectTarget,
+            u64,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// AI 来源：Auto = 本机优先、否则经对端转发；Local = 只用本机配置；Peer = 只用连接设备的 AI。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,8 +180,166 @@ pub struct MessageFileInfo {
     pub exists: bool,
 }
 
-/// 用系统默认程序打开文件（文件菜单「打开」）。
-pub fn open_file(path: &Path) -> Result<(), ServiceError> {
+/// 「打开文件」的处置分类（v2.6.2，#9 安全定版）：打开一律是**查看**
+/// 语义，绝不允许点一下就把脚本/程序跑起来。老版一律走系统默认
+/// 打开，Windows 上 .py 的默认 verb 就是解释器执行——超 10MB 的
+/// 脚本点「打开」被直接运行（v2.6.1 验后 #9 实锤）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenClass {
+    /// 文本/代码/脚本：内置查看器（只看不跑，任意大小降级打开）。
+    Viewer,
+    /// 二进制可执行类：只在文件夹中显示，永不系统打开。
+    Reveal,
+    /// 其余文档/媒体类：系统默认程序打开（查看语义成立的格式）。
+    System,
+}
+
+/// 按扩展名分类（小写比较）。处置对照表同步写在发布说明里。
+pub fn classify_open(name: &str) -> OpenClass {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .filter(|e| !e.is_empty() && !e.contains('/'))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // 文本/代码/脚本（含 bat/cmd/ps1/sh 等脚本）：查看器只读渲染
+    const TEXT_EXTS: &[&str] = &[
+        "txt",
+        "log",
+        "md",
+        "markdown",
+        "rs",
+        "py",
+        "js",
+        "ts",
+        "tsx",
+        "jsx",
+        "java",
+        "c",
+        "h",
+        "cpp",
+        "hpp",
+        "cc",
+        "cs",
+        "go",
+        "rb",
+        "pl",
+        "php",
+        "lua",
+        "swift",
+        "kt",
+        "scala",
+        "sh",
+        "bash",
+        "zsh",
+        "bat",
+        "cmd",
+        "ps1",
+        "psm1",
+        "vbs",
+        "sql",
+        "json",
+        "jsonl",
+        "toml",
+        "yaml",
+        "yml",
+        "xml",
+        "html",
+        "htm",
+        "css",
+        "scss",
+        "vue",
+        "ini",
+        "cfg",
+        "conf",
+        "csv",
+        "tsv",
+        "env",
+        "gitignore",
+        "dockerfile",
+        "makefile",
+        "gradle",
+        "properties",
+        "r",
+        "m",
+        "mm",
+        "asm",
+        "s",
+        "dart",
+        "ex",
+        "exs",
+        "erl",
+        "hs",
+        "clj",
+        "groovy",
+    ];
+    // 二进制可执行/安装包/快捷方式：只定位显示，永不打开
+    const EXEC_EXTS: &[&str] = &[
+        "exe", "msi", "com", "scr", "cpl", "dll", "sys", "drv", "ocx", "jar", "apk", "ipa", "dmg",
+        "pkg", "deb", "rpm", "appimage", "run", "bin", "lnk", "url", "app", "gadget", "msc", "reg",
+        "jse", "wsf", "wsh", "vbe", "pif",
+    ];
+    // 无扩展名但众所周知的文本文件（评审补强）：rsplit 对无点名返回
+    // 整个文件名，Dockerfile/Makefile 本就在 TEXT_EXTS 里；点文件与
+    // 说明文件在此兜底，免得落进 System 被系统打开。
+    const PLAIN_TEXT_NAMES: &[&str] = &[
+        ".bashrc",
+        ".zshrc",
+        ".profile",
+        ".gitignore",
+        ".gitattributes",
+        ".editorconfig",
+        "license",
+        "readme",
+        "changelog",
+        "authors",
+        "todo",
+    ];
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if PLAIN_TEXT_NAMES.contains(&base.to_ascii_lowercase().as_str()) {
+        return OpenClass::Viewer;
+    }
+    if TEXT_EXTS.contains(&ext.as_str()) {
+        OpenClass::Viewer
+    } else if EXEC_EXTS.contains(&ext.as_str()) {
+        OpenClass::Reveal
+    } else {
+        OpenClass::System
+    }
+}
+
+/// 打开文件的实际结果：调用方据此决定是走内置查看器还是已处理完。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// 应由内置查看器打开（命令层转告前端）。
+    Viewer,
+    /// 已处理（系统打开或文件夹定位）。
+    Done,
+}
+
+/// 打开文件（#9 定版）：文本/脚本 → 返回 Viewer 交内置查看器；
+/// 可执行类 → 只在文件夹中定位；其余 → 系统默认程序。
+/// 任何路径下都不会以默认 verb 打开脚本/可执行文件。
+pub fn open_file(path: &Path) -> Result<OpenOutcome, ServiceError> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    match classify_open(&name) {
+        OpenClass::Viewer => Ok(OpenOutcome::Viewer),
+        OpenClass::Reveal => {
+            reveal_file(path)?;
+            Ok(OpenOutcome::Done)
+        }
+        OpenClass::System => {
+            open_with_system(path)?;
+            Ok(OpenOutcome::Done)
+        }
+    }
+}
+
+/// 用系统默认程序打开（仅供 classify_open 判为 System 的文件与网址）。
+fn open_with_system(path: &Path) -> Result<(), ServiceError> {
     #[cfg(target_os = "windows")]
     let mut cmd = {
         let mut c = std::process::Command::new("explorer");
@@ -167,7 +368,7 @@ pub fn open_url(url: &str) -> Result<(), ServiceError> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(ServiceError::Other("只允许打开 http/https 网址".into()));
     }
-    open_file(std::path::Path::new(url))
+    open_with_system(std::path::Path::new(url))
 }
 
 /// 在系统文件管理器中定位文件（文件菜单「打开文件位置」）。
@@ -567,6 +768,16 @@ pub struct Node {
     /// 最后一个句柄被释放后内容立即失效——所以句柄必须常驻、绝不随单次读写销毁。
     /// 用 std Mutex：只在阻塞线程里短暂持有，不跨 await。
     clip_handle: std::sync::Mutex<Option<arboard::Clipboard>>,
+    /// 自动重连（v2.6.2）：上次成功出站连接留下的回拨目标。
+    reconnect_target: Mutex<Option<ReconnectTarget>>,
+    /// 应用层在 attach 前登记的本次拨号路线（attach 成功时被消费）。
+    pending_route: Mutex<Option<String>>,
+    /// 重连代号：新连接建立、用户主动断开都会自增，旧重连循环据此停手。
+    reconnect_gen: std::sync::atomic::AtomicU64,
+    /// 是否已有重连循环在跑（防重复拉起）。
+    reconnect_active: AtomicBool,
+    /// 应用层注册的拨号器（未注册时不自动重连，如纯服务层测试场景）。
+    reconnect_dialer: Mutex<Option<ReconnectDialer>>,
 }
 
 impl Node {
@@ -692,6 +903,11 @@ impl Node {
             clip_peer_on: AtomicBool::new(false),
             clip_guard: Mutex::new(ClipGuard::default()),
             clip_handle: std::sync::Mutex::new(None),
+            reconnect_target: Mutex::new(None),
+            pending_route: Mutex::new(None),
+            reconnect_gen: std::sync::atomic::AtomicU64::new(0),
+            reconnect_active: AtomicBool::new(false),
+            reconnect_dialer: Mutex::new(None),
         }))
     }
 
@@ -896,18 +1112,13 @@ impl Node {
             conn.send(&Frame::Control(Control::Hello {
                 device_id: self.device_id.clone(),
                 device_name: self.device_name.clone(),
-                protocol: 2,
+                protocol: 3,
                 code: code_from_peer_or_target.to_string(),
             }))
             .await?;
             // 双边同连仲裁：登记过出站尝试时，让行裁决与等 Ack 赛跑——
             // 对方（大 ID 方让行后）连入的链路才是要活的那条，本尝试立刻收尾。
-            let my_gen = self
-                .outbound_mark
-                .lock()
-                .await
-                .as_ref()
-                .map(|(_, g)| *g);
+            let my_gen = self.outbound_mark.lock().await.as_ref().map(|(_, g)| *g);
             let first = match my_gen {
                 Some(gen) => tokio::select! {
                     biased;
@@ -1000,9 +1211,48 @@ impl Node {
         // 已有旧会话时先按「被新连接替换」收尾再换上新会话，不许无声覆盖
         let old = self.peer.lock().await.clone();
         if let Some(old) = old {
-            self.end_session(&old, "被新连接替换").await;
+            self.end_session(&old, "被新连接替换", SessionEnd::Replaced)
+                .await;
         }
         *self.peer.lock().await = Some(session.clone());
+        // 自动重连登记（v2.6.2）：任何新连接都让在跑的重连循环停手；
+        // 本次带了拨号路线（出站连接由应用层在 attach 前登记）时刷新
+        // 回拨目标；纯入站连接不带路线——目标仍是这位对端则保留旧
+        // 路线，换了对端则清掉（没有路线就没法回拨）。
+        self.reconnect_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            // 路线只许出站 attach 消费（评审修正）：pending_route 只由
+            // 应用层出站拨号路径登记；若那次拨号失败、路线残留，而后
+            // 来的是**入站**连接，无条件消费会把入站对端的 ID 配上
+            // 别人的路线，重连将拨错设备。入站时只丢弃残留路线。
+            let route = if host {
+                let _ = self.pending_route.lock().await.take();
+                None
+            } else {
+                self.pending_route.lock().await.take()
+            };
+            let mut target = self.reconnect_target.lock().await;
+            match route {
+                Some(route) => {
+                    *target = Some(ReconnectTarget {
+                        peer_id: session.peer.device_id.clone(),
+                        name: session.peer.name.clone(),
+                        code: connection_code(&session.peer.device_id),
+                        route,
+                    });
+                }
+                None => {
+                    if target
+                        .as_ref()
+                        .map(|t| t.peer_id != session.peer.device_id)
+                        .unwrap_or(false)
+                    {
+                        *target = None;
+                    }
+                }
+            }
+        }
         // 连接结果是 essential：普通模式也要能查到「连上了谁」（握手分步行是 verbose，不能替代结果行）
         log::log_line(
             "conn",
@@ -1041,11 +1291,15 @@ impl Node {
     /// 断开当前连接（界面按钮/取消清理都走这里）：经 end_session 以
     /// 「用户主动断开」落字。只清指针不关连接的话，对端会一直以为还
     /// 连着（2026-11-19 取消迟到成功实测撞出），故收尾必关底层连接。
-    pub async fn disconnect(&self) {
+    pub async fn disconnect(self: &Arc<Self>) {
         let session = self.peer.lock().await.clone();
         match session {
-            Some(s) => self.end_session(&s, "用户主动断开").await,
+            Some(s) => self.end_session(&s, "用户主动断开", SessionEnd::User).await,
             None => {
+                // 无会话也要停掉可能在跑的自动重连（重连中点断开）
+                self.reconnect_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                *self.reconnect_target.lock().await = None;
                 // 无会话时也广播一次断开事件，前端状态归零（旧行为）
                 self.emit(Event::ConnectionChanged {
                     connected: false,
@@ -1065,7 +1319,12 @@ impl Node {
     /// 与对端先察觉的事实矛盾、误导排查，从此分开落字。多个结束路径
     /// （接收循环/心跳/界面断开/新连接替换）赛跑时只有先到者执行：
     /// 同一会话只落一行、只发一次事件。
-    async fn end_session(&self, session: &Arc<PeerSession>, reason: &str) {
+    async fn end_session(
+        self: &Arc<Self>,
+        session: &Arc<PeerSession>,
+        reason: &str,
+        kind: SessionEnd,
+    ) {
         {
             let mut guard = self.peer.lock().await;
             let is_current = guard
@@ -1090,6 +1349,131 @@ impl Node {
         });
         self.emit_clipboard_state(false);
         session.conn.close().await;
+        // 自动重连分流（v2.6.2）：用户主动断开清目标、停循环，绝不
+        // 重连；意外中断（Fault）且留有回拨目标时拉起重连循环。
+        match kind {
+            SessionEnd::User => {
+                self.reconnect_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                *self.reconnect_target.lock().await = None;
+            }
+            SessionEnd::Fault => {
+                self.maybe_start_reconnect().await;
+            }
+            SessionEnd::Replaced => {}
+        }
+    }
+
+    /// 应用层注册拨号器（见 ReconnectDialer）。未注册则不自动重连。
+    pub async fn set_reconnect_dialer(&self, dialer: ReconnectDialer) {
+        *self.reconnect_dialer.lock().await = Some(dialer);
+    }
+
+    /// 应用层在发起出站连接前登记本次拨号路线（attach 成功时消费）。
+    pub async fn set_pending_route(&self, route: String) {
+        *self.pending_route.lock().await = Some(route);
+    }
+
+    /// 重连代号是否仍有效（拨号器在 attach 前核对）。
+    pub fn reconnect_should_continue(&self, gen: u64) -> bool {
+        self.reconnect_gen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == gen
+    }
+
+    /// 意外断线后拉起重连循环（已有循环/无目标/无拨号器时直接返回）。
+    async fn maybe_start_reconnect(self: &Arc<Self>) {
+        if self.reconnect_active.swap(true, Ordering::Relaxed) {
+            return; // 已有循环在跑
+        }
+        let target = self.reconnect_target.lock().await.clone();
+        let has_dialer = self.reconnect_dialer.lock().await.is_some();
+        let (Some(target), true) = (target, has_dialer) else {
+            self.reconnect_active.store(false, Ordering::Relaxed);
+            return;
+        };
+        let gen = self
+            .reconnect_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        log::log_line(
+            "conn",
+            &format!(
+                "连接意外中断，已启动自动重连（目标 {}，退避 2/5/10/30 秒，总限时 180 秒）",
+                target.name
+            ),
+        );
+        let node = self.clone();
+        tokio::spawn(async move { node.reconnect_loop(target, gen).await });
+    }
+
+    /// 重连循环：退避 2→5→10→30 秒封顶，总限时 180 秒；代号失效
+    /// （用户主动断开/新连接建立）立即停手；成功后发 connected 事件，
+    /// 界面据 ConnectionChanged 落回该对端会话（㉛ 落点规则）。
+    async fn reconnect_loop(self: Arc<Self>, target: ReconnectTarget, gen: u64) {
+        const DELAYS: [u64; 4] = [2, 5, 10, 30];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut attempt: u32 = 0;
+        let gave_up = loop {
+            attempt += 1;
+            let delay = DELAYS[((attempt - 1) as usize).min(3)];
+            // 可中断等待：每 200ms 核对一次代号，失效立刻停手
+            let until = tokio::time::Instant::now() + std::time::Duration::from_secs(delay);
+            while tokio::time::Instant::now() < until {
+                if !self.reconnect_should_continue(gen) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            if !self.reconnect_should_continue(gen) || self.is_connected().await {
+                break false; // 被取消或已（被别的路径）连上，不算放弃
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break true;
+            }
+            self.emit(Event::ReconnectState {
+                peer_name: target.name.clone(),
+                attempt,
+                state: "trying".into(),
+            });
+            log::log_line(
+                "conn",
+                &format!("自动重连：第 {attempt} 次尝试连接 {}", target.name),
+            );
+            let dialer = self.reconnect_dialer.lock().await.clone();
+            let Some(dialer) = dialer else { break false };
+            let _ = dialer(self.clone(), target.clone(), gen).await;
+            if self.is_connected().await {
+                log::log_line(
+                    "conn",
+                    &format!("自动重连成功（第 {attempt} 次尝试）：{}", target.name),
+                );
+                self.emit(Event::ReconnectState {
+                    peer_name: target.name.clone(),
+                    attempt,
+                    state: "connected".into(),
+                });
+                break false;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break true;
+            }
+        };
+        if gave_up {
+            log::log_line(
+                "conn",
+                &format!(
+                    "自动重连停手：180 秒内未能恢复与 {} 的连接（共尝试 {attempt} 次）",
+                    target.name
+                ),
+            );
+            self.emit(Event::ReconnectState {
+                peer_name: target.name.clone(),
+                attempt,
+                state: "gave_up".into(),
+            });
+        }
+        self.reconnect_active.store(false, Ordering::Relaxed);
     }
 
     /// 心跳任务（每会话一个）：周期发 Ping 探活；连续 HEARTBEAT_DEAD_MS
@@ -1127,14 +1511,19 @@ impl Node {
                         node.end_session(
                             &session,
                             &format!("心跳判死：{} 秒无任何入站帧", silent_ms / 1000),
+                            SessionEnd::Fault,
                         )
                         .await;
                         return;
                     }
                 }
                 if let Err(e) = session.conn.send(&Frame::Control(Control::Ping)).await {
-                    node.end_session(&session, &format!("发送失败：心跳帧发送出错（{e}）"))
-                        .await;
+                    node.end_session(
+                        &session,
+                        &format!("发送失败：心跳帧发送出错（{e}）"),
+                        SessionEnd::Fault,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1161,7 +1550,7 @@ impl Node {
                 Err(e) => break format!("接收出错：{e}"),
             }
         };
-        self.end_session(&session, &reason).await;
+        self.end_session(&session, &reason, SessionEnd::Fault).await;
     }
 
     async fn handle_frame(
@@ -1563,21 +1952,16 @@ impl Node {
     /// 失败口径全是人话：文件不在了/解码失败/剪贴板被占用或不可用。
     pub fn copy_image_blocking(&self, path: &std::path::Path) -> Result<(u32, u32), ServiceError> {
         if !path.is_file() {
-            return Err(ServiceError::Other(
-                "图片文件已不存在，无法复制".into(),
-            ));
+            return Err(ServiceError::Other("图片文件已不存在，无法复制".into()));
         }
-        let img = image::open(path).map_err(|_| {
-            ServiceError::Other("这张图片解码失败，无法复制".into())
-        })?;
+        let img = image::open(path)
+            .map_err(|_| ServiceError::Other("这张图片解码失败，无法复制".into()))?;
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         // 尺寸上限保护：超大图 RGBA 展开是 4 字节/像素，5000 万像素
         // 已是 200MB 量级，再大直接拒绝并说明，不把应用拖垮。
         if (w as u64) * (h as u64) > 50_000_000 {
-            return Err(ServiceError::Other(
-                "图片尺寸过大，无法复制到剪贴板".into(),
-            ));
+            return Err(ServiceError::Other("图片尺寸过大，无法复制到剪贴板".into()));
         }
         let data = arboard::ImageData {
             width: w as usize,
@@ -1889,10 +2273,7 @@ impl Node {
                 .map(|t| t > std::time::Instant::now())
                 .unwrap_or(false)
             {
-                log::log_verbose(
-                    "clipboard",
-                    "剪贴板写入退让中，丢弃本条远端内容（不重试）",
-                );
+                log::log_verbose("clipboard", "剪贴板写入退让中，丢弃本条远端内容（不重试）");
                 return;
             }
         }
@@ -2434,7 +2815,7 @@ impl Node {
 
     async fn on_file_chunk(
         &self,
-        _session: &Arc<PeerSession>,
+        session: &Arc<PeerSession>,
         chunk: FileChunk,
     ) -> Result<(), ServiceError> {
         let t0 = std::time::Instant::now(); // ⑳ 收片处理计时
@@ -2449,21 +2830,113 @@ impl Node {
         let data = if chunk.compression == COMP_NONE {
             chunk.data
         } else {
-            decompress(&chunk.data, chunk.compression)?
+            match decompress(&chunk.data, chunk.compression) {
+                Ok(d) => d,
+                Err(e) => {
+                    // 故障隔离（v2.6.2 硬规）：单片解压失败只许停在这
+                    // 一条文件消息上——立刻收尾回 FileVerify{ok:false}
+                    // 让发送端把该条标失败，连接与后续消息全程不受
+                    // 影响。旧版在这里 `?` 冒泡后发送端永远等不到
+                    // 确认、传输挂死（审计表 #F3）。
+                    let tid = chunk.transfer_id.clone();
+                    let bad = guard.remove(&tid);
+                    drop(guard);
+                    if let Some(bad) = bad {
+                        let _ = std::fs::remove_file(&bad.part_path);
+                        self.emit(Event::TransferState {
+                            transfer_id: tid.clone(),
+                            state: "verify_failed".into(),
+                        });
+                        log::log_line(
+                            "files",
+                            &format!(
+                                "接收分片解压失败（{}），该文件已判失败、连接保持：{e}",
+                                bad.name
+                            ),
+                        );
+                    }
+                    let _ = session
+                        .conn
+                        .send(&Frame::Control(Control::FileVerify {
+                            transfer_id: tid,
+                            ok: false,
+                        }))
+                        .await;
+                    return Ok(());
+                }
+            }
         };
         // ⑳ .part 句柄常驻（首片打开、整程复用）：逐片 open/close 在
         // 快速链路上是纯浪费，还拖慢接收队列排空、让对方等校验更久。
+        // 写盘 IO 失败与解压失败同处置（故障隔离）：该文件判失败并
+        // 回执，连接保持——绝不让发送端干等确认（评审+审计补强）。
         if st.file.is_none() {
-            st.file = Some(
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&st.part_path)?,
-            );
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&st.part_path)
+            {
+                Ok(h) => st.file = Some(h),
+                Err(e) => {
+                    let tid = chunk.transfer_id.clone();
+                    let bad = guard.remove(&tid);
+                    drop(guard);
+                    if let Some(bad) = bad {
+                        let _ = std::fs::remove_file(&bad.part_path);
+                        self.emit(Event::TransferState {
+                            transfer_id: tid.clone(),
+                            state: "verify_failed".into(),
+                        });
+                        log::log_line(
+                            "files",
+                            &format!(
+                                "接收打开半成品失败（{}），该文件已判失败、连接保持：{e}",
+                                bad.name
+                            ),
+                        );
+                    }
+                    let _ = session
+                        .conn
+                        .send(&Frame::Control(Control::FileVerify {
+                            transfer_id: tid,
+                            ok: false,
+                        }))
+                        .await;
+                    return Ok(());
+                }
+            }
         }
         let f = st.file.as_mut().unwrap();
-        f.seek(SeekFrom::Start(chunk.offset))?;
-        f.write_all(&data)?;
+        let io_res = f
+            .seek(SeekFrom::Start(chunk.offset))
+            .and_then(|_| f.write_all(&data));
+        if let Err(e) = io_res {
+            let tid = chunk.transfer_id.clone();
+            let bad = guard.remove(&tid);
+            drop(guard);
+            if let Some(bad) = bad {
+                let _ = std::fs::remove_file(&bad.part_path);
+                self.emit(Event::TransferState {
+                    transfer_id: tid.clone(),
+                    state: "verify_failed".into(),
+                });
+                log::log_line(
+                    "files",
+                    &format!(
+                        "接收写盘失败（{}），该文件已判失败、连接保持：{e}",
+                        bad.name
+                    ),
+                );
+            }
+            let _ = session
+                .conn
+                .send(&Frame::Control(Control::FileVerify {
+                    transfer_id: tid,
+                    ok: false,
+                }))
+                .await;
+            return Ok(());
+        }
         st.ranges = merge_ranges(
             [
                 st.ranges.clone(),
@@ -2543,7 +3016,7 @@ impl Node {
         transfer_id: String,
     ) -> Result<(), ServiceError> {
         let done_t0 = std::time::Instant::now(); // ⑳ 「收完→发出确认」计时
-        // 先给本方界面一个「校验中」状态，别让进度条在 100% 干挂着
+                                                 // 先给本方界面一个「校验中」状态，别让进度条在 100% 干挂着
         self.emit(Event::TransferState {
             transfer_id: transfer_id.clone(),
             state: "verifying".into(),
@@ -2558,35 +3031,83 @@ impl Node {
         // 这一步原来要数秒）；否则（续传/乱序补片/中途异常）回退现行
         // 整文件重算，校验强度不降。
         let verify_t0 = std::time::Instant::now();
-        let (actual, verify_how) = if st.hasher.is_some() && st.hashed_upto == st.total {
-            let digest = format!("{:x}", st.hasher.take().unwrap().finalize());
-            (digest, "增量哈希")
-        } else {
-            // 整文件重算挪出接收循环：大文件要读数秒，堵在循环里会让
-            // 心跳与其它帧都读不到（v2.5.2 实测撞出：校验期会话被自家
-            // 心跳误判死亡）。spawn_blocking 里算，循环保持通畅。
-            let part = st.part_path.clone();
-            let digest = tokio::task::spawn_blocking(move || sha256_file(&part))
-                .await
-                .map_err(|e| ServiceError::Other(format!("校验任务失败：{e}")))??;
-            (digest, "整文件重算")
+        // 摘要计算失败（读盘/任务异常）与校验不符同处置：判该文件
+        // 失败、照常回执，绝不让发送端干等（故障隔离，审计补强）。
+        let digest_res: Result<(String, &'static str), String> =
+            if st.hasher.is_some() && st.hashed_upto == st.total {
+                let digest = format!("{:x}", st.hasher.take().unwrap().finalize());
+                Ok((digest, "增量哈希"))
+            } else {
+                // 整文件重算挪出接收循环：大文件要读数秒，堵在循环里
+                // 会让心跳与其它帧都读不到（v2.5.2 实测撞出：校验期
+                // 会话被自家心跳误判死亡）。spawn_blocking 里算。
+                let part = st.part_path.clone();
+                match tokio::task::spawn_blocking(move || sha256_file(&part)).await {
+                    Ok(Ok(d)) => Ok((d, "整文件重算")),
+                    Ok(Err(e)) => Err(format!("读取半成品算摘要失败：{e}")),
+                    Err(e) => Err(format!("校验任务失败：{e}")),
+                }
+            };
+        let (actual, verify_how) = match digest_res {
+            Ok(v) => v,
+            Err(why) => {
+                drop(st.file.take());
+                let _ = std::fs::remove_file(&st.part_path);
+                self.emit(Event::TransferState {
+                    transfer_id: transfer_id.clone(),
+                    state: "verify_failed".into(),
+                });
+                log::log_line(
+                    "files",
+                    &format!(
+                        "接收收尾失败（{}），该文件已判失败、连接保持：{why}",
+                        st.name
+                    ),
+                );
+                let _ = session
+                    .conn
+                    .send(&Frame::Control(Control::FileVerify {
+                        transfer_id,
+                        ok: false,
+                    }))
+                    .await;
+                return Ok(());
+            }
         };
         let verify_ms = verify_t0.elapsed().as_secs_f64() * 1000.0;
         let ok = actual == st.sha256;
+        // 先放掉常驻 .part 句柄再 rename：Windows 上句柄开着改名靠
+        // 共享标志兜底，显式释放把这条风险摘掉（flush 已在写片时完成）。
+        drop(st.file.take());
+        // rename/落库失败同判该文件失败（不冒泡挂死发送端）。
+        let mut ok = ok;
         if ok {
             let final_path = self.download_dir().join(&st.name);
-            std::fs::rename(&st.part_path, &final_path)?;
-            // ⑳ 三笔回写（消息状态/落地路径/传输收尾）合并成一个事务，
-            // 只剩一次提交落盘——文件菜单靠落地路径定位文件，别漏。
-            self.storage.finish_received_file(
-                &st.msg_id,
-                &st.file_id,
-                &final_path.to_string_lossy(),
-                &transfer_id,
-                &session.peer.device_id,
-                st.total,
-                &st.ranges,
-            )?;
+            let landed = std::fs::rename(&st.part_path, &final_path).and_then(|_| {
+                // ⑳ 三笔回写（消息状态/落地路径/传输收尾）合并成一个
+                // 事务，只剩一次提交落盘——文件菜单靠落地路径定位。
+                self.storage
+                    .finish_received_file(
+                        &st.msg_id,
+                        &st.file_id,
+                        &final_path.to_string_lossy(),
+                        &transfer_id,
+                        &session.peer.device_id,
+                        st.total,
+                        &st.ranges,
+                    )
+                    .map_err(std::io::Error::other)
+            });
+            if let Err(e) = landed {
+                log::log_line(
+                    "files",
+                    &format!("接收落盘失败（{}），该文件已判失败、连接保持：{e}", st.name),
+                );
+                ok = false;
+            }
+        }
+        if ok {
+            let final_path = self.download_dir().join(&st.name);
             self.emit(Event::TransferState {
                 transfer_id: transfer_id.clone(),
                 state: "done".into(),
@@ -2833,11 +3354,7 @@ impl Node {
 
     /// ㉕ AI 会话改名并持久化：只许改 Ai 类会话（设备会话名是对方设备名，
     /// 不归用户改）。
-    pub fn rename_ai_conversation(
-        &self,
-        conv_id: &str,
-        title: &str,
-    ) -> Result<(), ServiceError> {
+    pub fn rename_ai_conversation(&self, conv_id: &str, title: &str) -> Result<(), ServiceError> {
         let title = title.trim();
         if title.is_empty() {
             return Err(ServiceError::Other("会话名不能为空".into()));
@@ -2855,12 +3372,33 @@ impl Node {
         Ok(())
     }
 
+    /// 删除一条 AI 会话（v2.6.2，#3）：连同全部消息一并清除、重启
+    /// 不复活。默认会话「AI 助手」（ai-default）不可删——问AI 的固定
+    /// 落点在它，删了会让落点悬空；设备会话不归这里管。
+    pub fn delete_ai_conversation(&self, conv_id: &str) -> Result<(), ServiceError> {
+        if conv_id == "ai-default" {
+            return Err(ServiceError::Other("默认会话「AI 助手」不能删除".into()));
+        }
+        let conv = self
+            .storage
+            .list_conversations()?
+            .into_iter()
+            .find(|c| c.id == conv_id)
+            .ok_or_else(|| ServiceError::Other("会话不存在".into()))?;
+        if conv.kind != ConversationKind::Ai {
+            return Err(ServiceError::Other("只能删除 AI 会话".into()));
+        }
+        self.storage.delete_conversation(conv_id)?;
+        log::log_line(
+            "ai",
+            &format!("已删除 AI 会话「{}」（含全部消息）", conv.title),
+        );
+        Ok(())
+    }
+
     /// ㉕ 解析 AI 页当前打开的会话：前端传了就校验必须是已存在的 Ai
     /// 会话，没传（或问AI 等固定落点）用 ai-default「AI 助手」。
-    fn resolve_ai_conversation(
-        &self,
-        conv_id: Option<String>,
-    ) -> Result<String, ServiceError> {
+    fn resolve_ai_conversation(&self, conv_id: Option<String>) -> Result<String, ServiceError> {
         match conv_id {
             None => self.ensure_ai_conversation(),
             Some(id) => {
@@ -3136,7 +3674,11 @@ impl Node {
             src.push_str(&format!("【已有摘要】{old_text}\n"));
         }
         for m in dropped.iter().filter(|m| m.seq > old_upto) {
-            let who = if m.sender == Sender::Ai { "AI" } else { "用户" };
+            let who = if m.sender == Sender::Ai {
+                "AI"
+            } else {
+                "用户"
+            };
             src.push_str(&format!("{who}：{}\n", m.body));
         }
         let prompt = format!(
@@ -3329,9 +3871,7 @@ impl Node {
                     ),
                 );
                 let client = AiClient::new(cfg.clone());
-                let applied_of = |applied: bool| {
-                    opts.thinking.map(|_| applied)
-                };
+                let applied_of = |applied: bool| opts.thinking.map(|_| applied);
                 if cfg.stream {
                     let mut cb = on_delta;
                     let (full, applied) = client
@@ -3402,7 +3942,9 @@ impl Node {
         };
         // AI 页提问遵循「默认 AI」设置（本机 / 对方设备 / 自动）
         let source = self.default_ai_source();
-        let outcome = self.chat_core_src(msgs, Some(&mut cb), source, opts).await?;
+        let outcome = self
+            .chat_core_src(msgs, Some(&mut cb), source, opts)
+            .await?;
         if outcome.thinking_applied == Some(false) {
             self.emit(Event::AiThinkingNote);
         }
@@ -3415,22 +3957,148 @@ impl Node {
     /// opts 透传调用方软件给的 temperature/max_tokens/top_p（见 local_api 解析）。
     pub async fn gateway_chat(
         &self,
-        msgs: &[ChatMessage],
+        msgs: &[RichMessage],
         opts: &AiCallOptions,
         on_delta: &mut (dyn FnMut(&str) + Send),
     ) -> Result<String, ServiceError> {
-        log::log_line(
-            "api",
-            &format!("本地 API 网关请求：{} 条消息", msgs.len()),
-        );
-        let outcome = self
-            .chat_core_src(msgs, Some(on_delta), AiSource::Auto, opts)
-            .await
-            .map_err(|e| {
-                log::log_line("api", &format!("本地 API 网关请求失败：{e}"));
+        log::log_line("api", &format!("本地 API 网关请求：{} 条消息", msgs.len()));
+        let outcome = self.gateway_core(msgs, on_delta, opts).await.map_err(|e| {
+            log::log_line("api", &format!("本地 API 网关请求失败：{e}"));
+            e
+        })?;
+        Ok(outcome.text)
+    }
+
+    /// 网关富消息路由（v2.6.2，#13）：与 chat_core_src 的 Auto 路由同构
+    /// （本机配置优先、否则经对端转发），但全程保留消息完整形态
+    /// （tool_calls / tool_call_id / content 原样），并在真正调用上游
+    /// 的一侧经 normalize_messages 规范化——压平链路曾把 TRAE 的
+    /// 工具调用历史变成上游硬拒的形态，长历史必 422 即源于此。
+    async fn gateway_core(
+        &self,
+        msgs: &[RichMessage],
+        on_delta: &mut (dyn FnMut(&str) + Send),
+        opts: &AiCallOptions,
+    ) -> Result<AiOutcome, ServiceError> {
+        let cfg = self.ai_cfg.lock().await.clone();
+        if let Some(cfg) = cfg.filter(|c| c.is_ready()) {
+            log::log_line(
+                "ai",
+                &format!(
+                    "AI 网关请求路由：本机接口（模型 {}，{} 条消息）",
+                    cfg.model,
+                    msgs.len()
+                ),
+            );
+            let client = AiClient::new(cfg.clone());
+            let applied_of = |applied: bool| opts.thinking.map(|_| applied);
+            if cfg.stream {
+                let (full, applied) = client
+                    .chat_rich_stream_opts(msgs, opts, |d| on_delta(d))
+                    .await
+                    .map_err(|e| {
+                        log::log_line("ai", &format!("AI 网关请求失败（本机接口）：{e}"));
+                        e
+                    })?;
+                return Ok(AiOutcome {
+                    text: full,
+                    thinking_applied: applied_of(applied),
+                });
+            }
+            let (full, applied) = client.chat_rich_once_opts(msgs, opts).await.map_err(|e| {
+                log::log_line("ai", &format!("AI 网关请求失败（本机接口）：{e}"));
                 e
             })?;
-        Ok(outcome.text)
+            on_delta(&full);
+            return Ok(AiOutcome {
+                text: full,
+                thinking_applied: applied_of(applied),
+            });
+        }
+        if self.is_connected().await {
+            log::log_line(
+                "ai",
+                &format!("AI 网关请求路由：经对方设备转发（{} 条消息）", msgs.len()),
+            );
+            return self
+                .proxy_to_peer_rich(msgs, Some(on_delta), opts)
+                .await
+                .map_err(|e| {
+                    log::log_line("ai", &format!("AI 网关请求失败（对端转发）：{e}"));
+                    e
+                });
+        }
+        Err(bluelink_ai::AiError::NotConfigured.into())
+    }
+
+    /// 富消息版对端转发：消息经 serde 原样过线（字段一个不少），
+    /// 接收与等待逻辑与 proxy_to_peer 相同。
+    async fn proxy_to_peer_rich(
+        &self,
+        msgs: &[RichMessage],
+        mut on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
+        opts: &AiCallOptions,
+    ) -> Result<AiOutcome, ServiceError> {
+        let session = self.session().await?;
+        let request_id = new_id();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProxyRecv>(64);
+        self.proxy_waiters
+            .lock()
+            .await
+            .insert(request_id.clone(), tx);
+        let payload: Vec<serde_json::Value> = msgs
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+            .collect();
+        // 发送失败必须先摘掉 waiter 再返回（评审修正）：旧版 `?` 直接
+        // 冒泡，proxy_waiters 里永久残留一条死等者，失败一次漏一条。
+        if let Err(e) = session
+            .conn
+            .send(&Frame::Control(Control::AiProxyRequest {
+                request_id: request_id.clone(),
+                messages: payload,
+                model: None,
+                thinking: opts.thinking,
+                temperature: opts.temperature,
+                max_tokens: opts.max_tokens,
+                top_p: opts.top_p,
+            }))
+            .await
+        {
+            self.proxy_waiters.lock().await.remove(&request_id);
+            return Err(e.into());
+        }
+        let mut full = String::new();
+        let mut thinking_applied: Option<bool> = None;
+        while let Some(item) = rx.recv().await {
+            match item {
+                ProxyRecv::Delta(delta) => {
+                    if let Some(f) = on_delta.as_deref_mut() {
+                        f(&delta);
+                    }
+                    full.push_str(&delta);
+                }
+                ProxyRecv::Done {
+                    error,
+                    thinking_applied: applied,
+                } => {
+                    thinking_applied = applied;
+                    if let Some(e) = error {
+                        self.proxy_waiters.lock().await.remove(&request_id);
+                        return Err(ServiceError::Other(e));
+                    }
+                    break;
+                }
+            }
+        }
+        self.proxy_waiters.lock().await.remove(&request_id);
+        if full.is_empty() {
+            return Err(ServiceError::Other("对方未能提供 AI 代理".into()));
+        }
+        Ok(AiOutcome {
+            text: full,
+            thinking_applied,
+        })
     }
 
     /// 本机当前生效的 AI 模型名（本地接口 /v1/models 用）：本机配置优先，
@@ -3462,7 +4130,9 @@ impl Node {
             .iter()
             .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
             .collect();
-        session
+        // 发送失败必须先摘掉 waiter 再返回（评审修正）：旧版 `?` 直接
+        // 冒泡，proxy_waiters 里永久残留一条死等者，失败一次漏一条。
+        if let Err(e) = session
             .conn
             .send(&Frame::Control(Control::AiProxyRequest {
                 request_id: request_id.clone(),
@@ -3473,7 +4143,11 @@ impl Node {
                 max_tokens: opts.max_tokens,
                 top_p: opts.top_p,
             }))
-            .await?;
+            .await
+        {
+            self.proxy_waiters.lock().await.remove(&request_id);
+            return Err(e.into());
+        }
         let mut full = String::new();
         let mut thinking_applied: Option<bool> = None;
         while let Some(item) = rx.recv().await {
@@ -3616,22 +4290,28 @@ impl Node {
                 .await?;
             return Ok(());
         };
-        let msgs: Vec<ChatMessage> = messages
+        // 富消息解析（v2.6.2，#13）：tool_calls/tool_call_id/content
+        // 原样保留，规范化在 AiClient 组装请求体时统一做；解析不出的
+        // 退回 role+文本的宽容形态，绝不因一条坏消息拒整段请求。
+        let msgs: Vec<RichMessage> = messages
             .iter()
-            .map(|v| ChatMessage {
-                role: v
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("user")
-                    .to_string(),
-                content: v
-                    .get("content")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+            .map(|v| {
+                serde_json::from_value::<RichMessage>(v.clone()).unwrap_or_else(|_| {
+                    RichMessage::text(
+                        v.get("role").and_then(|r| r.as_str()).unwrap_or("user"),
+                        &bluelink_ai::rich_content_text(v.get("content")),
+                    )
+                })
             })
             .collect();
-        let prompt_chars: u64 = msgs.iter().map(|m| m.content.chars().count() as u64).sum();
+        let prompt_chars: u64 = msgs
+            .iter()
+            .map(|m| {
+                bluelink_ai::rich_content_text(m.content.as_ref())
+                    .chars()
+                    .count() as u64
+            })
+            .sum();
         let client = AiClient::new(cfg.clone());
         // 增量先入通道、由转发任务顺序发出，保证分片先于 Done 到达（不能逐段 spawn，会乱序）
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -3653,7 +4333,7 @@ impl Node {
             }
         });
         let result = client
-            .chat_stream_opts(&msgs, opts, |delta| {
+            .chat_rich_stream_opts(&msgs, opts, |delta| {
                 let _ = tx.try_send(delta.to_string());
             })
             .await;
@@ -3820,5 +4500,105 @@ mod group_save_tests {
             "序号与内容对应组内顺序"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn temp_node(name: &str) -> Arc<Node> {
+        let dir =
+            std::env::temp_dir().join(format!("bl-reconnect-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Node::new(&dir, name).expect("建节点")
+    }
+
+    /// 自动重连 rig 证据（v2.6.2）：A 经 TCP 连 B 并登记路线与拨号器；
+    /// B 侧会话被杀（A 视角为意外中断）后，A 应在退避节奏内自动重连
+    /// 成功并在同一会话继续发消息；A 主动断开后则绝不重连。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn 意外断线自动重连且主动断开不重连() {
+        let a = temp_node("重连甲");
+        let b = temp_node("重连乙");
+        // B 持续监听并接管每条入站连接（模拟对端应用一直在运行）
+        let listener = bluelink_transport::listen_tcp("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+        let b_host = b.clone();
+        let accept_alive = Arc::new(AtomicBool::new(true));
+        let alive2 = accept_alive.clone();
+        tokio::spawn(async move {
+            while alive2.load(Ordering::Relaxed) {
+                match bluelink_transport::accept_tcp(&listener).await {
+                    Ok(conn) => {
+                        let _ = b_host.attach(conn, true, "").await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        // A 的拨号器：按 tcp 路线回拨（与应用层拨号器同构的最小版）
+        let dialer: ReconnectDialer = Arc::new(|node, target, gen| {
+            Box::pin(async move {
+                let addr = target
+                    .route
+                    .strip_prefix("tcp:")
+                    .ok_or("路线错误")?
+                    .to_string();
+                let conn = bluelink_transport::connect_tcp(&addr)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !node.reconnect_should_continue(gen) {
+                    drop(conn);
+                    return Err("已取消".to_string());
+                }
+                node.attach(conn, false, &target.code)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+        });
+        a.set_reconnect_dialer(dialer).await;
+        // A 首次连接（登记路线 → attach 消费为重连目标）
+        a.set_pending_route(format!("tcp:{addr}")).await;
+        let conn = bluelink_transport::connect_tcp(&addr).await.unwrap();
+        let code = bluelink_domain::connection_code(&b.device_id);
+        a.attach(conn, false, &code).await.unwrap();
+        assert!(a.is_connected().await);
+        a.send_text("断前消息", None).await.unwrap();
+        // B 侧杀掉会话：A 收到 EOF = 意外中断，应触发自动重连
+        b.disconnect().await;
+        // 退避首拍 2 秒 + 拨号，给足 20 秒观察窗
+        let mut reconnected = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if a.is_connected().await && b.is_connected().await {
+                reconnected = true;
+                break;
+            }
+        }
+        assert!(reconnected, "意外断线后 20 秒内应自动重连成功");
+        // 同一会话继续发消息、B 应收到
+        a.send_text("重连后消息", None).await.unwrap();
+        let mut got = false;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let msgs = b
+                .storage
+                .list_messages(&format!("peer-{}", a.device_id), None, 50)
+                .unwrap_or_default();
+            if msgs.iter().any(|m| m.body == "重连后消息") {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "重连后消息应送达对端");
+        // A 主动断开：绝不触发重连（等过首拍退避 2 秒再断言）
+        a.disconnect().await;
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert!(!a.is_connected().await, "用户主动断开后不许自动重连");
+        accept_alive.store(false, Ordering::Relaxed);
     }
 }

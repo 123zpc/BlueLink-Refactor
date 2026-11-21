@@ -1,5 +1,12 @@
-//! 协议 v2 实现（详细设计第一章）：长度前缀帧编解码、控制消息、文件分片。
-//! 帧格式：`u32 小端 payload 长度 | 1 字节类型 | payload`，payload 上限 16 MiB。
+//! 协议 v3 实现（详细设计第一章）：长度前缀帧编解码、控制消息、文件分片。
+//! 帧格式：`魔数 2B "BL" | u32 小端长度 | 1 字节类型 | payload | CRC32 4B`，
+//! 长度字段计类型+payload+CRC 本身，CRC32 覆盖类型+payload，payload 上限 16 MiB。
+//!
+//! v3 帧层加固（v2.6.2，故障隔离硬规）：魔数+帧校验让接收端在字节流
+//! 失步（BLE 切片丢失/重复/污染）时只丢损坏帧、扫描魔数重新对齐到下一
+//! 帧头——一帧损坏绝不许杀死整条连接。代价是与 v2.6.1 及更早版本的帧
+//! 格式不兼容（对方旧帧无魔数、解码器只会丢弃并等不到完整帧，握手以
+//! 超时干净失败，与 zstd 换装时的混版口径一致）。
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -7,6 +14,69 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// 单帧 payload 上限（16 MiB）。
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
+/// 帧头魔数（"BL"）：解码器失步时扫描它重新对齐。
+pub const FRAME_MAGIC: [u8; 2] = [0x42, 0x4C];
+/// 长度字段上限：类型(1) + payload(MAX) + CRC(4)。
+const MAX_LEN_FIELD: usize = MAX_PAYLOAD as usize + 5;
+
+/// CRC32（IEEE 802.3，多项式 0xEDB88320）：手写查表实现，协议层不引新依赖。
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                0xEDB88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+}
+static CRC_TABLE: [u32; 256] = crc32_table();
+
+const fn crc32_tables4() -> [[u32; 256]; 4] {
+    let base = crc32_table();
+    let mut tables = [[0u32; 256]; 4];
+    let mut i = 0;
+    while i < 256 {
+        tables[0][i] = base[i];
+        let mut k = 1;
+        while k < 4 {
+            let prev = tables[k - 1][i];
+            tables[k][i] = base[(prev & 0xFF) as usize] ^ (prev >> 8);
+            k += 1;
+        }
+        i += 1;
+    }
+    tables
+}
+static CRC_TABLES4: [[u32; 256]; 4] = crc32_tables4();
+
+/// 计算一段字节的 CRC32（IEEE，与 crc32 标准向量一致）。
+/// 四字节切片查表：逐字节版在大文件帧上要多花数倍时间，帧层校验
+/// 不能成为吞吐瓶颈（v2.6.2 速度回归实测后优化）。
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut c: u32 = 0xFFFF_FFFF;
+    let mut chunks = data.chunks_exact(4);
+    for ch in &mut chunks {
+        let x = c ^ u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+        c = CRC_TABLES4[3][(x & 0xFF) as usize]
+            ^ CRC_TABLES4[2][((x >> 8) & 0xFF) as usize]
+            ^ CRC_TABLES4[1][((x >> 16) & 0xFF) as usize]
+            ^ CRC_TABLES4[0][((x >> 24) & 0xFF) as usize];
+    }
+    for &b in chunks.remainder() {
+        c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    c ^ 0xFFFF_FFFF
+}
 /// 文件分片大小（256 KiB）。
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
@@ -195,7 +265,7 @@ pub enum Frame {
     ClipboardImage(ClipboardImage),
 }
 
-/// 把一帧编码为字节（长度前缀 + 类型 + payload）。
+/// 把一帧编码为字节（魔数 + 长度 + 类型 + payload + CRC32）。
 pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
     let (code, payload) = match frame {
         Frame::Control(c) => (c.type_code(), serde_json::to_vec(c)?),
@@ -221,10 +291,13 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
     if payload.len() as u64 + 1 > MAX_PAYLOAD as u64 {
         return Err(ProtocolError::FrameTooLarge(payload.len() as u32));
     }
-    let mut out = Vec::with_capacity(4 + 1 + payload.len());
-    out.extend_from_slice(&((payload.len() as u32 + 1).to_le_bytes()));
+    let mut out = Vec::with_capacity(2 + 4 + 1 + payload.len() + 4);
+    out.extend_from_slice(&FRAME_MAGIC);
+    out.extend_from_slice(&((payload.len() as u32 + 5).to_le_bytes()));
     out.push(code);
     out.extend_from_slice(&payload);
+    let crc = crc32(&out[6..]);
+    out.extend_from_slice(&crc.to_le_bytes());
     Ok(out)
 }
 
@@ -259,24 +332,8 @@ fn id_from_16(b: &[u8]) -> String {
     )
 }
 
-/// 从异步流读取一帧；流正常关闭时返回 None。
-pub async fn read_frame(
-    r: &mut (dyn AsyncRead + Unpin + Send),
-) -> Result<Option<Frame>, ProtocolError> {
-    let mut len_buf = [0u8; 4];
-    match r.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let len = u32::from_le_bytes(len_buf);
-    if len == 0 || len > MAX_PAYLOAD {
-        return Err(ProtocolError::FrameTooLarge(len));
-    }
-    let mut payload = vec![0u8; len as usize];
-    r.read_exact(&mut payload).await?;
-    let code = payload[0];
-    let body = &payload[1..];
+/// 按类型码把 payload 解成一帧（帧头/长度/CRC 已由调用方校验过）。
+fn decode_payload(code: u8, body: &[u8]) -> Result<Frame, ProtocolError> {
     if code == 0x12 {
         if body.len() < 25 {
             return Err(ProtocolError::BadChunk);
@@ -291,7 +348,7 @@ pub async fn read_frame(
             compression: body[24],
             data: body[25..].to_vec(),
         };
-        return Ok(Some(Frame::Chunk(chunk)));
+        return Ok(Frame::Chunk(chunk));
     }
     if code == 0x1A {
         if body.len() < 41 {
@@ -314,10 +371,163 @@ pub async fn read_frame(
             compression: body[40],
             data: body[41..].to_vec(),
         };
-        return Ok(Some(Frame::ClipboardImage(image)));
+        return Ok(Frame::ClipboardImage(image));
     }
     let control: Control = serde_json::from_slice(body)?;
-    Ok(Some(Frame::Control(control)))
+    Ok(Frame::Control(control))
+}
+
+/// 可重对齐的流式帧解码器（v2.6.2 故障隔离核心）：字节先进缓冲，
+/// next_frame 逐帧取出。失步（长度离谱/CRC 不符/JSON 坏）时只丢损坏
+/// 帧、扫描魔数重新对齐到下一帧头，绝不把错误抛给连接层——连接只有
+/// 在真 EOF / IO 错误时才结束。计数器供上层落日志对账。
+#[derive(Debug, Default)]
+pub struct FrameDecoder {
+    buf: Vec<u8>,
+    /// 消费游标：buf[..start] 已消费。旧版逐帧 drain 前段，每帧都要
+    /// 搬移剩余缓冲，大帧流下是纯浪费；游标化后消费只是挪下标，
+    /// push 时一次性压实（v2.6.2 速度回归优化）。
+    start: usize,
+    /// 成功解出的帧数。
+    pub frames_ok: u64,
+    /// 被丢弃的损坏帧数（长度离谱、CRC 不符、payload 解析失败）。
+    pub frames_dropped: u64,
+    /// 发生重新对齐的次数。
+    pub resyncs: u64,
+    /// 对齐过程中跳过的字节数。
+    pub bytes_skipped: u64,
+}
+
+impl FrameDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入新到达的字节（先压实已消费段，保持缓冲有界）。
+    pub fn push(&mut self, data: &[u8]) {
+        if self.start > 0 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    /// 当前缓冲里还没消费的字节数。
+    pub fn buffered(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    fn view(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    fn find_magic(&self) -> Option<usize> {
+        self.view().windows(2).position(|w| w == FRAME_MAGIC)
+    }
+
+    /// 消费 n 字节。
+    fn consume(&mut self, n: usize) {
+        self.start += n;
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        }
+    }
+
+    /// 尝试从缓冲中解出一帧。见类型注释：坏帧只被丢弃，绝不冒泡。
+    pub fn next_frame(&mut self) -> Option<Frame> {
+        loop {
+            match self.find_magic() {
+                None => {
+                    // 找不到魔数：最多保留末尾 1 字节（可能与下一片拼成魔数）
+                    let keep = if self.view().last() == Some(&FRAME_MAGIC[0]) {
+                        1
+                    } else {
+                        0
+                    };
+                    let drop = self.buffered() - keep;
+                    if drop > 0 {
+                        self.bytes_skipped += drop as u64;
+                        self.consume(drop);
+                    }
+                    return None;
+                }
+                Some(0) => {}
+                Some(p) => {
+                    self.bytes_skipped += p as u64;
+                    self.resyncs += 1;
+                    self.consume(p);
+                }
+            }
+            if self.buffered() < 6 {
+                return None; // 魔数+长度还没到齐
+            }
+            let len = u32::from_le_bytes(self.view()[2..6].try_into().unwrap()) as usize;
+            if len < 5 || len > MAX_LEN_FIELD {
+                // 长度离谱：这不是帧头，丢 1 字节继续扫描
+                self.frames_dropped += 1;
+                self.resyncs += 1;
+                self.bytes_skipped += 1;
+                self.consume(1);
+                continue;
+            }
+            if self.buffered() < 6 + len {
+                return None; // 整帧还没到齐
+            }
+            // 就地校验与解析（不整帧拷贝）：typed = 类型+payload+CRC
+            let (ok, parsed) = {
+                let typed = &self.view()[6..6 + len];
+                let (tp, crc_bytes) = typed.split_at(typed.len() - 4);
+                let crc_stored = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+                if crc32(tp) != crc_stored {
+                    (false, None)
+                } else {
+                    (true, decode_payload(tp[0], &tp[1..]).ok())
+                }
+            };
+            if !ok {
+                // CRC 不符：只退 1 字节重扫——真帧头若藏在坏帧字节里，
+                // 后续扫描自然会找到，不必整帧回插。每轮净丢 ≥1 字节。
+                self.frames_dropped += 1;
+                self.resyncs += 1;
+                self.bytes_skipped += 1;
+                self.consume(1);
+                continue;
+            }
+            match parsed {
+                Some(f) => {
+                    self.frames_ok += 1;
+                    self.consume(6 + len);
+                    return Some(f);
+                }
+                None => {
+                    // CRC 对但 payload 解析失败（如坏 JSON）：丢这一帧
+                    self.frames_dropped += 1;
+                    self.consume(6 + len);
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+/// 从异步流读取一帧；流正常关闭时返回 None。
+/// 内部走 FrameDecoder：坏帧被丢弃并自动重对齐，不冒泡为错误。
+pub async fn read_frame(
+    r: &mut (dyn AsyncRead + Unpin + Send),
+) -> Result<Option<Frame>, ProtocolError> {
+    let mut dec = FrameDecoder::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        if let Some(f) = dec.next_frame() {
+            return Ok(Some(f));
+        }
+        let n = r.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        dec.push(&chunk[..n]);
+    }
 }
 
 /// 向异步流写出一帧。
@@ -360,12 +570,14 @@ mod tests {
         for f in &frames {
             buf.extend_from_slice(&encode(f).unwrap());
         }
-        let mut cursor = std::io::Cursor::new(buf);
+        // 多帧同流往返走有状态解码器（Conn 的生产路径；read_frame 无状态、
+        // 一次读会吞掉后续帧的字节，不适合多帧流）
+        let mut dec = FrameDecoder::new();
+        dec.push(&buf);
         for f in &frames {
-            let got = read_frame(&mut cursor).await.unwrap().unwrap();
-            assert_eq!(&got, f);
+            assert_eq!(&dec.next_frame().unwrap(), f);
         }
-        assert!(read_frame(&mut cursor).await.unwrap().is_none());
+        assert!(dec.next_frame().is_none());
     }
 
     #[tokio::test]
@@ -388,12 +600,12 @@ mod tests {
         for f in &frames {
             buf.extend_from_slice(&encode(f).unwrap());
         }
-        let mut cursor = std::io::Cursor::new(buf);
+        let mut dec = FrameDecoder::new();
+        dec.push(&buf);
         for f in &frames {
-            let got = read_frame(&mut cursor).await.unwrap().unwrap();
-            assert_eq!(&got, f);
+            assert_eq!(&dec.next_frame().unwrap(), f);
         }
-        assert!(read_frame(&mut cursor).await.unwrap().is_none());
+        assert!(dec.next_frame().is_none());
     }
 
     #[tokio::test]
@@ -440,8 +652,11 @@ mod tests {
             mime: None,
             group: None,
         });
-        let s = String::from_utf8(encode(&plain).unwrap()).unwrap();
-        assert!(!s.contains("group"), "无组时不应出现 group 字段：{s}");
+        let bytes = encode(&plain).unwrap();
+        assert!(
+            !bytes.windows(5).any(|w| w == b"group"),
+            "无组时不应出现 group 字段"
+        );
     }
 
     /// 降级锚点：用「老版本形态」的枚举（FileOffer 没有 group 字段，
@@ -488,5 +703,125 @@ mod tests {
                 mime: None,
             }
         );
+    }
+
+    fn ping() -> Frame {
+        Frame::Control(Control::Ping)
+    }
+
+    fn chat(text: &str) -> Frame {
+        Frame::Control(Control::ChatText {
+            msg_id: "m".into(),
+            text: text.into(),
+            reply_to: None,
+            ts: 1,
+        })
+    }
+
+    fn drain(dec: &mut FrameDecoder) -> Vec<Frame> {
+        let mut out = Vec::new();
+        while let Some(f) = dec.next_frame() {
+            out.push(f);
+        }
+        out
+    }
+
+    /// CRC32 与标准向量对齐（"123456789" 的 CRC32-IEEE 是 0xCBF43926）。
+    #[test]
+    fn crc32标准向量() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    /// 失步注入①：整帧丢失——后续帧必须照常解出，解码器不报废。
+    #[test]
+    fn 解码器丢帧后自恢复() {
+        let mut stream = Vec::new();
+        stream.extend(encode(&ping()).unwrap());
+        stream.extend(encode(&chat("一")).unwrap());
+        stream.extend(encode(&chat("二")).unwrap());
+        // 模拟第一帧在空中整帧丢失：从第二帧头开始喂
+        let first_len = encode(&ping()).unwrap().len();
+        let mut dec = FrameDecoder::new();
+        dec.push(&stream[first_len..]);
+        let got = drain(&mut dec);
+        assert_eq!(got, vec![chat("一"), chat("二")]);
+        assert_eq!(dec.frames_ok, 2);
+    }
+
+    /// 失步注入②：帧中间丢字节——本帧丢弃，下一帧重新对齐解出。
+    #[test]
+    fn 解码器帧内丢字节后重对齐() {
+        let mut stream = Vec::new();
+        stream.extend(encode(&chat("受损帧")).unwrap());
+        stream.extend(encode(&chat("完好帧")).unwrap());
+        stream.drain(10..16); // 在第一帧 payload 中段抠掉 6 字节
+        let mut dec = FrameDecoder::new();
+        // 分两次喂（模拟切片边界任意切分）
+        let half = stream.len() / 2;
+        dec.push(&stream[..half]);
+        let mut got = drain(&mut dec);
+        dec.push(&stream[half..]);
+        got.extend(drain(&mut dec));
+        assert_eq!(got, vec![chat("完好帧")]);
+        assert!(dec.frames_dropped >= 1, "损坏帧应被计数丢弃");
+        assert!(dec.resyncs >= 1, "应发生重新对齐");
+    }
+
+    /// 失步注入③：重复字节/整帧重发——重复帧至多多解一次（帧层不去重，
+    /// 去重归业务层），但绝不失步，后续帧照常。
+    #[test]
+    fn 解码器重复注入不失步() {
+        let one = encode(&chat("重复")).unwrap();
+        let two = encode(&ping()).unwrap();
+        let mut stream = Vec::new();
+        stream.extend(&one);
+        stream.extend(&one); // 整帧重复（切片重传的最坏形态）
+        stream.extend(&two);
+        let mut dec = FrameDecoder::new();
+        dec.push(&stream);
+        let got = drain(&mut dec);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[2], ping());
+    }
+
+    /// 失步注入④：帧内单字节被污染——CRC 拦截本帧，后续帧无恙。
+    #[test]
+    fn 解码器坏字节被crc拦截() {
+        let mut stream = Vec::new();
+        stream.extend(encode(&chat("被污染")).unwrap());
+        stream.extend(encode(&chat("干净")).unwrap());
+        stream[12] ^= 0xFF; // 翻转第一帧 payload 内一字节
+        let mut dec = FrameDecoder::new();
+        dec.push(&stream);
+        let got = drain(&mut dec);
+        assert_eq!(got, vec![chat("干净")]);
+        assert!(dec.frames_dropped >= 1);
+    }
+
+    /// 失步注入⑤：随机垃圾字节垫在帧前——扫描魔数跳过垃圾。
+    #[test]
+    fn 解码器跳过前置垃圾() {
+        let mut stream = vec![0x00, 0x99, 0x42, 0x00, 0xFF, 0x13];
+        stream.extend(encode(&ping()).unwrap());
+        let mut dec = FrameDecoder::new();
+        dec.push(&stream);
+        assert_eq!(drain(&mut dec), vec![ping()]);
+        assert!(dec.bytes_skipped >= 5);
+    }
+
+    /// 任意切分喂入（逐字节）结果一致：切片边界不得影响解码。
+    #[test]
+    fn 解码器逐字节喂入一致() {
+        let mut stream = Vec::new();
+        stream.extend(encode(&chat("逐字节")).unwrap());
+        stream.extend(encode(&ping()).unwrap());
+        let mut dec = FrameDecoder::new();
+        let mut got = Vec::new();
+        for b in &stream {
+            dec.push(&[*b]);
+            got.extend(drain(&mut dec));
+        }
+        assert_eq!(got, vec![chat("逐字节"), ping()]);
     }
 }

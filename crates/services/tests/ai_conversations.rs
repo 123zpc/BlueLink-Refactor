@@ -44,14 +44,24 @@ async fn ai会话新建改名与隔离() {
 
     // 按会话发送落点隔离：未配 AI 时发送会失败，但用户消息应先落到
     // 指定会话（ai_push_and_answer 先落库再调用），且不落到默认会话
-    let before_def = a.storage.list_messages("ai-default", None, 100).unwrap().len();
-    let _ = a.ai_send("只进新会话的问题", None, Some(c1.id.clone())).await;
+    let before_def = a
+        .storage
+        .list_messages("ai-default", None, 100)
+        .unwrap()
+        .len();
+    let _ = a
+        .ai_send("只进新会话的问题", None, Some(c1.id.clone()))
+        .await;
     let in_c1 = a.storage.list_messages(&c1.id, None, 100).unwrap();
     assert!(
         in_c1.iter().any(|m| m.body == "只进新会话的问题"),
         "问题应落在指定会话"
     );
-    let after_def = a.storage.list_messages("ai-default", None, 100).unwrap().len();
+    let after_def = a
+        .storage
+        .list_messages("ai-default", None, 100)
+        .unwrap()
+        .len();
     assert_eq!(before_def, after_def, "默认会话不应被串入");
 
     // 不存在的会话 id 发送应明确报错，不许静默落到默认会话

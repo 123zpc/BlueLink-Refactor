@@ -236,6 +236,31 @@ impl Storage {
     }
 
     /// 删除一条消息（供 AI 重新生成替换旧回复用），连带清理全文索引与标记。
+    /// 删除整个会话及其全部消息（AI 会话删除用）：消息的 FTS、彩签、
+    /// 收藏/置顶附属行一并清掉，不留孤儿。
+    pub fn delete_conversation(&self, id: &str) -> Result<(), StorageError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // FTS 清理一条语句完成（评审修正）：旧版先把全部 rowid 拉回
+        // 内存再逐条 DELETE，会话越大越慢。
+        tx.execute(
+            "DELETE FROM messages_fts WHERE rowid IN (SELECT rowid FROM messages WHERE conversation_id=?1)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM message_tags WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?1)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM message_marks WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?1)",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM messages WHERE conversation_id=?1", params![id])?;
+        tx.execute("DELETE FROM conversations WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_message(&self, id: &str) -> Result<(), StorageError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -875,7 +900,10 @@ mod tests {
             .iter()
             .map(|x| x.id.clone())
             .collect();
-        assert_eq!(convs_before, vec!["c1".to_string(), "ai-default".to_string()]);
+        assert_eq!(
+            convs_before,
+            vec!["c1".to_string(), "ai-default".to_string()]
+        );
         // 置顶中间一条（AI 会话内）
         assert!(s.toggle_mark("m2", MarkKind::Pin).unwrap());
         let pinned = s.list_marked(MarkKind::Pin).unwrap();
