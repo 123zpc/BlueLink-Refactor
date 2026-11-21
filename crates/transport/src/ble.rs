@@ -65,6 +65,15 @@ pub const OUT_QUEUE_FRAMES: usize = 8;
 
 /// 基于 mpsc 通道的字节流：一端交给 Conn 当 AsyncRead/AsyncWrite，
 /// 另一端（StreamEnds）由 BLE 平台泵任务驱动。字节边界不保留，与 TCP 流语义一致。
+/// 等待出站槽位的 acquire future 类型（clippy type_complexity 要求别名）。
+type AcquireFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>,
+            > + Send,
+    >,
+>;
+
 pub struct ChannelStream {
     incoming: mpsc::Receiver<Vec<u8>>,
     read_buf: VecDeque<u8>,
@@ -73,18 +82,7 @@ pub struct ChannelStream {
     /// 出站队列槽位信号量（与泵共享同一实例）。
     out_slots: Arc<tokio::sync::Semaphore>,
     /// 正在等待槽位的 acquire future（poll_write 跨调用保留，负责登记唤醒）。
-    out_acquire: Option<
-        std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            tokio::sync::OwnedSemaphorePermit,
-                            tokio::sync::AcquireError,
-                        >,
-                    > + Send,
-            >,
-        >,
-    >,
+    out_acquire: Option<AcquireFuture>,
 }
 
 pub fn channel_stream() -> (ChannelStream, StreamEnds) {
@@ -257,7 +255,7 @@ impl SliceDecoder {
     pub fn decode(&mut self, slice: &[u8]) -> Option<Vec<u8>> {
         if slice.len() < SLICE_HEADER || slice[0] != SLICE_MAGIC {
             self.corrupt += 1;
-            if self.corrupt == 1 || self.corrupt % 100 == 0 {
+            if self.corrupt == 1 || self.corrupt.is_multiple_of(100) {
                 crate::probe::log(
                     self.tag,
                     &format!("切片头无效，整片丢弃（累计 {} 次）", self.corrupt),
@@ -962,7 +960,7 @@ pub async fn start_ble_server(
                         let (stream, ends) = channel_stream();
                         let StreamEnds {
                             incoming_tx,
-                            outgoing_rx: mut outgoing_rx,
+                            mut outgoing_rx,
                         } = ends;
                         link = Some((
                             request.client.clone(),

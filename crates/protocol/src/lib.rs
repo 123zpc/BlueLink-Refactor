@@ -64,15 +64,15 @@ static CRC_TABLES4: [[u32; 256]; 4] = crc32_tables4();
 /// 不能成为吞吐瓶颈（v2.6.2 速度回归实测后优化）。
 pub fn crc32(data: &[u8]) -> u32 {
     let mut c: u32 = 0xFFFF_FFFF;
-    let mut chunks = data.chunks_exact(4);
-    for ch in &mut chunks {
-        let x = c ^ u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+    let (chunks, remainder) = data.as_chunks::<4>();
+    for ch in chunks {
+        let x = c ^ u32::from_le_bytes(*ch);
         c = CRC_TABLES4[3][(x & 0xFF) as usize]
             ^ CRC_TABLES4[2][((x >> 8) & 0xFF) as usize]
             ^ CRC_TABLES4[1][((x >> 16) & 0xFF) as usize]
             ^ CRC_TABLES4[0][((x >> 24) & 0xFF) as usize];
     }
-    for &b in chunks.remainder() {
+    for &b in remainder {
         c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
     }
     c ^ 0xFFFF_FFFF
@@ -463,7 +463,7 @@ impl FrameDecoder {
                 return None; // 魔数+长度还没到齐
             }
             let len = u32::from_le_bytes(self.view()[2..6].try_into().unwrap()) as usize;
-            if len < 5 || len > MAX_LEN_FIELD {
+            if !(5..=MAX_LEN_FIELD).contains(&len) {
                 // 长度离谱：这不是帧头，丢 1 字节继续扫描
                 self.frames_dropped += 1;
                 self.resyncs += 1;

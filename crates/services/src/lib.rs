@@ -691,11 +691,11 @@ pub fn estimate_tokens(text: &str) -> usize {
         if ch.is_ascii() {
             ascii_run += 1;
         } else {
-            tokens += (ascii_run + 3) / 4 + 1;
+            tokens += ascii_run.div_ceil(4) + 1;
             ascii_run = 0;
         }
     }
-    tokens + (ascii_run + 3) / 4
+    tokens + ascii_run.div_ceil(4)
 }
 
 /// ㉓ 预算裁剪（纯函数，组装与测试共用）：bodies 为正序历史正文，返回
