@@ -581,7 +581,9 @@ document.querySelector(".capsule").addEventListener("click", () => switchView("c
 // ---------- 视图切换 ----------
 function switchView(view) {
   state.view = view;
-  // 连接页与聊天页在导航里平级（㉛ 定版）：各自高亮、随时互切
+  // 左栏目的地各自高亮；连接页是独立模块、不进左栏（v2.6.3 用户裁定），
+  // 身处连接页时没有任何左栏项匹配，天然无高亮——进入路径只有冷启动落点、
+  // 未连接提示带「去连接」按钮与顶栏状态胶囊，都直接调 switchView("connect")。
   document.querySelectorAll(".nav-item").forEach((b) =>
     b.classList.toggle("active", b.dataset.view === view));
   $("chat-view").classList.toggle("hidden", view !== "chat");
