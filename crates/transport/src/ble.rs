@@ -382,6 +382,32 @@ impl BleCentral {
         Ok(merge_same_name(out))
     }
 
+    /// 清掉一台设备的缓存状态（v2.6.1）：断开可能残留的僵尸 GATT 连接、
+    /// 并把设备移出首次发现序。背景：对端进程重启后其广播地址/栈状态
+    /// 已变，本机缓存里的旧 Peripheral 仍能在系统层「连上」，但对端应用
+    /// 层毫无知觉（服务端零入站），握手必然超时——重试前必须先断掉这条
+    /// 僵尸链路并配合重新扫描拿新地址。btleplug 没有缓存淘汰 API，
+    /// disconnect + 忘掉排序记录 + 上层重启扫描是能做到的最彻底清理。
+    pub async fn forget_device(&self, device_id: &str) {
+        if let Ok(peripherals) = self.adapter.peripherals().await {
+            for p in peripherals {
+                if p.id().to_string() == device_id {
+                    if matches!(p.is_connected().await, Ok(true)) {
+                        let _ = p.disconnect().await;
+                        crate::probe::log(
+                            "ble",
+                            &format!("已断开目标 {device_id} 的残留 GATT 连接（清缓存）"),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        if let Ok(mut order) = self.seen_order.lock() {
+            order.retain(|x| x != device_id);
+        }
+    }
+
     /// 连接指定设备并完成 GATT 发现，返回可直接交给服务层握手的连接。
     ///
     /// 全程分步日志（步骤1–4/6，5–6 是服务层握手）：每步记完成耗时，

@@ -195,6 +195,16 @@ impl Storage {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// ㉕ 会话改名（AI 会话自定义命名）：只改标题，其余字段不动。
+    pub fn rename_conversation(&self, id: &str, title: &str) -> Result<(), StorageError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE conversations SET title=?2 WHERE id=?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
     pub fn save_draft(&self, conversation_id: &str, draft: &str) -> Result<(), StorageError> {
         let conn = self.lock();
         conn.execute(
@@ -608,6 +618,39 @@ impl Storage {
         Ok(())
     }
 
+    /// ⑳ 接收完成的三笔回写合并成一个事务：消息状态、文件落地路径、
+    /// 传输收尾。此前三笔各走一次自动提交（各带一次落盘同步），在本机
+    /// 磁盘慢时合计约 250 ms，全算在「收完→发出校验确认」的等待里；
+    /// 合并后只剩一次提交。
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_received_file(
+        &self,
+        msg_id: &str,
+        file_id: &str,
+        final_path: &str,
+        transfer_id: &str,
+        peer_id: &str,
+        total: u64,
+        ranges: &Ranges,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE messages SET status=?2 WHERE id=?1",
+            params![msg_id, status_str(MessageStatus::Delivered)],
+        )?;
+        tx.execute(
+            "UPDATE files SET path=?1 WHERE id=?2",
+            params![final_path, file_id],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO transfers(id,file_id,direction,peer_id,total,ranges,state,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![transfer_id, file_id, "in", peer_id, total as i64, serde_json::to_string(ranges)?, "done", now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn load_transfer_ranges(&self, id: &str) -> Result<Option<Ranges>, StorageError> {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT ranges FROM transfers WHERE id=?1")?;
@@ -804,6 +847,56 @@ mod tests {
         assert_eq!(s.list_marked(MarkKind::Favorite).unwrap().len(), 1);
         assert!(!s.toggle_mark("m1", MarkKind::Favorite).unwrap());
         assert_eq!(s.list_marked(MarkKind::Favorite).unwrap().len(), 0);
+    }
+
+    /// ⑲ 回归：置顶/取消置顶只许动 message_marks——会话列表与消息列表
+    /// 的完整性、条数、顺序在置顶前后必须逐项不变（用户实报「置顶后
+    /// 列表里看不到、重启不恢复」，数据层先钉死写入不污染列表字段）。
+    #[test]
+    fn 置顶不污染会话与消息列表() {
+        let (s, c) = 准备();
+        // 再建一个 AI 会话，凑齐「多会话 + 中间一条消息置顶」的场景
+        let ai = Conversation {
+            id: "ai-default".into(),
+            kind: ConversationKind::Ai,
+            peer_device_id: None,
+            title: "AI".into(),
+            draft: String::new(),
+            last_read_id: None,
+            created_at: 2,
+        };
+        s.create_conversation(&ai).unwrap();
+        s.insert_message(&消息("m1", &c.id, "第一条", 1)).unwrap();
+        s.insert_message(&消息("m2", &ai.id, "中间条", 2)).unwrap();
+        s.insert_message(&消息("m3", &ai.id, "第三条", 3)).unwrap();
+        let convs_before: Vec<String> = s
+            .list_conversations()
+            .unwrap()
+            .iter()
+            .map(|x| x.id.clone())
+            .collect();
+        assert_eq!(convs_before, vec!["c1".to_string(), "ai-default".to_string()]);
+        // 置顶中间一条（AI 会话内）
+        assert!(s.toggle_mark("m2", MarkKind::Pin).unwrap());
+        let pinned = s.list_marked(MarkKind::Pin).unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].id, "m2");
+        assert_eq!(pinned[0].conversation_id, "ai-default");
+        // 置顶后：会话列表条数/顺序不变，两个会话的消息条数不变
+        let convs_after: Vec<String> = s
+            .list_conversations()
+            .unwrap()
+            .iter()
+            .map(|x| x.id.clone())
+            .collect();
+        assert_eq!(convs_after, convs_before);
+        assert_eq!(s.list_messages(&ai.id, None, 200).unwrap().len(), 2);
+        assert_eq!(s.list_messages(&c.id, None, 200).unwrap().len(), 1);
+        // 取消置顶后同样不变，且置顶集为空
+        assert!(!s.toggle_mark("m2", MarkKind::Pin).unwrap());
+        assert_eq!(s.list_marked(MarkKind::Pin).unwrap().len(), 0);
+        assert_eq!(s.list_conversations().unwrap().len(), 2);
+        assert_eq!(s.list_messages(&ai.id, None, 200).unwrap().len(), 2);
     }
 
     #[test]

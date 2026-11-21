@@ -14,7 +14,9 @@
         "minHeight": 600,
         "minWidth": 900,
         "title": "BlueLink",
-        "width": 900
+        "width": 900,
+        "visible": false,
+        "backgroundColor": "#F5F5F4"
       }
     ],
     "withGlobalTauri": true
@@ -44,5 +46,5 @@
     }
   },
   "productName": "BlueLink",
-  "version": "2.6.0"
+  "version": "2.6.1"
 }

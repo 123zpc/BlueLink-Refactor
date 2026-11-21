@@ -89,6 +89,19 @@ pub enum Control {
         request_id: String,
         messages: Vec<serde_json::Value>,
         model: Option<String>,
+        /// 思考模式开关（v2.6.1）：随请求带给对端，对端组装上游请求体时用。
+        /// serde default：旧版对端忽略未知字段、新版读旧帧得 None，混版不破。
+        #[serde(default)]
+        thinking: Option<bool>,
+        /// 请求级温度（本地 API 网关透传用），同上混版兼容。
+        #[serde(default)]
+        temperature: Option<f32>,
+        /// 请求级最大回复长度（本地 API 网关透传用）。
+        #[serde(default)]
+        max_tokens: Option<u32>,
+        /// 请求级 top_p（本地 API 网关透传用）。
+        #[serde(default)]
+        top_p: Option<f32>,
     },
     AiProxyChunk {
         request_id: String,
@@ -97,6 +110,11 @@ pub enum Control {
     AiProxyDone {
         request_id: String,
         error: Option<String>,
+        /// 思考开关是否真被上游接受（v2.6.1）：请求带了 thinking 且对端
+        /// 上游支持时为 Some(true)，带了但不支持为 Some(false)，没带为 None。
+        /// 请求方据此如实提示用户，不许假装生效。
+        #[serde(default)]
+        thinking_applied: Option<bool>,
     },
     /// 剪贴板同步开关状态通告：连接建立后双方互发，开关被切换时再发。
     /// 只有双方都开启才真正同步内容。

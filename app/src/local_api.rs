@@ -187,6 +187,56 @@ async fn handle(node: Arc<Node>, mut sock: TcpStream) -> std::io::Result<()> {
     }
 }
 
+/// 取一条消息的文本内容：兼容 OpenAI 的两种形态——纯字符串，或分段数组
+/// （[{type:"text",text:"…"},…]，TRAE 等编程工具发的是后者）。
+/// 数组时拼接全部 text 段，非文本段（图片等）跳过；v2.6.1 前只认纯字符串，
+/// 数组内容被解析成空字符串、空消息发到上游被 422 拒（真机实证）。
+fn message_content_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    serde_json::Value::String(s) => out.push_str(s),
+                    v if v.get("type").and_then(|t| t.as_str()) == Some("text") => {
+                        if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+                            out.push_str(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        _ => String::new(),
+    }
+}
+
+/// 从请求体提取可透传的生成参数（temperature / max_tokens / top_p）：
+/// 只收数值合法的，其余忽略——调用方软件给什么尽量带给上游（经对端
+/// 转发时随 AiProxy 请求一起带过去），不给就按执行侧配置走。
+fn gateway_options(v: &serde_json::Value) -> bluelink_services::AiCallOptions {
+    bluelink_services::AiCallOptions {
+        thinking: None,
+        temperature: v
+            .get("temperature")
+            .and_then(|t| t.as_f64())
+            .map(|t| t as f32)
+            .filter(|t| (0.0..=2.0).contains(t)),
+        max_tokens: v
+            .get("max_tokens")
+            .and_then(|t| t.as_u64())
+            .and_then(|t| u32::try_from(t).ok())
+            .filter(|t| *t > 0),
+        top_p: v
+            .get("top_p")
+            .and_then(|t| t.as_f64())
+            .map(|t| t as f32)
+            .filter(|t| (0.0..=1.0).contains(t)),
+    }
+}
+
 async fn chat_completions(
     node: Arc<Node>,
     sock: &mut TcpStream,
@@ -206,24 +256,29 @@ async fn chat_completions(
                     .and_then(|r| r.as_str())
                     .unwrap_or("user")
                     .to_string(),
-                content: m
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                content: message_content_text(m.get("content")),
             });
         }
     }
     if msgs.is_empty() {
         return respond_error(sock, 400, "messages 为空").await;
     }
+    let opts = gateway_options(&v);
+    bluelink_services::log_line(
+        "api",
+        &format!(
+            "本地 API 请求：chat/completions（{} 条消息，流式={}）",
+            msgs.len(),
+            stream
+        ),
+    );
     let model = node.gateway_model().await;
     let created = secs_now();
 
     if !stream {
         let prompt_chars: usize = msgs.iter().map(|m| m.content.chars().count()).sum();
         let mut sink = |_: &str| {};
-        return match node.gateway_chat(&msgs, &mut sink).await {
+        return match node.gateway_chat(&msgs, &opts, &mut sink).await {
             Ok(full) => {
                 let completion_chars = full.chars().count();
                 respond_json(
@@ -261,7 +316,7 @@ async fn chat_completions(
         let mut cb = move |d: &str| {
             let _ = tx2.send(Ok(d.to_string()));
         };
-        if let Err(e) = n2.gateway_chat(&msgs2, &mut cb).await {
+        if let Err(e) = n2.gateway_chat(&msgs2, &opts, &mut cb).await {
             let _ = tx.send(Err(e.to_string()));
         }
     });
@@ -304,4 +359,41 @@ async fn chat_completions(
     write_sse(sock, "[DONE]").await?;
     sock.write_all(b"0\r\n\r\n").await?;
     sock.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 内容解析兼容数组分段() {
+        // 纯字符串（旧形态）
+        let v = serde_json::json!("你好");
+        assert_eq!(message_content_text(Some(&v)), "你好");
+        // 数组分段（TRAE 等编程工具的形态）：text 段拼接、非文本段跳过
+        let v = serde_json::json!([
+            {"type": "text", "text": "帮我看看"},
+            {"type": "image_url", "image_url": {"url": "data:..."}},
+            {"type": "text", "text": "这段代码"}
+        ]);
+        assert_eq!(message_content_text(Some(&v)), "帮我看看这段代码");
+        // 缺失/ null / 其它类型：空字符串（不 panic）
+        assert_eq!(message_content_text(None), "");
+        assert_eq!(message_content_text(Some(&serde_json::Value::Null)), "");
+    }
+
+    #[test]
+    fn 网关参数只收合法数值() {
+        let v = serde_json::json!({"temperature": 0.5, "max_tokens": 256, "top_p": 0.9});
+        let o = gateway_options(&v);
+        assert_eq!(o.temperature, Some(0.5));
+        assert_eq!(o.max_tokens, Some(256));
+        assert_eq!(o.top_p, Some(0.9));
+        // 越界/缺失一律忽略，不把非法值带给上游
+        let v = serde_json::json!({"temperature": 9.9, "max_tokens": 0, "top_p": "x"});
+        let o = gateway_options(&v);
+        assert_eq!(o.temperature, None);
+        assert_eq!(o.max_tokens, None);
+        assert_eq!(o.top_p, None);
+    }
 }

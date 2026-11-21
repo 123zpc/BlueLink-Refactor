@@ -10,12 +10,18 @@ const state = {
   peerName: null,
   view: "chat",
   peerConvId: null,
+  peerConvTitle: "", // ㉛ 当前打开的设备会话标题（顶栏如实用）
+  connectedConvId: null, // ㉛ 实际连接的对端会话 id（落点规则用）
   aiConvId: "ai-default",
   replyTo: null,
   renderedChat: new Set(),
   renderedAi: new Set(),
   aiGenerating: false,
+  pendingAskRef: null, // ㉒ 问AI 待发送的引用 { convId, msgId }
+  locateInProgress: false, // ㉔ 定位期间抑制 loadAiMessages 并发重渲染
   streamEl: null,
+  streamText: "",
+  streamWaiting: false,
   categories: [],
   catEditId: null,
   pendingFiles: [],
@@ -38,13 +44,90 @@ function esc(s) {
 }
 
 /** 极简 Markdown：代码块、行内代码、加粗、换行（AI 回复用）。 */
-function md(s) {
-  let h = esc(s);
-  h = h.replace(/```([\s\S]*?)```/g, (_, code) => `<pre>${code}</pre>`);
-  h = h.replace(/`([^`\n]+)`/g, "<code>$1</code>");
-  h = h.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
-  return h;
+// ---- AI 回复 Markdown 渲染（⑩⑫，v2.6.1）----
+// AI 页与聊天 @AI 气泡共用。原则：先按行切分原始文本，代码块收原始
+// 代码（显示时转义、复制时给原文），其余行先转义再套行内格式——原始
+// HTML 永远进不了 DOM。流式中途的半截 Markdown 必须容错：未闭合的
+// 围栏先按代码块渲染（等后续分片补上闭合围栏自然成型）。
+// 代码块原文按全局序号暂存：渲染出的 HTML 只带序号，复制按钮按序号
+// 取原文（塞进 HTML 属性一转义就对不回原文）。序号只增不复用，多条
+// 消息同屏互不串扰；暂存超过 500 段时整体清空（极老气泡的复制按钮
+// 会提示失效，可接受）。
+const MD_CODE_BLOCKS = new Map();
+let MD_CODE_SEQ = 0;
+
+function mdInline(t) {
+  // t 必须已 esc；在此基础上套行内格式（代码/粗体/斜体/链接）
+  return t
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<i>$2</i>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/(^|[\s（(])((?:https?:\/\/)[^\s<）)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
 }
+
+function md(s) {
+  const lines = String(s ?? "").split("\n");
+  let out = "", listOpen = false;
+  const closeList = () => { if (listOpen) { out += "</ul>"; listOpen = false; } };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = line.match(/^```([A-Za-z0-9+#-]*)\s*$/);
+    if (fence) {
+      closeList();
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
+      i++; // 吃掉闭合围栏；流式未闭合时 i 已到尾，无妨
+      const raw = buf.join("\n");
+      if (MD_CODE_BLOCKS.size > 500) MD_CODE_BLOCKS.clear();
+      const id = ++MD_CODE_SEQ;
+      MD_CODE_BLOCKS.set(id, raw);
+      const lang = fence[1] || "代码";
+      out += `<div class="md-code"><div class="md-code-head"><span>${esc(lang)}</span><button type="button" class="md-copy" data-mdcopy="${id}">复制</button></div><pre><code>${esc(raw)}</code></pre></div>`;
+      continue;
+    }
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      closeList();
+      out += `<div class="md-h md-h${h[1].length}">${mdInline(esc(h[2]))}</div>`;
+      i++;
+      continue;
+    }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      closeList();
+      out += '<hr class="md-hr">';
+      i++;
+      continue;
+    }
+    const li = line.match(/^\s*(?:[-*+]|\d+[.、)])\s+(.*)$/);
+    if (li) {
+      if (!listOpen) { out += "<ul class=\"md-ul\">"; listOpen = true; }
+      out += `<li>${mdInline(esc(li[1]))}</li>`;
+      i++;
+      continue;
+    }
+    closeList();
+    if (/^\s*>\s?/.test(line)) {
+      out += `<div class="md-q">${mdInline(esc(line.replace(/^\s*>\s?/, "")))}</div>`;
+    } else if (line.trim() !== "") {
+      out += `<div class="md-p">${mdInline(esc(line))}</div>`;
+    }
+    i++;
+  }
+  closeList();
+  return out;
+}
+
+// 代码块「复制」按钮：事件委托一处接管（气泡是动态渲染的）
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest ? e.target.closest("[data-mdcopy]") : null;
+  if (!btn) return;
+  const raw = MD_CODE_BLOCKS.get(Number(btn.dataset.mdcopy));
+  if (raw === undefined) { showToast("这段代码已失效，请重新生成"); return; }
+  copyText(raw);
+});
 
 function fmtTime(ts) {
   const d = new Date(ts);
@@ -143,6 +226,8 @@ function buildMessageEl(m, opts = {}) {
   } else if (m.kind === "file") {
     bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div><div class="progress hidden"><div></div></div><div class="progress-meta hidden"></div><button class="progress-cancel hidden">取消</button><button class="transfer-retry hidden">重试</button>`;
     state.lastFileBubble = bubble;
+    // ㉑ 单张图片在气泡里直接出预览（详见 attachImagePreview）
+    if (isImageExt(fileExt(m.body))) attachImagePreview(bubble, m.id);
     bubble.addEventListener("click", (e) => {
       if (e.target.closest("button")) return;
       openFileSmart(m, e.clientX, e.clientY);
@@ -195,6 +280,9 @@ function buildMessageEl(m, opts = {}) {
   // 图片组的正文是清单 JSON，引用/问AI 对它无意义，不给这两个入口
   if (!opts.ai && m.kind !== "imagegroup") btns.push(["引用", () => setReply(m)], ["问AI", () => askAiAbout(m)]);
   if (opts.ai && m.sender === "ai") btns.push(["复制", () => navigator.clipboard.writeText(m.body)], ["重新生成", () => regenerateAi()]);
+  // 聊天里的 @AI 回答同样给复制/重新生成（v2.6.1 ⑭：此前只有 AI 页有，
+  // 聊天侧点了没反应/没入口）；重新生成走 chat_regenerate_ai 按原问题重答
+  if (!opts.ai && m.sender === "ai") btns.push(["复制", () => navigator.clipboard.writeText(m.body)], ["重新生成", () => chatRegenerateAi(m)]);
   for (const [label, fn] of btns) {
     const b = document.createElement("button");
     b.textContent = label;
@@ -332,7 +420,12 @@ function appendMessage(container, m, renderedSet, opts) {
   }
   container.appendChild(el);
   renderedSet.add(m.id);
-  container.scrollTop = container.scrollHeight;
+  // ⑥ 跟随滚动要有分寸：本来就在底部附近（≤80px）才跟随到底；
+  // 用户上滑看历史时新消息/流式落库不许把视图抢走。整页加载走
+  // loadChatMessages/loadAiMessages 的显式滚底，不经这里。
+  if (nearBottomEl(container)) container.scrollTop = container.scrollHeight;
+  if (container.id === "messages") syncBottomBtn();
+  if (container.id === "ai-messages") syncAiBottomBtn();
 }
 
 /** 唯一的定位链路：切会话→加载消息→滚动到目标→高亮闪烁两次。
@@ -340,31 +433,90 @@ function appendMessage(container, m, renderedSet, opts) {
  *  脉冲高亮就用分类色；引用/搜索/收藏/置顶发起的定位不传，仍用默认蓝色。 */
 async function locateMessage(conversationId, messageId, colorHex) {
   const isAi = conversationId === state.aiConvId || conversationId.startsWith("ai");
-  switchView(isAi ? "ai" : "chat");
-  const container = isAi ? $("ai-messages") : $("messages");
-  const set = isAi ? state.renderedAi : state.renderedChat;
-  if (!set.has(messageId)) {
-    const msgs = await invoke("list_messages", { conversationId, limit: 2000 });
-    container.innerHTML = "";
-    set.clear();
-    for (const m of msgs) appendMessage(container, m, set, { ai: isAi });
-  }
-  const el = container.querySelector(`[data-mid="${messageId}"]`);
-  if (el) {
-    el.scrollIntoView({ block: "center" });
-    if (colorHex) el.style.setProperty("--flash-ring", colorHex);
-    el.classList.add("flash");
-    setTimeout(() => { el.classList.remove("flash"); el.style.removeProperty("--flash-ring"); }, 1300);
+  // ㉔：定位期间置旗，switchView 触发的 loadAiMessages 不得并发重渲染
+  // 同一容器——旧实现两边赛跑：整段加载刚滚到目标，分页加载随后完成
+  // 又把容器清空重铺，滚动落点被冲掉（AI 页落点不准的主因）。
+  state.locateInProgress = true;
+  try {
+    // ㉕：定位到非当前打开的 AI 会话时先认领它，否则界面显示的是这个
+    // 会话的消息、发送却落进另一个会话（串话）
+    if (isAi && conversationId !== state.aiConvId) {
+      state.aiConvId = conversationId;
+    }
+    switchView(isAi ? "ai" : "chat");
+    if (isAi) loadAiConversations();
+    const container = isAi ? $("ai-messages") : $("messages");
+    const set = isAi ? state.renderedAi : state.renderedChat;
+    if (!set.has(messageId)) {
+      const msgs = await invoke("list_messages", { conversationId, limit: 2000 });
+      container.innerHTML = "";
+      set.clear();
+      for (const m of msgs) appendMessage(container, m, set, { ai: isAi });
+    }
+    const el = container.querySelector(`[data-mid="${messageId}"]`);
+    if (el) {
+      // 等布局落定（双 rAF）再滚：Markdown 渲染后的高度要一两帧才稳，
+      // 提前滚必偏；滚后在短窗口内再校正一次（图片等异步撑高时补正）。
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      el.scrollIntoView({ block: "center" });
+      if (colorHex) el.style.setProperty("--flash-ring", colorHex);
+      el.classList.add("flash");
+      setTimeout(() => {
+        if (!el.isConnected) return;
+        const r = el.getBoundingClientRect();
+        const cr = container.getBoundingClientRect();
+        const off = (r.top + r.height / 2) - (cr.top + cr.height / 2);
+        if (Math.abs(off) > 48) el.scrollIntoView({ block: "center" });
+      }, 400);
+      setTimeout(() => { el.classList.remove("flash"); el.style.removeProperty("--flash-ring"); }, 1600);
+    }
+  } finally {
+    state.locateInProgress = false;
   }
   closeDrawer();
 }
 
+/** ㉛ 未连接态的聊天页形态：输入行换成提示带（同一位置），顶栏状态
+ * 如实。浏览路径（会话列表/消息加载/分页/跳转）一律不看连接状态——
+ * 历史是本地数据。 */
+function syncOfflineUI() {
+  const off = !state.connected;
+  $("offline-band").classList.toggle("hidden", !off);
+  document.querySelector("#composer .composer-row").classList.toggle("hidden", off);
+  $("btn-disconnect").disabled = off; // 导出是历史功能，离线照常可用
+  syncPeerHead();
+}
+
+/** ㉛ 聊天顶栏如实：标题是当前打开会话的设备名；状态点/文案——
+ * 未连接=灰点「未连接」；连的就是本会话=绿点「已连接」；连的是别的
+ * 设备=绿点并写明「当前连接：X」，不假装本会话可发。 */
+function syncPeerHead() {
+  if (state.peerConvTitle) $("peer-name").textContent = state.peerConvTitle;
+  const dot = $("peer-dot");
+  const txt = $("peer-state-text");
+  if (!state.connected) {
+    dot.className = "status-dot";
+    txt.textContent = "未连接";
+  } else if (state.connectedConvId && state.peerConvId && state.connectedConvId !== state.peerConvId) {
+    dot.className = "status-dot on";
+    txt.textContent = `当前连接：${state.peerName || "其他设备"}`;
+  } else {
+    dot.className = "status-dot on";
+    txt.textContent = "已连接";
+  }
+  $("nav-conn-dot").classList.toggle("on", !!state.connected);
+}
+$("btn-go-connect").addEventListener("click", () => switchView("connect"));
+document.querySelector(".capsule").addEventListener("click", () => switchView("connect"));
+
 // ---------- 视图切换 ----------
 function switchView(view) {
   state.view = view;
-  document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
-  $("chat-view").classList.toggle("hidden", !(view === "chat" && state.connected));
-  $("connect-view").classList.toggle("hidden", !(view === "chat" && !state.connected));
+  // 连接页与聊天页在导航里平级（㉛ 定版）：各自高亮、随时互切
+  document.querySelectorAll(".nav-item").forEach((b) =>
+    b.classList.toggle("active", b.dataset.view === view));
+  $("chat-view").classList.toggle("hidden", view !== "chat");
+  $("connect-view").classList.toggle("hidden", view !== "connect");
   $("ai-view").classList.toggle("hidden", view !== "ai");
   $("tags-view").classList.toggle("hidden", view !== "tags");
   $("fav-view").classList.toggle("hidden", view !== "favorites");
@@ -372,13 +524,16 @@ function switchView(view) {
   closePinList();
   applyAside();
   syncDrawer();
+  if (view === "chat") syncOfflineUI();
   // 视图刚变可见时补量一次输入框高度（隐藏期间 autoGrow 会跳过）
   autoGrow($("input"));
   autoGrow($("ai-input"));
   if (view === "tags") loadCategoryList();
   if (view === "favorites") loadFavList();
-  if (view === "ai") loadAiMessages();
+  if (view === "ai") { loadAiConversations(); loadAiMessages(); loadGatewaySettings(); }
   if (view === "settings") loadSettings();
+  // 置顶栏按视图各一份（⑲）：进聊天/AI 页时都刷新到本会话的置顶
+  if (view === "ai" || view === "chat") refreshPinBar();
 }
 
 document.querySelectorAll(".nav-item").forEach((b) =>
@@ -419,17 +574,45 @@ $("btn-aside-float").addEventListener("click", () => {
 
 // ---------- 会话列表 ----------
 async function loadConversations() {
-  const convs = await invoke("list_conversations");
+  // ⑲ 加固：拉取失败时保留现有列表、只记日志，绝不先清空再渲染——
+  // 旧写法 invoke 一失败列表就整体变空，看起来像「会话不见了」；
+  // 单条渲染异常也只跳过该条，不连累整表。
+  let convs;
+  try {
+    convs = await invoke("list_conversations");
+  } catch (e) {
+    invoke("log_frontend", { msg: "会话列表加载失败（保留现有列表）：" + String(e) }).catch(() => {});
+    return;
+  }
   const list = $("conv-list");
   list.innerHTML = "";
-  for (const c of convs) {
-    if (c.kind === "peer") state.peerConvId = c.id;
-    const item = document.createElement("div");
-    item.className = "list-item conv-item";
-    item.innerHTML = `<span class="li-main"><span class="li-title"><span>${esc(c.title)}</span></span><span class="li-sub">${c.kind === "ai" ? "AI 会话" : "设备会话"}</span></span>`;
-    item.addEventListener("click", () => switchView(c.kind === "ai" ? "ai" : "chat"));
-    list.appendChild(item);
+  const peerConvs = convs.filter((c) => c.kind === "peer");
+  // ㉛ 当前打开的会话不被列表刷新顶掉（落点/浏览位置保持）；只有它
+  // 不存在了才回落到最近一条设备会话
+  if (!peerConvs.some((c) => c.id === state.peerConvId)) {
+    state.peerConvId = peerConvs.length ? peerConvs[peerConvs.length - 1].id : null;
   }
+  const cur = peerConvs.find((c) => c.id === state.peerConvId);
+  state.peerConvTitle = cur ? (cur.title || "") : state.peerConvTitle;
+  for (const c of peerConvs) {
+    try {
+      const item = document.createElement("div");
+      item.className = "list-item conv-item";
+      item.innerHTML = `<span class="li-main"><span class="li-title"><span>${esc(c.title || "")}</span></span><span class="li-sub">设备会话</span></span>`;
+      // ㉛ 点开会话即加载本地历史（与连接状态无关）；点已打开的会话
+      // 不重载——浏览位置保持不重置
+      item.addEventListener("click", () => {
+        const switching = state.peerConvId !== c.id;
+        state.peerConvId = c.id;
+        state.peerConvTitle = c.title || "";
+        switchView("chat");
+        if (switching) loadChatMessages();
+        syncPeerHead();
+      });
+      list.appendChild(item);
+    } catch (_) { /* 单条坏数据跳过，不打断整表 */ }
+  }
+  syncPeerHead();
 }
 
 // ---------- 聊天 ----------
@@ -550,32 +733,83 @@ async function refreshPinIds() {
   } catch (_) { return null; }
 }
 
+/** 当前视图对应的置顶上下文（会话 + 栏/列表元素）。
+ * ⑲ 定案：置顶的写入与单条状态读取一直是全局的（message_marks +
+ * pinIds，显示「已置顶」没问题），但置顶栏/置顶列表此前只按设备会话
+ * 过滤、且只存在于聊天页——在 AI 页置顶的消息在任何列表里都看不到，
+ * 重启也不会恢复（结构性分叉，非数据丢失）。修法：两个视图各一份
+ * 置顶栏/列表，各收录本会话的置顶。 */
+function pinCtx() {
+  return state.view === "ai"
+    ? { conv: state.aiConvId, bar: $("ai-pin-bar"), list: $("ai-pin-list") }
+    : { conv: state.peerConvId, bar: $("pin-bar"), list: $("pin-list") };
+}
+
 async function refreshPinBar() {
   try {
     const pins = await refreshPinIds();
     if (!pins) return;
-    const mine = pins.filter((m) => m.conversation_id === state.peerConvId);
-    state.pins = mine;
-    const bar = $("pin-bar");
-    if (!mine.length) { bar.classList.add("hidden"); closePinList(); return; }
-    bar.classList.remove("hidden");
-    // 1 条：保持现行文案与点击直跳；≥2 条：文案提示可多选，点击先弹列表
-    bar.innerHTML = mine.length === 1
-      ? `${iconUse("i-pin", "ico ico-14")}<span>置顶：${esc(mine[0].body.slice(0, 40))}</span>`
-      : `${iconUse("i-pin", "ico ico-14")}<span>置顶消息 · 共 ${mine.length} 条（点击选择）</span>`;
-    bar.onclick = () => {
-      if (state.pins.length === 1) locateMessage(state.pins[0].conversation_id, state.pins[0].id);
-      else togglePinList();
-    };
+    renderPinBar(pins, state.peerConvId, $("pin-bar"));
+    renderPinBar(pins, state.aiConvId, $("ai-pin-bar"));
+    const ctx = pinCtx();
+    state.pins = pins.filter((m) => m.conversation_id === ctx.conv);
+    if (!state.pins.length) closePinList();
   } catch (_) { /* 忽略 */ }
+}
+
+function renderPinBar(pins, convId, bar) {
+  if (!bar) return;
+  const mine = pins.filter((m) => m.conversation_id === convId);
+  if (!mine.length) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+  // 1 条：保持现行文案与点击直跳；≥2 条：文案提示可多选，点击先弹列表
+  bar.innerHTML = mine.length === 1
+    ? `${iconUse("i-pin", "ico ico-14")}<span>置顶：${esc(mine[0].body.slice(0, 40))}</span>`
+    : `${iconUse("i-pin", "ico ico-14")}<span>置顶消息 · 共 ${mine.length} 条（点击选择）</span>`;
+  bar.onclick = () => {
+    state.pins = mine;
+    if (mine.length === 1) locateMessage(mine[0].conversation_id, mine[0].id);
+    else togglePinList();
+  };
+  // ㉖ 单条时置顶栏本身就是那条置顶的条目：右键同样可取消置顶；
+  // 多条时右键先展开列表，再在条目上操作
+  bar.oncontextmenu = (e) => {
+    e.preventDefault();
+    if (mine.length === 1) openUnpinMenu(mine[0], e.clientX, e.clientY);
+    else { state.pins = mine; openPinList(); }
+  };
+}
+
+/** ㉖ 取消置顶菜单（置顶列表条目/单条置顶栏共用）：点「取消置顶」先
+ * 弹确认，确认才真取消；取消/关弹窗保持置顶不动。 */
+function openUnpinMenu(m, x, y) {
+  const menu = $("file-menu");
+  menu.innerHTML = "";
+  const b = document.createElement("button");
+  b.textContent = "取消置顶";
+  b.addEventListener("click", async () => {
+    menu.classList.add("hidden");
+    const ok = await showConfirm("取消置顶这条消息？", "取消置顶");
+    if (!ok) return;
+    await toggleMark(m.id, "pin");
+    // 列表开着时按最新置顶集重渲染（refreshPinBar 已在无置顶时关列表）
+    if (pinListOpen) {
+      if (state.pins && state.pins.length) openPinList();
+      else closePinList();
+    }
+  });
+  menu.appendChild(b);
+  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
+  menu.style.top = Math.min(y, window.innerHeight - 120) + "px";
+  menu.classList.remove("hidden");
 }
 
 // ---------- 置顶消息列表（≥2 条时点置顶栏弹出，点哪条跳哪条） ----------
 let pinListOpen = false;
 function togglePinList() { pinListOpen ? closePinList() : openPinList(); }
 function openPinList() {
-  const list = $("pin-list");
-  const bar = $("pin-bar");
+  const { list, bar } = pinCtx();
+  if (!list || !bar) return;
   list.innerHTML = "";
   const head = document.createElement("div");
   head.className = "rl-head";
@@ -589,6 +823,8 @@ function openPinList() {
     item.title = main;
     // 回跳复用 locateMessage：目标不在已加载首屏时它会整段加载兜底定位
     item.addEventListener("click", () => { closePinList(); locateMessage(m.conversation_id, m.id); });
+    // ㉖ 右键就地取消置顶（带二次确认）
+    item.addEventListener("contextmenu", (e) => { e.preventDefault(); e.stopPropagation(); openUnpinMenu(m, e.clientX, e.clientY); });
     list.appendChild(item);
   }
   list.style.top = (bar.offsetTop + bar.offsetHeight + 4) + "px";
@@ -597,14 +833,15 @@ function openPinList() {
 }
 function closePinList() {
   pinListOpen = false;
-  const list = $("pin-list");
-  if (list) list.classList.add("hidden");
+  for (const id of ["pin-list", "ai-pin-list"]) {
+    const list = $(id);
+    if (list) list.classList.add("hidden");
+  }
 }
 document.addEventListener("mousedown", (e) => {
   if (!pinListOpen) return;
-  const list = $("pin-list");
-  const bar = $("pin-bar");
-  if (!list.contains(e.target) && !bar.contains(e.target)) closePinList();
+  const { list, bar } = pinCtx();
+  if (list && bar && !list.contains(e.target) && !bar.contains(e.target)) closePinList();
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePinList(); });
 
@@ -865,11 +1102,14 @@ async function sendCurrent() {
     updateDocBar();
     invoke("save_draft", { conversationId: state.peerConvId, text: "" }).catch(() => {});
     chatAiBusy = true;
+    // ④ 发出即挂等待气泡：回答经事件回推落库前界面必须有动静，
+    // 否则走对方转发时十几秒空白像卡死。路由决定等待文案。
+    const waitRow = appendChatAiWaiting(src === "peer" || (src === "default" && aiRouteIsPeer()));
     try {
-      await invoke("chat_ask_ai", { conversationId: state.peerConvId, source: src, text });
+      await invoke("chat_ask_ai", { conversationId: state.peerConvId, source: src, text, thinking: currentThinking() });
     } catch (e) {
       showToast("问AI 失败：" + e);
-    } finally { chatAiBusy = false; }
+    } finally { waitRow.remove(); chatAiBusy = false; }
     return;
   }
   const asDoc = docSuggestion;
@@ -897,6 +1137,7 @@ async function sendCurrent() {
 
 $("btn-send").addEventListener("click", sendCurrent);
 $("input").addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return; // 输入法组字回车不发送（与 AI 页对齐，⑦）
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendCurrent(); }
 });
 let typingTimer = null, draftTimer = null;
@@ -1822,6 +2063,9 @@ async function openFileMenu(mid, x, y) {
         showToast("已另存为");
       }
     }, ""],
+    // ㉖ 补齐：文件气泡右键菜单此前没有收藏/置顶，与文本气泡口径对齐
+    ["收藏", true, async () => { await toggleMark(mid, "favorite"); }, ""],
+    [state.pinIds.has(mid) ? "取消置顶" : "置顶", true, async () => { await toggleMark(mid, "pin"); }, ""],
     ["删除记录", true, async () => {
       await invoke("delete_message", { messageId: mid });
       const row = document.querySelector(`[data-mid="${mid}"]`);
@@ -2037,7 +2281,85 @@ $("search-input").addEventListener("input", () => {
 });
 
 // ---------- AI ----------
+// ---------- ㉕ AI 会话体系：列表只属于 AI 页 ----------
+// AI 会话与聊天（设备）会话是两回事：AI 页自带会话条，可新建、切换、
+// 双击改名；发送跟随当前打开的会话（state.aiConvId）。ai-default
+// 「AI 助手」是默认会话，问AI 的落点也固定在它。
+async function loadAiConversations() {
+  let convs;
+  try {
+    convs = await invoke("list_conversations");
+  } catch (_) { return; }
+  const aiConvs = convs.filter((c) => c.kind === "ai");
+  if (!aiConvs.some((c) => c.id === state.aiConvId)) {
+    state.aiConvId = aiConvs.length ? aiConvs[0].id : "ai-default";
+  }
+  const list = $("ai-conv-list");
+  list.innerHTML = "";
+  for (const c of aiConvs) {
+    const chip = document.createElement("button");
+    chip.className = "ai-conv-chip" + (c.id === state.aiConvId ? " active" : "");
+    chip.textContent = c.title || "AI 会话";
+    chip.title = "点击打开；双击改名";
+    // 已打开的会话点它不做任何事：重渲染会把紧接着的双击（改名）打断
+    chip.addEventListener("click", () => { if (c.id !== state.aiConvId) openAiConversation(c.id); });
+    chip.addEventListener("dblclick", (ev) => { ev.stopPropagation(); renameAiChip(chip, c); });
+    list.appendChild(chip);
+    if (c.id === state.aiConvId) $("ai-title").textContent = c.title || "AI 助手";
+  }
+}
+
+function openAiConversation(id) {
+  if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
+  state.aiConvId = id;
+  loadAiConversations();
+  loadAiMessages();
+  refreshPinBar();
+}
+
+function renameAiChip(chip, conv) {
+  const input = document.createElement("input");
+  input.value = conv.title || "";
+  chip.textContent = "";
+  chip.appendChild(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const commit = async (save) => {
+    if (done) return;
+    done = true;
+    const title = input.value.trim();
+    if (save && title && title !== conv.title) {
+      try {
+        await invoke("rename_ai_conversation", { conversationId: conv.id, title });
+      } catch (e) { showToast("改名失败：" + e); }
+    }
+    loadAiConversations();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") commit(true);
+    else if (e.key === "Escape") commit(false);
+    e.stopPropagation();
+  });
+  input.addEventListener("blur", () => commit(true));
+  input.addEventListener("click", (e) => e.stopPropagation());
+  input.addEventListener("dblclick", (e) => e.stopPropagation());
+}
+
+$("btn-ai-new-conv").addEventListener("click", async () => {
+  if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
+  try {
+    const conv = await invoke("create_ai_conversation", { title: null });
+    state.aiConvId = conv.id;
+    await loadAiConversations();
+    await loadAiMessages();
+    refreshPinBar();
+    $("ai-input").focus();
+  } catch (e) { showToast("新建会话失败：" + e); }
+});
+
 async function loadAiMessages() {
+  if (state.locateInProgress) return; // ㉔：定位链路自己管加载，不并发重铺
   await refreshFavIds();
   await refreshPinIds();
   const msgs = await invoke("list_messages", { conversationId: state.aiConvId, limit: 200 });
@@ -2048,35 +2370,112 @@ async function loadAiMessages() {
   updateAiState();
 }
 
+// ---- AI 等待态 / 跟随滚动 / 思考开关（④⑤⑥，v2.6.1）----
+// ④ 此前发出问题后界面零反馈：问题落库要等回答事件才显形、首片到达
+// 前流式气泡根本不存在，走对方转发时十几秒没动静像卡死。现在三入口
+// 发出即显等待气泡，首片到达原地转流式渲染。
+// ⑥ 流式跟随只在距底 ≤80px 时发生；用户上滑看历史不再被抢滚动，
+// AI 页右下角给「回到最新」按钮（聊天页已有同类按钮 btn-bottom）。
+function nearBottomEl(el, px = 80) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= px;
+}
+function syncAiBottomBtn() {
+  const c = $("ai-messages");
+  $("btn-ai-bottom").classList.toggle("hidden", nearBottomEl(c, 80));
+}
+// 默认 AI 这次会走哪条路（与 updateAiState 的口径一致）：local 本机；
+// peer 对方；auto 本机配好走本机、否则走对方。等待文案据此区分。
+function aiRouteIsPeer() {
+  if (state.aiSource === "local") return false;
+  if (state.aiSource === "peer") return true;
+  return !state.aiLocalReady;
+}
+function aiWaitingText(peer) {
+  return peer ? "正在等待对方 AI 回复…" : "正在等待 AI 回复…";
+}
+function showAiWaiting() {
+  clearAiWaiting();
+  const container = $("ai-messages");
+  const row = document.createElement("div");
+  row.className = "msg-row";
+  row.id = "ai-waiting-row";
+  row.innerHTML = `<div class="msg"><div class="bubble ai-waiting"><span class="wait-dots"><i></i><i></i><i></i></span>${aiWaitingText(aiRouteIsPeer())}</div></div>`;
+  container.appendChild(row);
+  container.scrollTop = container.scrollHeight;
+  syncAiBottomBtn();
+  state.streamEl = row.querySelector(".bubble");
+  state.streamText = "";
+  state.streamWaiting = true;
+}
+function clearAiWaiting() {
+  const r = $("ai-waiting-row");
+  if (r) r.remove();
+  if (state.streamWaiting) {
+    state.streamEl = null;
+    state.streamText = "";
+    state.streamWaiting = false;
+  }
+}
+// ⑤ 思考模式开关：AI 页开关是唯一状态源（localStorage 持久化），
+// @AI/问AI/重新生成都读同一个值随请求带上。后端仅对 DeepSeek 兼容
+// 接口真正下发 thinking 参数，其余接口忽略并回执提示（见
+// ai_thinking_note 事件）。
+function currentThinking() {
+  // 只在勾选时携带 true：未勾选传 null（不干预）——否则不支持思考
+  // 开关的接口每次回答都会误报「已忽略该设置」（自测抓到后修）
+  const el = $("ai-thinking");
+  return el && el.checked ? true : null;
+}
+
 async function sendAi() {
   const text = $("ai-input").value.trim();
-  if (!text || state.aiGenerating) return;
+  const ref = state.pendingAskRef;
+  if (state.aiGenerating) return;
+  if (!text && !ref) return;
   if (!(await aiReadyOrRemind())) return;
   $("ai-input").value = ""; autoGrow($("ai-input"));
   state.aiGenerating = true;
   $("btn-ai-stop").classList.remove("hidden");
+  showAiWaiting();
   try {
-    await invoke("ai_send", { text });
+    if (ref) {
+      // ㉒ 引用模式：引用消息作上下文 + 用户文字作问题一起发出；
+      // 没输文字则 extra 为空，后端按引用原文问（兜底）
+      await invoke("ai_ask_message", {
+        conversationId: ref.convId, messageId: ref.msgId,
+        thinking: currentThinking(), extra: text || null,
+      });
+      clearAskRef();
+    } else {
+      await invoke("ai_send", { text, thinking: currentThinking(), conversationId: state.aiConvId });
+    }
   } catch (e) {
     showToast("AI 提问失败：" + e);
   } finally {
     state.aiGenerating = false;
+    clearAiWaiting();
     state.streamEl = null;
+    state.streamText = "";
     $("btn-ai-stop").classList.add("hidden");
+    if (ref) loadAiMessages();
   }
 }
 async function regenerateAi() {
   if (state.aiGenerating) return;
   state.aiGenerating = true;
   $("btn-ai-stop").classList.remove("hidden");
+  showAiWaiting();
   try {
-    await invoke("ai_regenerate");
+    await invoke("ai_regenerate", { thinking: currentThinking(), conversationId: state.aiConvId });
     await loadAiMessages();
   } catch (e) { showToast("重新生成失败：" + e); }
   state.aiGenerating = false;
+  clearAiWaiting();
   state.streamEl = null;
+  state.streamText = "";
   $("btn-ai-stop").classList.add("hidden");
 }
+// 聊天 @AI 回答的重新生成（⑭）见下方 chatRegenerateAi（与 chatAiBusy 同处）。
 $("btn-local-api").addEventListener("click", () => {
   switchView("settings");
   setTimeout(() => $("local-api-section").scrollIntoView({ behavior: "smooth" }), 60);
@@ -2093,7 +2492,7 @@ async function updateAiState() {
     const sel = $("ai-source");
     if (sel && document.activeElement !== sel) sel.value = src;
     const peerLabel = state.peerName || "对方设备";
-    $("ai-state").textContent =
+    const aiStateText =
       src === "local"
         ? ready ? `默认AI：本机AI（${cfg.model}）` : "默认AI：本机AI（尚未配置）"
         : src === "peer"
@@ -2103,6 +2502,9 @@ async function updateAiState() {
             : state.connected
               ? `默认AI：自动（本机未配置 · 经${peerLabel}转发回答）`
               : "默认AI：自动（本机未配置 AI，也未连接设备）";
+    // ㉚ 顶栏单行化：状态小字与标题同行、超长截断，悬停看全文
+    $("ai-state").textContent = aiStateText;
+    $("ai-state").title = aiStateText;
   } catch (_) { /* 忽略 */ }
 }
 $("ai-source").addEventListener("change", async (e) => {
@@ -2121,6 +2523,37 @@ function aiRouteName(key) {
   if (key === "local") return "本机AI";
   if (key === "peer") return `${state.peerName || "对方设备"}的AI`;
   return "默认AI";
+}
+
+// 在聊天列表末尾挂一行 AI 等待气泡，返回该行元素（用完 remove）。
+// 聊天 @AI 与聊天重新生成共用（④）。
+function appendChatAiWaiting(peer) {
+  const row = document.createElement("div");
+  row.className = "msg-row";
+  row.dataset.sender = "ai";
+  row.innerHTML = `<div class="msg"><div class="bubble ai-waiting"><span class="wait-dots"><i></i><i></i><i></i></span>${aiWaitingText(peer)}</div></div>`;
+  const c = $("messages");
+  c.appendChild(row);
+  c.scrollTop = c.scrollHeight;
+  return row;
+}
+
+// 聊天 @AI 回答的重新生成（⑭）：按回答消息 ID 让后端找回原问题重答；
+// 等待行先挂上，新答落库后经 message 事件替换旧气泡（后端先生成后删旧，
+// 这里成功后直接整页重载当前会话最稳妥）。
+async function chatRegenerateAi(m) {
+  if (chatAiBusy) { showToast("AI 正在回答上一个问题，请稍候"); return; }
+  chatAiBusy = true;
+  const waitRow = appendChatAiWaiting(aiRouteIsPeer());
+  try {
+    await invoke("chat_regenerate_ai", { messageId: m.id, thinking: currentThinking() });
+    if (state.peerConvId) await loadChatMessages();
+  } catch (e) {
+    showToast("重新生成失败：" + e);
+  } finally {
+    waitRow.remove();
+    chatAiBusy = false;
+  }
 }
 
 async function openAiPick() {
@@ -2178,28 +2611,57 @@ $("input").addEventListener("keydown", (e) => {
 }, true);
 
 /** 聊天页「问AI」：把这条消息作为上下文发给默认 AI，跳到 AI 页看回答并可继续追问。 */
-async function askAiAbout(m) {
+// ㉒ 问AI：点完不直接发——切到 AI 页把消息挂为引用上下文条，
+// 用户在输入框补自己的问题后发送才真正发出；不输文字直接发送 =
+// 按引用原文问（旧行为兜底）。× 可取消引用，取消后发送不带上下文。
+function askAiAbout(m) {
   if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
-  if (!(await aiReadyOrRemind())) return;
-  switchView("ai");
-  state.aiGenerating = true;
-  $("btn-ai-stop").classList.remove("hidden");
-  try {
-    await invoke("ai_ask_message", { conversationId: m.conversation_id, messageId: m.id });
-  } catch (e) {
-    showToast("问AI 失败：" + e);
-  } finally {
-    state.aiGenerating = false;
-    state.streamEl = null;
-    $("btn-ai-stop").classList.add("hidden");
-    loadAiMessages();
-  }
+  aiReadyOrRemind().then((ok) => {
+    if (!ok) return;
+    switchView("ai");
+    // 问AI 落点维持裁定：固定进 ai-default「AI 助手」（㉒+㉕ 口径），
+    // 当前打开的若是别的 AI 会话，先切回默认会话再挂引用条
+    if (state.aiConvId !== "ai-default") {
+      state.aiConvId = "ai-default";
+      loadAiConversations();
+      loadAiMessages();
+    }
+    state.pendingAskRef = { convId: m.conversation_id, msgId: m.id };
+    const who = m.sender === "me" ? "我" : m.sender === "ai" ? "AI" : "对方";
+    $("ai-quote-text").textContent = `引用${who}的消息：${(m.body || "").slice(0, 80)}`;
+    $("ai-quote-bar").classList.remove("hidden");
+    $("ai-input").focus();
+  });
 }
+function clearAskRef() {
+  state.pendingAskRef = null;
+  $("ai-quote-bar").classList.add("hidden");
+}
+$("ai-quote-x").addEventListener("click", clearAskRef);
 $("btn-ai-send").addEventListener("click", sendAi);
+// ⑦ AI 页输入框与聊天框对齐：Enter 发送、Shift+Enter 换行（textarea
+// 默认行为，不拦截即可）、高度自适应（wireAutoGrow 已接，上限同为
+// COMPOSER_MAX_H）。补输入法守卫：中文输入法组字中的回车是确认候选
+// 词，绝不能当发送——聊天框同病，一并对齐。
 $("ai-input").addEventListener("keydown", (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendAi(); }
 });
 $("btn-ai-stop").addEventListener("click", () => invoke("ai_stop"));
+// ⑥ AI 页「回到最新」：上滑后出现，点按回底并恢复跟随
+$("ai-messages").addEventListener("scroll", syncAiBottomBtn);
+$("btn-ai-bottom").addEventListener("click", () => {
+  const c = $("ai-messages");
+  c.scrollTop = c.scrollHeight;
+  syncAiBottomBtn();
+});
+// ⑤ 思考开关持久化：重开应用保持上次选择
+(() => {
+  const el = $("ai-thinking");
+  if (!el) return;
+  el.checked = localStorage.getItem("ai_thinking") === "1";
+  el.addEventListener("change", () => localStorage.setItem("ai_thinking", el.checked ? "1" : "0"));
+})();
 
 // ---------- 通用确认框与轻提示 ----------
 function showConfirm(text, okLabel = "确定") {
@@ -2300,6 +2762,17 @@ async function loadGatewaySettings() {
     $("local-api-status").textContent = g.local_enabled
       ? (g.local_running ? "运行中" : "启动失败（端口可能被占用）")
       : "未开启";
+    // ㉚ AI 页顶栏的本地 API 入口做成状态胶囊：一眼看出开/关
+    const apiBtn = $("btn-local-api");
+    apiBtn.textContent = g.local_enabled ? "本地 API · 开" : "本地 API · 关";
+    apiBtn.classList.toggle("api-on", !!g.local_enabled);
+    // ㉙ 可用模型一行：数据取网关现成的 gateway_model() 与连接状态，
+    // 三态口径——本机真实模型名 / 经对方转发（占位名）/ 暂无可用模型
+    const modelEl = $("local-api-model");
+    if (!g.local_enabled) modelEl.textContent = "开启后显示";
+    else if (g.model && g.model !== "bluelink-proxy") modelEl.textContent = `${g.model}（本机）`;
+    else if (g.connected) modelEl.textContent = "bluelink-proxy（经对方设备 AI 转发）";
+    else modelEl.textContent = "暂无可用模型（本机未配置 AI，且未连接设备）";
     $("local-api-key").placeholder = g.local_has_key ? "已设置（留空不修改）" : "可留空";
     $("btn-local-api-clear").classList.toggle("hidden", !g.local_has_key);
   } catch (_) { /* 忽略 */ }
@@ -2396,11 +2869,18 @@ $("btn-ai-save").addEventListener("click", async () => {
   $("ai-key").value = "";
   $("ai-test-result").textContent = "已保存";
   updateAiState();
+  loadGatewaySettings(); // ㉙ AI 配置保存后刷新可用模型一行
 });
 $("btn-ai-test").addEventListener("click", async () => {
   $("ai-test-result").textContent = "测试中…";
   try {
-    $("ai-test-result").textContent = await invoke("test_ai_connection");
+    // ③ 用表单当前值直测（v2.6.1）：改了地址/模型/密钥不必先保存。
+    // 密钥框留空 = 沿用已保存的密钥（表单从不回显明文），后端同口径。
+    $("ai-test-result").textContent = await invoke("test_ai_connection", {
+      baseUrl: $("ai-base").value.trim(),
+      apiKey: $("ai-key").value.trim(),
+      model: $("ai-model").value.trim(),
+    });
   } catch (e) { $("ai-test-result").textContent = String(e); }
 });
 $("proxy-allow-toggle").addEventListener("change", async (e) => {
@@ -2529,8 +3009,9 @@ async function wireEvents() {
     $("nav-logo").classList.toggle("linked", state.connected);
     if (!state.connected) ringClearAll();
     state.peerName = e.payload.peer_name;
-    $("peer-name").textContent = state.peerName || "未连接";
-    $("peer-state").textContent = state.connected ? "已连接" : "离线";
+    // ㉛ 落点规则的数据面：记下实际连上的对端会话（断开时清空）
+    state.connectedConvId = state.connected ? (e.payload.conversation_id || null) : null;
+    loadGatewaySettings(); // ㉙ 连接状态变化时刷新可用模型一行
     $("connect-status").textContent = state.connected ? "" : $("connect-status").textContent;
     // 连接页的已连接卡与胶囊：连上时已连接卡替换本机设备卡，断开时恢复
     if (state.connected) {
@@ -2547,8 +3028,23 @@ async function wireEvents() {
     updateCapsule();
     if (lastDevices.length) renderBtDevices(lastDevices);
     await loadConversations();
-    if (state.connected) { switchView("chat"); loadChatMessages(); }
-    else { loadLastPeer(); switchView(state.view); }
+    if (state.connected) {
+      // ㉛ 落点规则（定版）：一律打开实际连上的那个对端的会话——从
+      // 会话 A 去连接、连上 B 就落 B 的会话，不回 A
+      if (state.connectedConvId) {
+        state.peerConvId = state.connectedConvId;
+        const cur = (await invoke("list_conversations").catch(() => []))
+          .find((c) => c.id === state.connectedConvId);
+        if (cur) state.peerConvTitle = cur.title || "";
+      }
+      // 在连接页/聊天页时落到该会话；在别的页（AI/设置等）不打断
+      if (state.view === "connect" || state.view === "chat") { switchView("chat"); loadChatMessages(); }
+      syncOfflineUI();
+    } else {
+      // ㉛ 断开不再把人踢出聊天页：历史留原地，只切提示带与状态
+      loadLastPeer();
+      syncOfflineUI();
+    }
     updateAiState();
   });
   await listen("message_new", (e) => {
@@ -2563,7 +3059,7 @@ async function wireEvents() {
     const cid = e.payload && e.payload.conversation_id;
     if (cid && (cid === state.aiConvId || cid.startsWith("ai"))) { switchView("ai"); return; }
     switchView("chat");
-    if (state.connected) loadChatMessages();
+    loadChatMessages(); // ㉛ 通知回窗看历史同样不问连接状态
   });
   await listen("message_updated", (e) => {
     // 已有消息内容变化（图片组接收端逐张并入清单）：按 id 重建该行，
@@ -2667,6 +3163,9 @@ async function wireEvents() {
     if (b.dataset.flowing) { ringSet(b.dataset.flowing, false); delete b.dataset.flowing; }
     if (tstate === "done") {
       if (meta) meta.textContent = "已完成";
+      // ㉑ 接收完成补挂图片预览（气泡渲染时文件还没落盘的情况）
+      const fname = b.querySelector(".file-name");
+      if (mid && fname && isImageExt(fileExt(fname.textContent || ""))) attachImagePreview(b, mid);
       setTimeout(() => {
         if (bar) bar.classList.add("hidden");
         if (meta) meta.classList.add("hidden");
@@ -2695,15 +3194,35 @@ async function wireEvents() {
       row.innerHTML = `<div class="msg"><div class="bubble"></div></div>`;
       container.appendChild(row);
       state.streamEl = row.querySelector(".bubble");
+      state.streamText = "";
     }
-    state.streamEl.textContent += e.payload.delta;
-    container.scrollTop = container.scrollHeight;
+    // 首片到达：等待气泡原地转流式（④）——清掉等待样式与文案，
+    // 之后每片把全文重渲染 Markdown（⑫，半截围栏由 md() 容错）
+    if (state.streamWaiting) {
+      state.streamEl.classList.remove("ai-waiting");
+      state.streamEl.innerHTML = "";
+      state.streamWaiting = false;
+      const wr = $("ai-waiting-row");
+      if (wr) wr.removeAttribute("id");
+    }
+    state.streamText += e.payload.delta;
+    state.streamEl.innerHTML = md(state.streamText);
+    // ⑥ 仅距底 ≤80px 才跟随；用户上滑后停钉底，「回到最新」按钮接管
+    if (nearBottomEl(container)) container.scrollTop = container.scrollHeight;
+    syncAiBottomBtn();
   });
   await listen("ai_done", (e) => {
-    if (state.streamEl) { state.streamEl = null; }
+    state.streamEl = null;
+    state.streamText = "";
+    state.streamWaiting = false;
     loadAiMessages();
   });
-  await listen("ai_error", (e) => showToast(e.payload.error));
+  await listen("ai_error", (e) => { clearAiWaiting(); showToast(e.payload.error); });
+  // ⑤ 思考开关被当前接口忽略时的一次性小字提示（后端判定后回执）
+  await listen("ai_thinking_note", () => {
+    const n = $("ai-think-note");
+    if (n) n.classList.remove("hidden");
+  });
 }
 
 // ---------- 主题 ----------
@@ -2750,6 +3269,10 @@ let updAbandoned = false;
 function updSetStatus(text) { $("update-status").textContent = text; }
 function friendlyUpdError(e) {
   const s = String((e && e.message) || e || "");
+  // ① 取不到 release JSON 的插件原文（Could not fetch a valid release
+  // JSON…）：当前正式版没有附 latest.json 时必现，不是故障——映射成
+  // 人话，原文由调用方记进运行日志备查。
+  if (/valid release JSON|release JSON/i.test(s)) return "暂时无法获取更新信息：可能尚无带更新文件的正式版发布，或网络不通，请稍后再试";
   if (/404|not found/i.test(s)) return "暂无可用的更新信息";
   if (/network|error sending request|dns|connect|timed out/i.test(s)) return "网络不可用";
   return s.slice(0, 80) || "未知错误";
@@ -2784,10 +3307,19 @@ $("btn-check-update").addEventListener("click", async () => {
     updSetStatus(`发现新版本 v${update.version}`);
   } catch (e) {
     updSetStatus("检查失败，请稍后再试");
+    // ① 原始错误（含插件英文原文）记进运行日志，界面只给人话版
+    invoke("log_frontend", { msg: "检查更新失败，原始错误：" + String((e && e.message) || e || "") }).catch(() => {});
     showToast("检查更新失败：" + friendlyUpdError(e));
   } finally {
     btn.disabled = false;
   }
+});
+
+// ② 设置页「项目」地址：点开走系统浏览器（后端 open_url 只放行 http/https）
+$("project-link").addEventListener("click", async (e) => {
+  e.preventDefault();
+  try { await invoke("open_external_url", { url: "https://github.com/123zpc/BlueLink" }); }
+  catch (err) { showToast("打开失败：" + err); }
 });
 
 $("update-cancel").addEventListener("click", () => {
@@ -2901,13 +3433,15 @@ $("update-action").addEventListener("click", async () => {
   } catch (e) { console.error("拖拽监听注册失败", e); }
   await loadConversations();
   loadLastPeer();
-  if (state.identity.connected) {
-    state.connected = true;
-    switchView("chat");
-    loadChatMessages();
-  } else {
-    switchView("chat");
-  }
+  if (state.identity.connected) state.connected = true;
+  switchView("chat");
+  // ㉛ 冷启默认打开的会话直接渲染本地历史，连接与否都一样
+  loadChatMessages();
+  // ㉘ 主界面已就绪：立刻撤外壳并通知后端显示窗口（外壳不设最短停留，
+  // 就绪多快就多快切）。ui_ready 只在进程启动这一次调用。
+  $("splash").classList.add("done");
+  setTimeout(() => $("splash").remove(), 300);
+  invoke("ui_ready").catch(() => {});
 })();
 
 
@@ -2983,7 +3517,6 @@ function buildGroupBubble(bubble, m, row) {
       <span class="gstack-count">共 ${items.length} 张</span>
       <button class="gstack-nav prev" title="上一张">‹</button>
       <button class="gstack-nav next" title="下一张">›</button>
-      <span class="gstack-idx">1 / ${items.length}</span>
     </div>
     <div class="progress hidden"><div></div></div>
     <div class="progress-meta hidden"></div>
@@ -2996,7 +3529,7 @@ function buildGroupBubble(bubble, m, row) {
     if (!items.length) return;
     const i = Math.max(0, Math.min(bubble._gidx, items.length - 1));
     bubble._gidx = i;
-    bubble.querySelector(".gstack-idx").textContent = `${i + 1} / ${items.length}`;
+    // 页码指示已移入图片查看器（vi-count），气泡面不再挂第二个徽标（⑰）
     const img = bubble.querySelector(".gstack-img");
     const ph = bubble.querySelector(".gstack-ph");
     const f = files[i];
@@ -3163,6 +3696,30 @@ function openGroupMenu(m, x, y) {
 /** 文件气泡点击分流（v2.6.0）：文本/代码→内置文本查看器，图片→
  * 图片查看器，音视频→内置播放，PDF/Office→系统程序打开（本轮不做
  * 内置），其余与文件不存在时维持原文件菜单。 */
+/** ㉑ 单张图片气泡预览：图片类文件消息在文件卡顶部挂一张缩略预览，
+ * 气泡里直接能看，点击仍走气泡既有点击 → openFileSmart 进图片查看器。
+ * 尺寸靠 CSS 约束（max 240×180、cover、圆角同气泡规范），img 带
+ * lazy/async 解码，不把原图整张反复解码塞进布局；文件还没落盘
+ * （接收中）时不出预览，由传输完成事件再补挂一次（transfer_state）。
+ * 非图片/文件已删/加载失败一律不挂，文件卡原样。 */
+async function attachImagePreview(bubble, messageId) {
+  if (bubble.querySelector(".img-preview")) return;
+  let info = null;
+  try { info = await invoke("file_info", { messageId }); } catch (_) { return; }
+  if (!info || !info.exists || !info.path) return;
+  if (!isImageExt(fileExt(info.name || ""))) return;
+  if (!bubble.isConnected || bubble.querySelector(".img-preview")) return;
+  const img = document.createElement("img");
+  img.className = "img-preview";
+  img.alt = info.name || "";
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.draggable = false;
+  img.addEventListener("error", () => img.remove());
+  try { img.src = await assetUrl(info.path); } catch (_) { return; }
+  bubble.insertBefore(img, bubble.firstChild);
+}
+
 async function openFileSmart(m, x, y) {
   let info = null;
   try { info = await invoke("file_info", { messageId: m.id }); } catch (_) { /* 忽略 */ }
@@ -3281,6 +3838,16 @@ $("vi-rotl").addEventListener("click", () => { IV.rot = (IV.rot + 270) % 360; iv
 $("vi-rotr").addEventListener("click", () => { IV.rot = (IV.rot + 90) % 360; ivFit(); });
 $("viewer-img-prev").addEventListener("click", () => ivStep(-1));
 $("viewer-img-next").addEventListener("click", () => ivStep(1));
+// ⑱ 复制图片：复制当前显示的这一张（组内翻页跟随 IV.idx），走后端
+// 原生通道（按路径读图→解码→arboard 写图），不依赖浏览器剪贴板 API
+$("vi-copy").addEventListener("click", async () => {
+  const it = IV.items[IV.idx];
+  if (!it || !it.path) { showToast("图片文件未就绪，无法复制"); return; }
+  try {
+    const size = await invoke("copy_image_clipboard", { path: it.path });
+    showToast(`图片已复制到剪贴板（${size}）`);
+  } catch (e) { showToast(String(e)); }
+});
 {
   const stage = $("viewer-img-stage");
   stage.addEventListener("wheel", (e) => {
@@ -3384,11 +3951,54 @@ function decodeTextBytes(bytes) {
   if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
     return { text: new TextDecoder("utf-16be").decode(bytes), enc: "UTF-16" };
   }
+  // 严格链（v2.6.1）：整文件严格 UTF-8 → 严格 GBK → 有损兜底。
+  // v2.6.0 是「严格 UTF-8 失败就直接 GBK 有损」：UTF-8 文件只要混进
+  // 个别坏字节，整篇正常中文会被 GBK 误读成乱码（⑧「例」变 �� 一类）。
+  // 兜底时两种有损解码都试，按替换符数量取少者（并列取 UTF-8）：
+  // 坏字节只坏它自己那一两个字，不再连累全文。
   try {
     return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), enc: "UTF-8" };
-  } catch (_) {
-    return { text: new TextDecoder("gbk").decode(bytes), enc: "GBK" };
+  } catch (_) { /* 不是纯 UTF-8，继续严格 GBK */ }
+  try {
+    return { text: new TextDecoder("gbk", { fatal: true }).decode(bytes), enc: "GBK" };
+  } catch (_) { /* 也不是纯 GBK，进有损兜底 */ }
+  // 有损兜底的判据不能只比替换符个数：UTF-8 文件坏一两个字节时，
+  // GBK 有损解码反而可能替换符更少、却把全篇读成错字（实测翻车）。
+  // 先估 UTF-8 损坏字节数：损坏很小（≤3 字节，约一个字的量级）说明
+  // 本体就是 UTF-8、只坏了个别字 → UTF-8 有损；损坏大说明本体不是
+  // UTF-8 → 再比两种有损解码的替换符个数，少者胜（并列取 UTF-8）。
+  if (utf8DamageCount(bytes) <= 3) {
+    return { text: new TextDecoder("utf-8").decode(bytes), enc: "UTF-8" };
   }
+  const lossyUtf8 = new TextDecoder("utf-8").decode(bytes);
+  const lossyGbk = new TextDecoder("gbk").decode(bytes);
+  const badCount = (s) => (s.match(/�/g) || []).length;
+  if (badCount(lossyGbk) < badCount(lossyUtf8)) {
+    return { text: lossyGbk, enc: "GBK" };
+  }
+  return { text: lossyUtf8, enc: "UTF-8" };
+}
+
+// 估算字节流按 UTF-8 解读时的损坏字节数（不合规序列按字节计）。
+// 只做损坏量级估计，不做严格校验（过长编码等细节不究）。
+function utf8DamageCount(bytes) {
+  let i = 0, dmg = 0;
+  while (i < bytes.length) {
+    const b = bytes[i];
+    if (b < 0x80) { i++; continue; }
+    let need = 0;
+    if (b >= 0xc2 && b <= 0xdf) need = 1;
+    else if (b >= 0xe0 && b <= 0xef) need = 2;
+    else if (b >= 0xf0 && b <= 0xf4) need = 3;
+    else { dmg++; i++; continue; }
+    let ok = true;
+    for (let k = 1; k <= need; k++) {
+      const c = bytes[i + k];
+      if (c === undefined || c < 0x80 || c > 0xbf) { ok = false; break; }
+    }
+    if (ok) i += need + 1; else { dmg++; i++; }
+  }
+  return dmg;
 }
 
 async function openTextViewer(info) {
@@ -3414,8 +4024,35 @@ async function openTextViewer(info) {
   TV.encoding = dec.enc;
   TV.ext = fileExt(info.name);
   TV.lang = langOfExt(TV.ext);
+  // ⑨ 围栏文件（v2.6.1）：内容首行恰为 ```<lang> 时，这是从 AI 回答/
+  // 文档里整段存下来的代码块——围栏是包装不是正文：去掉首尾围栏行、
+  // 用围栏语言高亮。否则顶部会多出一行光秃秃的「python」，正文首行
+  // （如 shebang）反而被挤下去（2026-11-21 用户实报）。
+  const fence = TV.origText.match(/^```([A-Za-z0-9+#-]*)\s*\n/);
+  if (fence) {
+    TV.origText = TV.origText.slice(fence[0].length).replace(/\n?```[ \t]*\n?$/, "");
+    TV.lang = langOfFence(fence[1]) || TV.lang;
+  }
   $("viewer-sub").textContent = `${fmtSize(data.size)} · ${dec.enc}`;
   tvSetText(TV.origText);
+}
+
+// 围栏语言名 → 查看器内部高亮语言键（langOfExt 的表）；认不出返回 null，
+// 调用方保留按扩展名定的语言。
+function langOfFence(name) {
+  const n = (name || "").toLowerCase();
+  const map = {
+    python: "py", py: "py",
+    rust: "rust", rs: "rust",
+    javascript: "js", js: "js", typescript: "js", ts: "js",
+    c: "c", cpp: "c", "c++": "c", java: "c", cs: "c", php: "c", kt: "c",
+    go: "go", golang: "go",
+    json: "json",
+    html: "markup", xml: "markup", svg: "markup", vue: "markup",
+    css: "css", scss: "css",
+    sh: "shell", bash: "shell", shell: "shell", zsh: "shell",
+  };
+  return map[n] || null;
 }
 
 function tvSetText(text) {
@@ -3641,8 +4278,14 @@ function tvTokenizeLine(line, lang, st) {
       continue;
     }
     if (/[A-Za-z_$]/.test(ch) || ch.charCodeAt(0) > 127) {
+      // 词扫描必须认 Unicode 字母/数字：v2.6.0 及更早内层只认 ASCII \w，
+      // 中文标识符/裸中文行进来后 j 一步不进、i 原地死循环把界面冻死
+      // （2026-11-21 真机「所有代码文件打开都卡死」根因）。再加兜底：
+      // 本分支结束时游标未前进则强制吃掉一个字符，任何输入都不许
+      // 原地踏步。
       let j = i;
-      while (j < n && /[\w$]/.test(line[j])) j++;
+      while (j < n && /[\p{L}\p{N}_$]/u.test(line[j])) j++;
+      if (j === i) j = i + 1;
       const word = line.slice(i, j);
       if (kw && kw.has(word)) push(word, "tk-kw");
       else plain += word;

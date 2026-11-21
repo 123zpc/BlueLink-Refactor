@@ -48,6 +48,10 @@ pub enum Event {
     ConnectionChanged {
         connected: bool,
         peer_name: Option<String>,
+        /// ㉛ 落点规则的数据面：连上的对端设备 id 与其会话 id，前端据此
+        /// 在连接成功后打开「实际连上的那个对端」的会话。
+        peer_device_id: Option<String>,
+        conversation_id: Option<String>,
     },
     MessageNew(Message),
     /// 已有消息的内容发生变化（图片组接收端逐张追加清单时用）：
@@ -90,6 +94,9 @@ pub enum Event {
     ClipboardSynced {
         kind: String,
     },
+    /// 思考模式开关没生效（v2.6.1）：请求带了开关，但实际执行一侧的上游
+    /// 接口不支持 thinking 参数——前端在回答区给一次性小字提示，不许假装开了。
+    AiThinkingNote,
 }
 
 /// AI 来源：Auto = 本机优先、否则经对端转发；Local = 只用本机配置；Peer = 只用连接设备的 AI。
@@ -152,6 +159,15 @@ pub fn open_file(path: &Path) -> Result<(), ServiceError> {
     };
     cmd.spawn()?;
     Ok(())
+}
+
+/// 用系统默认浏览器打开网址（设置页「项目」地址点击用）。
+/// 只放行 http/https，防前端误传本地路径或协议被当成文件打开。
+pub fn open_url(url: &str) -> Result<(), ServiceError> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(ServiceError::Other("只允许打开 http/https 网址".into()));
+    }
+    open_file(std::path::Path::new(url))
 }
 
 /// 在系统文件管理器中定位文件（文件菜单「打开文件位置」）。
@@ -333,22 +349,48 @@ fn clip_image_digest(width: u32, height: u32, rgba: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// 一次剪贴板读取的结果：内容（可能为空）+ 是否因「被其他程序占用」读不到。
+/// 「剪贴板里没东西」与「被占用读不了」必须分开——前者是常态、后者是
+/// 故障信号（v2.6.1 前两者都静默成 None，出问题无据可查）。
+struct ClipRead {
+    content: Option<ClipContent>,
+    occupied: bool,
+}
+
 /// 读系统剪贴板：与粘贴规则同口径——先文字，纯图片才取图片；空剪贴板返回 None。
 /// 句柄由 Node 长驻持有（见 clip_handle 字段注释），不要在这里新建临时句柄。
-fn clip_read_with(cb: &mut arboard::Clipboard) -> Option<ClipContent> {
-    if let Ok(t) = cb.get_text() {
-        if !t.is_empty() {
-            return Some(ClipContent::Text(t));
+fn clip_read_with(cb: &mut arboard::Clipboard) -> ClipRead {
+    let mut occupied = false;
+    match cb.get_text() {
+        Ok(t) => {
+            if !t.is_empty() {
+                return ClipRead {
+                    content: Some(ClipContent::Text(t)),
+                    occupied: false,
+                };
+            }
         }
+        Err(arboard::Error::ClipboardOccupied) => occupied = true,
+        Err(_) => {}
     }
-    if let Ok(img) = cb.get_image() {
-        return Some(ClipContent::Image {
-            width: img.width as u32,
-            height: img.height as u32,
-            rgba: img.bytes.into_owned(),
-        });
+    match cb.get_image() {
+        Ok(img) => {
+            return ClipRead {
+                content: Some(ClipContent::Image {
+                    width: img.width as u32,
+                    height: img.height as u32,
+                    rgba: img.bytes.into_owned(),
+                }),
+                occupied: false,
+            };
+        }
+        Err(arboard::Error::ClipboardOccupied) => occupied = true,
+        Err(_) => {}
     }
-    None
+    ClipRead {
+        content: None,
+        occupied,
+    }
 }
 
 /// 写系统剪贴板（句柄由 Node 长驻持有，理由同上）。
@@ -372,10 +414,17 @@ fn clip_write_with(cb: &mut arboard::Clipboard, content: &ClipContent) -> Result
 /// 剪贴板同步的防回环状态：last_seen 是最近见过的本机剪贴板内容哈希
 /// （自己复制后发出的、或从对方写入的都算），suppress 是最近一次从对方
 /// 写入的内容哈希——监视到它时绝不回发，避免两台机器来回震荡。
+/// write_backoff_until / last_read_fail_log 是 v2.6.1 的退让与限频字段：
+/// 同步绝不许影响本机功能——写不进去立刻退让、不许重试风暴；读失败
+/// 要留痕但不许刷屏。
 #[derive(Default)]
 struct ClipGuard {
     last_seen: Option<String>,
     suppress: Option<String>,
+    /// 写剪贴板失败后的退让截止时刻：此前到达的远端内容直接丢弃不再尝试写。
+    write_backoff_until: Option<std::time::Instant>,
+    /// 上次记录「读剪贴板被占用」的时刻（限频：每分钟至多一条）。
+    last_read_fail_log: Option<std::time::Instant>,
 }
 
 /// 接收中的文件状态。
@@ -394,6 +443,75 @@ struct RecvState {
     /// 重算，校验强度不降。
     hasher: Option<Sha256>,
     hashed_upto: u64,
+    /// ⑳ 分段计时：首片到达时刻、已收片数、收片处理累计耗时（毫秒）。
+    first_chunk_at: Option<std::time::Instant>,
+    chunk_count: u64,
+    process_ms: f64,
+    /// ⑳ 续传进度落盘节流计数：距上次 save_transfer 的片数。
+    since_save: u32,
+    /// ⑳ .part 文件常驻句柄（首片时打开）：免逐片 open/close。
+    file: Option<std::fs::File>,
+}
+
+/// 对端代理应答通道的消息（v2.6.1 起）：增量与完成分开建模，
+/// 完成时除错误外还带「思考开关是否真被上游接受」，请求方据此如实提示。
+enum ProxyRecv {
+    Delta(String),
+    Done {
+        error: Option<String>,
+        thinking_applied: Option<bool>,
+    },
+}
+
+/// 一次 AI 调用的结果：正文 + 思考开关的生效情况
+/// （None = 没带开关或无从得知，如对端是旧版本；Some(false) = 带了但没生效）。
+pub struct AiOutcome {
+    pub text: String,
+    pub thinking_applied: Option<bool>,
+}
+
+/// AI 请求级选项的服务层别名（与 ai 层同构，直接透传）。
+pub type AiCallOptions = bluelink_ai::AiRequestOptions;
+
+/// ㉓ 历史上下文 token 预算（估算口径，见 estimate_tokens）：组装上下文
+/// 时从最新往旧装、装满为止，被丢弃的老内容改走摘要纪要。
+pub const AI_HISTORY_TOKEN_BUDGET: usize = 24_000;
+
+/// ㉓ 历史摘要的长度上限（字）。
+pub const AI_SUMMARY_MAX_CHARS: usize = 300;
+
+/// 粗估 token 数（启发式估算、非精确分词，只用于预算裁剪不作计费
+/// 依据）：非 ASCII 字符（中文等）约 1 字 1 token，ASCII 约 4 字符
+/// 1 token。
+pub fn estimate_tokens(text: &str) -> usize {
+    let mut tokens = 0usize;
+    let mut ascii_run = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_run += 1;
+        } else {
+            tokens += (ascii_run + 3) / 4 + 1;
+            ascii_run = 0;
+        }
+    }
+    tokens + (ascii_run + 3) / 4
+}
+
+/// ㉓ 预算裁剪（纯函数，组装与测试共用）：bodies 为正序历史正文，返回
+/// 保留段的起始下标——从最新往旧累加估算 token（每条 +4 结构开销），
+/// 装满预算为止；最新一条无条件保留（最新一轮不许截断）。
+pub fn ai_kept_from(bodies: &[&str]) -> usize {
+    let mut used = 0usize;
+    let mut kept = 0usize;
+    for body in bodies.iter().rev() {
+        let cost = estimate_tokens(body) + 4;
+        if kept > 0 && used + cost > AI_HISTORY_TOKEN_BUDGET {
+            break;
+        }
+        used += cost;
+        kept += 1;
+    }
+    bodies.len() - kept
 }
 
 /// 一个对端会话。
@@ -431,7 +549,14 @@ pub struct Node {
     accept_waiters: Mutex<HashMap<String, oneshot::Sender<Ranges>>>,
     verify_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     recv_files: Mutex<HashMap<String, RecvState>>,
-    proxy_waiters: Mutex<HashMap<String, tokio::sync::mpsc::Sender<Result<String, String>>>>,
+    proxy_waiters: Mutex<HashMap<String, tokio::sync::mpsc::Sender<ProxyRecv>>>,
+    /// 双边同连仲裁（v2.6.1，见 begin_outbound_attempt）：出站尝试登记的
+    /// （目标设备名， 代号）；握手期间同名设备入站时按设备 ID 字典序裁决。
+    outbound_mark: Mutex<Option<(String, u64)>>,
+    /// 被裁决让行的出站尝试代号（宿主侧握手写入、发起侧握手以
+    /// 100ms 轮询检查——握手最长 20 秒，轮询无丢唤醒竞态、代价可忽略）。
+    glare_yield_gen: Mutex<Option<u64>>,
+    outbound_gen: std::sync::atomic::AtomicU64,
     /// 被用户取消的发送中传输 ID（发送循环逐片检查）。
     cancelled: Mutex<HashSet<String>>,
     /// 对方剪贴板同步开关状态（连接建立后由对方通告，断开时复位）。
@@ -560,6 +685,9 @@ impl Node {
             verify_waiters: Mutex::new(HashMap::new()),
             recv_files: Mutex::new(HashMap::new()),
             proxy_waiters: Mutex::new(HashMap::new()),
+            outbound_mark: Mutex::new(None),
+            glare_yield_gen: Mutex::new(None),
+            outbound_gen: std::sync::atomic::AtomicU64::new(0),
             cancelled: Mutex::new(HashSet::new()),
             clip_peer_on: AtomicBool::new(false),
             clip_guard: Mutex::new(ClipGuard::default()),
@@ -649,6 +777,36 @@ impl Node {
         self.peer.lock().await.is_some()
     }
 
+    /// 登记一次出站连接尝试（双边同连仲裁用）：bt_connect 在传输连接前
+    /// 调用，返回本次尝试的代号；attach 结束时以 end_outbound_attempt 注销。
+    /// 只有经 bt_connect 的蓝牙连接登记——局域网通道不登记、不参与仲裁。
+    pub async fn begin_outbound_attempt(&self, target_name: &str) -> u64 {
+        let gen = self
+            .outbound_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        *self.outbound_mark.lock().await = Some((target_name.to_string(), gen));
+        gen
+    }
+
+    /// 注销出站尝试登记（代号对得上才清，防迟到的旧尝试清掉新尝试的登记）。
+    pub async fn end_outbound_attempt(&self, gen: u64) {
+        let mut mark = self.outbound_mark.lock().await;
+        if matches!(&*mark, Some((_, g)) if *g == gen) {
+            *mark = None;
+        }
+    }
+
+    /// 等待「本代号已被裁决让行」：100ms 轮询检查裁决槽（见 glare_yield_gen 注释）。
+    async fn wait_glare_yield(&self, gen: u64) {
+        loop {
+            if *self.glare_yield_gen.lock().await == Some(gen) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     /// 握手本体（attach 的限时区）：宿主侧等 Hello 并校验连接码，
     /// 发起侧发 Hello 等 Ack。块内的 return 即握手失败出口。
     async fn handshake(
@@ -671,6 +829,33 @@ impl Node {
                         "conn",
                         &format!("握手步骤5/6：收到 Hello（对方 {device_name}），校验连接码"),
                     );
+                    // 双边同连仲裁（v2.6.1）：本机正向同一台设备发起出站
+                    // 握手时，对方的出站也连了进来——两条链路只能活一条。
+                    // 规则双端一致、结果确定：设备 ID 字典序大的一方让行
+                    // （取消自己的出站、接受入站），小的一方保留出站、
+                    // 拒绝入站。匹配键是设备名（扫描名与 Hello 名同源）。
+                    {
+                        let mark = self.outbound_mark.lock().await.clone();
+                        if let Some((target_name, gen)) = mark {
+                            if target_name == device_name {
+                                if self.device_id > device_id {
+                                    *self.glare_yield_gen.lock().await = Some(gen);
+                                    log::log_line(
+                                        "conn",
+                                        "双边同连仲裁：对方同时也在连本机，本机设备 ID 较大，让行出站尝试、改走对方连入的链路",
+                                    );
+                                } else {
+                                    log::log_line(
+                                        "conn",
+                                        "双边同连仲裁：对方同时也在连本机，本机设备 ID 较小，保留出站尝试、拒绝这条入站连接",
+                                    );
+                                    return Err(ServiceError::Other(
+                                        "双边同连仲裁：已拒绝入站（本机出站优先）".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     if code != self.my_code() {
                         let _ = conn
                             .send(&Frame::Control(Control::HelloAck {
@@ -715,7 +900,29 @@ impl Node {
                 code: code_from_peer_or_target.to_string(),
             }))
             .await?;
-            match conn.recv().await? {
+            // 双边同连仲裁：登记过出站尝试时，让行裁决与等 Ack 赛跑——
+            // 对方（大 ID 方让行后）连入的链路才是要活的那条，本尝试立刻收尾。
+            let my_gen = self
+                .outbound_mark
+                .lock()
+                .await
+                .as_ref()
+                .map(|(_, g)| *g);
+            let first = match my_gen {
+                Some(gen) => tokio::select! {
+                    biased;
+                    _ = self.wait_glare_yield(gen) => {
+                        log::log_line(
+                            "conn",
+                            "双边同连仲裁：本机出站尝试让行，改走对方连入的链路",
+                        );
+                        return Err(ServiceError::Other("双边同连：已让行入站连接".into()));
+                    }
+                    r = conn.recv() => r?,
+                },
+                None => conn.recv().await?,
+            };
+            match first {
                 Frame::Control(Control::HelloAck {
                     device_id,
                     device_name,
@@ -807,6 +1014,8 @@ impl Node {
         self.emit(Event::ConnectionChanged {
             connected: true,
             peer_name: Some(session.peer.name.clone()),
+            peer_device_id: Some(session.peer.device_id.clone()),
+            conversation_id: Some(session.conversation_id.clone()),
         });
 
         // 接收循环 + 心跳（判死察觉，见 spawn_heartbeat）
@@ -841,6 +1050,8 @@ impl Node {
                 self.emit(Event::ConnectionChanged {
                     connected: false,
                     peer_name: None,
+                    peer_device_id: None,
+                    conversation_id: None,
                 });
                 self.emit_clipboard_state(false);
             }
@@ -874,6 +1085,8 @@ impl Node {
         self.emit(Event::ConnectionChanged {
             connected: false,
             peer_name: None,
+            peer_device_id: None,
+            conversation_id: None,
         });
         self.emit_clipboard_state(false);
         session.conn.close().await;
@@ -1080,21 +1293,41 @@ impl Node {
             Frame::Control(Control::AiProxyRequest {
                 request_id,
                 messages,
+                thinking,
+                temperature,
+                max_tokens,
+                top_p,
                 ..
             }) => {
                 let node = self.clone();
                 let session2 = session.clone();
+                let opts = AiCallOptions {
+                    thinking,
+                    temperature,
+                    max_tokens,
+                    top_p,
+                };
                 tokio::spawn(async move {
-                    let _ = node.serve_ai_proxy(session2, request_id, messages).await;
+                    let _ = node
+                        .serve_ai_proxy(session2, request_id, messages, &opts)
+                        .await;
                 });
             }
             Frame::Control(Control::AiProxyChunk { request_id, delta }) => {
                 self.handle_ai_proxy_frame(Control::AiProxyChunk { request_id, delta })
                     .await;
             }
-            Frame::Control(Control::AiProxyDone { request_id, error }) => {
-                self.handle_ai_proxy_frame(Control::AiProxyDone { request_id, error })
-                    .await;
+            Frame::Control(Control::AiProxyDone {
+                request_id,
+                error,
+                thinking_applied,
+            }) => {
+                self.handle_ai_proxy_frame(Control::AiProxyDone {
+                    request_id,
+                    error,
+                    thinking_applied,
+                })
+                .await;
             }
         }
         Ok(())
@@ -1322,6 +1555,44 @@ impl Node {
         guard.as_mut().map(f)
     }
 
+    /// 把图片文件复制进系统剪贴板（图片查看器「复制图片」，⑱）：
+    /// 按路径读文件、解码为 RGBA、经 arboard 原生通道写入——不走
+    /// WebView 的浏览器剪贴板 API（写图不可靠）。走与剪贴板同步同一把
+    /// 长驻句柄（with_clipboard），不另开实例抢占。同步阻塞调用，
+    /// 调用方须放在 spawn_blocking 里。返回图片尺寸供界面反馈。
+    /// 失败口径全是人话：文件不在了/解码失败/剪贴板被占用或不可用。
+    pub fn copy_image_blocking(&self, path: &std::path::Path) -> Result<(u32, u32), ServiceError> {
+        if !path.is_file() {
+            return Err(ServiceError::Other(
+                "图片文件已不存在，无法复制".into(),
+            ));
+        }
+        let img = image::open(path).map_err(|_| {
+            ServiceError::Other("这张图片解码失败，无法复制".into())
+        })?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        // 尺寸上限保护：超大图 RGBA 展开是 4 字节/像素，5000 万像素
+        // 已是 200MB 量级，再大直接拒绝并说明，不把应用拖垮。
+        if (w as u64) * (h as u64) > 50_000_000 {
+            return Err(ServiceError::Other(
+                "图片尺寸过大，无法复制到剪贴板".into(),
+            ));
+        }
+        let data = arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+        };
+        match self.with_clipboard(|cb| cb.set_image(data)) {
+            Some(Ok(())) => Ok((w, h)),
+            Some(Err(_)) => Err(ServiceError::Other(
+                "剪贴板正被其他程序占用，请稍后再试".into(),
+            )),
+            None => Err(ServiceError::Other("系统剪贴板不可用".into())),
+        }
+    }
+
     fn emit_clipboard_state(&self, connected: bool) {
         self.emit(Event::ClipboardState {
             local: self.clipboard_local_on(),
@@ -1350,11 +1621,19 @@ impl Node {
 
     /// 本机剪贴板监视任务（随会话启动、会话结束自动退出）：每 700ms 轮询一次。
     /// 隐私底线：本机开关关闭时连读都不读；对方未开启时读了也不发，同样不读。
+    ///
+    /// 基线规矩（v2.6.1，用户裁定「同步不得影响任何电脑本身的功能」）：
+    /// 每次（重新）进入「双方都开」状态时，先把本机当前剪贴板登记为基线
+    /// （只记哈希、绝不发送），之后只同步基线之后新复制的内容。旧行为在
+    /// 每次重连时把连接前就躺在剪贴板里的旧内容无条件推给对方、写进对方
+    /// 剪贴板，会顶掉对方刚复制的东西（真机实证：同一段文字随重连被重写
+    /// 5 次）——基线制从根上消除。
     fn spawn_clipboard_poll(self: &Arc<Self>, session: Arc<PeerSession>) {
         let node = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(700));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut primed = false;
             loop {
                 ticker.tick().await;
                 // 会话已断开或已被新会话替换：退出监视
@@ -1366,6 +1645,13 @@ impl Node {
                     break;
                 }
                 if !node.clipboard_local_on() || !node.clipboard_peer_on() {
+                    // 任一侧关掉后，下次再进入双开状态要重新立基线
+                    primed = false;
+                    continue;
+                }
+                if !primed {
+                    node.clipboard_prime().await;
+                    primed = true;
                     continue;
                 }
                 node.clipboard_poll_once(&session).await;
@@ -1373,16 +1659,54 @@ impl Node {
         });
     }
 
+    /// 立基线：读一次本机剪贴板，把内容哈希登记为已见（不发送、不写入）。
+    async fn clipboard_prime(self: &Arc<Self>) {
+        let node = self.clone();
+        let read = tokio::task::spawn_blocking(move || node.with_clipboard(clip_read_with))
+            .await
+            .ok()
+            .flatten();
+        if let Some(ClipRead {
+            content: Some(content),
+            ..
+        }) = read
+        {
+            let mut g = self.clip_guard.lock().await;
+            g.last_seen = Some(content.hash());
+        }
+        log::log_verbose(
+            "clipboard",
+            "剪贴板同步基线已建立：只同步此后新复制的内容，重连不重推旧内容",
+        );
+    }
+
     /// 一次监视：读本机剪贴板，内容变了且不是刚从对方写入的才发送。
     async fn clipboard_poll_once(self: &Arc<Self>, session: &Arc<PeerSession>) {
         // 剪贴板读取是同步系统调用，放阻塞线程执行，避免卡住异步运行时
         let node = self.clone();
-        let content =
-            tokio::task::spawn_blocking(move || node.with_clipboard(clip_read_with).flatten())
-                .await
-                .ok()
-                .flatten();
-        let Some(content) = content else { return };
+        let read = tokio::task::spawn_blocking(move || node.with_clipboard(clip_read_with))
+            .await
+            .ok()
+            .flatten();
+        let Some(read) = read else { return };
+        if read.occupied && read.content.is_none() {
+            // 被其他程序占用读不到：留痕但限频（每分钟至多一条），不重试硬抢
+            let mut g = self.clip_guard.lock().await;
+            let due = g
+                .last_read_fail_log
+                .map(|t| t.elapsed() >= std::time::Duration::from_secs(60))
+                .unwrap_or(true);
+            if due {
+                g.last_read_fail_log = Some(std::time::Instant::now());
+                drop(g);
+                log::log_line(
+                    "clipboard",
+                    "读取本机剪贴板失败：剪贴板被其他程序占用，本轮跳过（不重试）",
+                );
+            }
+            return;
+        }
+        let Some(content) = read.content else { return };
         let hash = content.hash();
         {
             let mut g = self.clip_guard.lock().await;
@@ -1549,6 +1873,29 @@ impl Node {
             ClipContent::Text(t) => format!("文字（{} 字节）", t.len()),
             ClipContent::Image { width, height, .. } => format!("图片（{width}x{height}）"),
         };
+        {
+            let g = self.clip_guard.lock().await;
+            // 本机剪贴板已经是这份内容：再写一遍纯属多余，还可能顶掉用户
+            // 此刻刚复制的新内容——跳过（同步绝不影响本机功能的第一道闸）
+            if g.last_seen.as_deref() == Some(hash.as_str()) {
+                log::log_verbose(
+                    "clipboard",
+                    "收到对方剪贴板内容，与本机当前内容相同，跳过写入",
+                );
+                return;
+            }
+            // 上次写入失败后的退让期内：直接丢弃，绝不重试硬抢系统剪贴板
+            if g.write_backoff_until
+                .map(|t| t > std::time::Instant::now())
+                .unwrap_or(false)
+            {
+                log::log_verbose(
+                    "clipboard",
+                    "剪贴板写入退让中，丢弃本条远端内容（不重试）",
+                );
+                return;
+            }
+        }
         let written = content.clone();
         let node = self.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -1569,12 +1916,27 @@ impl Node {
                 });
             }
             Ok(Err(e)) => {
-                log::log_line("clipboard", &format!("写入本机剪贴板失败：{e}"));
+                self.clip_write_failed(&e).await;
             }
             Err(e) => {
-                log::log_line("clipboard", &format!("写入本机剪贴板失败：{e}"));
+                self.clip_write_failed(&e.to_string()).await;
             }
         }
+    }
+
+    /// 写本机剪贴板失败的统一收尾：记日志 + 进入 30 秒退让期。
+    /// 失败多半是剪贴板被其他程序占用——同步是旁观者，退让不重试，
+    /// 绝不许因为同步把用户本机的复制粘贴搞坏（用户 2026-11-21 裁定）。
+    async fn clip_write_failed(&self, err: &str) {
+        {
+            let mut g = self.clip_guard.lock().await;
+            g.write_backoff_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        }
+        log::log_line(
+            "clipboard",
+            &format!("写入本机剪贴板失败：{err}（30 秒内不再尝试写入，不重试）"),
+        );
     }
 
     // ---------- 文件传输 ----------
@@ -1781,10 +2143,21 @@ impl Node {
                 transfer_id: transfer_id.clone(),
             }))
             .await?;
+        let verify_wait_t0 = std::time::Instant::now(); // ⑳ 发送端等校验计时
         let ok = tokio::time::timeout(std::time::Duration::from_secs(60), vrx)
             .await
             .map_err(|_| ServiceError::Other("等待校验结果超时".into()))?
             .map_err(|_| ServiceError::Other("校验通道已关闭".into()))?;
+        log_line(
+            "files",
+            &format!(
+                "essential: 发送计时 {}（{} 字节）：最后一片发出→收到校验确认 {:.0} ms（发片总耗时 {:.0} ms）",
+                name,
+                size,
+                verify_wait_t0.elapsed().as_secs_f64() * 1000.0,
+                send_started.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
         Ok(TransferRun::Done {
             ok,
             wire_bytes,
@@ -1948,6 +2321,11 @@ impl Node {
                 written: covered_bytes(&ranges),
                 hasher: if fresh { Some(Sha256::new()) } else { None },
                 hashed_upto: 0,
+                first_chunk_at: None,
+                chunk_count: 0,
+                process_ms: 0.0,
+                since_save: 0,
+                file: None,
             },
         );
         self.storage.save_file(&FileMeta {
@@ -2059,19 +2437,31 @@ impl Node {
         _session: &Arc<PeerSession>,
         chunk: FileChunk,
     ) -> Result<(), ServiceError> {
+        let t0 = std::time::Instant::now(); // ⑳ 收片处理计时
         let mut guard = self.recv_files.lock().await;
         let st = guard
             .get_mut(&chunk.transfer_id)
             .ok_or_else(|| ServiceError::Other("收到未知传输的分片".into()))?;
+        if st.first_chunk_at.is_none() {
+            st.first_chunk_at = Some(t0);
+        }
+        st.chunk_count += 1;
         let data = if chunk.compression == COMP_NONE {
             chunk.data
         } else {
             decompress(&chunk.data, chunk.compression)?
         };
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&st.part_path)?;
+        // ⑳ .part 句柄常驻（首片打开、整程复用）：逐片 open/close 在
+        // 快速链路上是纯浪费，还拖慢接收队列排空、让对方等校验更久。
+        if st.file.is_none() {
+            st.file = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&st.part_path)?,
+            );
+        }
+        let f = st.file.as_mut().unwrap();
         f.seek(SeekFrom::Start(chunk.offset))?;
         f.write_all(&data)?;
         st.ranges = merge_ranges(
@@ -2117,6 +2507,15 @@ impl Node {
                 st.hashed_upto = end;
             }
         }
+        st.process_ms += t0.elapsed().as_secs_f64() * 1000.0;
+        // ⑳ 续传进度落盘节流：逐片一次 INSERT（各带一次落盘同步）是
+        // 收片处理的大头，改成每 32 片落一次；崩溃时最多丢最近 32 片
+        // （8 MB）的续传进度、重连后补发，换取整程排空速度。
+        st.since_save += 1;
+        let save_due = st.since_save >= 32;
+        if save_due {
+            st.since_save = 0;
+        }
         let (tid, written, total, ranges, mid) = (
             chunk.transfer_id.clone(),
             st.written,
@@ -2125,8 +2524,10 @@ impl Node {
             st.msg_id.clone(),
         );
         drop(guard);
-        self.storage
-            .save_transfer(&tid, "", "in", "", total, &ranges, "receiving")?;
+        if save_due {
+            self.storage
+                .save_transfer(&tid, "", "in", "", total, &ranges, "receiving")?;
+        }
         self.emit(Event::TransferProgress {
             transfer_id: tid,
             msg_id: mid,
@@ -2141,6 +2542,7 @@ impl Node {
         session: &Arc<PeerSession>,
         transfer_id: String,
     ) -> Result<(), ServiceError> {
+        let done_t0 = std::time::Instant::now(); // ⑳ 「收完→发出确认」计时
         // 先给本方界面一个「校验中」状态，别让进度条在 100% 干挂着
         self.emit(Event::TransferState {
             transfer_id: transfer_id.clone(),
@@ -2155,6 +2557,7 @@ impl Node {
         // 增量哈希覆盖全文件时直接比对摘要，免去整文件重读（大文件
         // 这一步原来要数秒）；否则（续传/乱序补片/中途异常）回退现行
         // 整文件重算，校验强度不降。
+        let verify_t0 = std::time::Instant::now();
         let (actual, verify_how) = if st.hasher.is_some() && st.hashed_upto == st.total {
             let digest = format!("{:x}", st.hasher.take().unwrap().finalize());
             (digest, "增量哈希")
@@ -2168,25 +2571,21 @@ impl Node {
                 .map_err(|e| ServiceError::Other(format!("校验任务失败：{e}")))??;
             (digest, "整文件重算")
         };
+        let verify_ms = verify_t0.elapsed().as_secs_f64() * 1000.0;
         let ok = actual == st.sha256;
         if ok {
-            let _ = self
-                .storage
-                .update_message_status(&st.msg_id, MessageStatus::Delivered);
             let final_path = self.download_dir().join(&st.name);
             std::fs::rename(&st.part_path, &final_path)?;
-            // 回写落地路径，文件菜单（打开/另存为等）靠它定位文件
-            let _ = self
-                .storage
-                .update_file_path(&st.file_id, &final_path.to_string_lossy());
-            self.storage.save_transfer(
+            // ⑳ 三笔回写（消息状态/落地路径/传输收尾）合并成一个事务，
+            // 只剩一次提交落盘——文件菜单靠落地路径定位文件，别漏。
+            self.storage.finish_received_file(
+                &st.msg_id,
+                &st.file_id,
+                &final_path.to_string_lossy(),
                 &transfer_id,
-                "",
-                "in",
                 &session.peer.device_id,
                 st.total,
                 &st.ranges,
-                "done",
             )?;
             self.emit(Event::TransferState {
                 transfer_id: transfer_id.clone(),
@@ -2210,6 +2609,27 @@ impl Node {
             });
             log::log_line("files", &format!("接收校验失败，已删除半成品：{}", st.name));
         }
+        // ⑳ 分段计时落日志：收片跨度（首片→FileDone 被处理）、收片处理
+        // 累计、校验耗时、收完→确认总耗时。发送端另有一条等校验日志，
+        // 两边相减即帧在接收队列里排队被嚼的时间。
+        let span_ms = st
+            .first_chunk_at
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        log_line(
+            "files",
+            &format!(
+                "essential: 接收计时 {}（{} 字节，{} 片）：收片跨度 {:.0} ms，收片处理累计 {:.0} ms，校验（{}）{:.0} ms，收完→发出确认 {:.0} ms",
+                st.name,
+                st.total,
+                st.chunk_count,
+                span_ms,
+                st.process_ms,
+                verify_how,
+                verify_ms,
+                done_t0.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
         session
             .conn
             .send(&Frame::Control(Control::FileVerify { transfer_id, ok }))
@@ -2389,10 +2809,84 @@ impl Node {
         Ok(id)
     }
 
+    /// ㉕ 新建一条 AI 会话：id 以 ai- 开头（定位链路按前缀识别 AI 会话），
+    /// 标题默认「新会话」，用户可改名。ai-default「AI 助手」不受影响。
+    pub fn create_ai_conversation(
+        &self,
+        title: Option<String>,
+    ) -> Result<Conversation, ServiceError> {
+        let conv = Conversation {
+            id: format!("ai-{}", new_id()),
+            kind: ConversationKind::Ai,
+            peer_device_id: None,
+            title: title
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "新会话".into()),
+            draft: String::new(),
+            last_read_id: None,
+            created_at: now_ms(),
+        };
+        self.storage.create_conversation(&conv)?;
+        Ok(conv)
+    }
+
+    /// ㉕ AI 会话改名并持久化：只许改 Ai 类会话（设备会话名是对方设备名，
+    /// 不归用户改）。
+    pub fn rename_ai_conversation(
+        &self,
+        conv_id: &str,
+        title: &str,
+    ) -> Result<(), ServiceError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(ServiceError::Other("会话名不能为空".into()));
+        }
+        let conv = self
+            .storage
+            .list_conversations()?
+            .into_iter()
+            .find(|c| c.id == conv_id)
+            .ok_or_else(|| ServiceError::Other("会话不存在".into()))?;
+        if conv.kind != ConversationKind::Ai {
+            return Err(ServiceError::Other("只能给 AI 会话改名".into()));
+        }
+        self.storage.rename_conversation(conv_id, title)?;
+        Ok(())
+    }
+
+    /// ㉕ 解析 AI 页当前打开的会话：前端传了就校验必须是已存在的 Ai
+    /// 会话，没传（或问AI 等固定落点）用 ai-default「AI 助手」。
+    fn resolve_ai_conversation(
+        &self,
+        conv_id: Option<String>,
+    ) -> Result<String, ServiceError> {
+        match conv_id {
+            None => self.ensure_ai_conversation(),
+            Some(id) => {
+                let conv = self
+                    .storage
+                    .list_conversations()?
+                    .into_iter()
+                    .find(|c| c.id == id);
+                match conv {
+                    Some(c) if c.kind == ConversationKind::Ai => Ok(id),
+                    _ => Err(ServiceError::Other("AI 会话不存在".into())),
+                }
+            }
+        }
+    }
+
     /// 在 AI 会话里提问：走「默认 AI」来源（本机配置 / 连接设备的 AI / 自动）。
-    pub async fn ai_send(self: &Arc<Self>, text: &str) -> Result<Message, ServiceError> {
-        let conv_id = self.ensure_ai_conversation()?;
-        self.ai_push_and_answer(&conv_id, text).await
+    /// ㉕ 起跟随 AI 页当前打开的会话（conversation_id），不传则落 ai-default。
+    pub async fn ai_send(
+        self: &Arc<Self>,
+        text: &str,
+        thinking: Option<bool>,
+        conversation_id: Option<String>,
+    ) -> Result<Message, ServiceError> {
+        let conv_id = self.resolve_ai_conversation(conversation_id)?;
+        self.ai_push_and_answer(&conv_id, text, thinking).await
     }
 
     /// 聊天页「问AI」：把某条聊天消息作为上下文发给默认 AI，问答落在 AI 会话里
@@ -2401,6 +2895,8 @@ impl Node {
         self: &Arc<Self>,
         conv_id: &str,
         msg_id: &str,
+        thinking: Option<bool>,
+        extra: Option<String>,
     ) -> Result<Message, ServiceError> {
         let orig = self
             .storage
@@ -2414,8 +2910,27 @@ impl Node {
             .map(|c| c.title)
             .unwrap_or_else(|| "聊天".into());
         let ai_conv = self.ensure_ai_conversation()?;
-        let body = format!("【来自与「{title}」的聊天】\n{}", orig.body);
-        self.ai_push_and_answer(&ai_conv, &body).await
+        // ㉒：引用消息只作上下文；用户补了自己的问题时一并组装，
+        // 没补（extra 为空）则按引用原文问（旧行为兜底）。
+        let extra = extra.unwrap_or_default();
+        let extra = extra.trim();
+        let body = if extra.is_empty() {
+            format!("【来自与「{title}」的聊天】\n{}", orig.body)
+        } else {
+            format!(
+                "【来自与「{title}」的聊天】\n{}\n\n【我的问题】\n{}",
+                orig.body, extra
+            )
+        };
+        log_line(
+            "ai",
+            &format!(
+                "essential: 问AI 发起（引用消息 {}，带补充问题={}）",
+                msg_id,
+                !extra.is_empty()
+            ),
+        );
+        self.ai_push_and_answer(&ai_conv, &body, thinking).await
     }
 
     /// 聊天框 @AI 提问：问题与回答都落在当前聊天会话里（仅本机保存，不发给对方），
@@ -2425,6 +2940,7 @@ impl Node {
         conv_id: &str,
         source: AiSource,
         text: &str,
+        thinking: Option<bool>,
     ) -> Result<Message, ServiceError> {
         let mut q = Message {
             id: new_id(),
@@ -2451,13 +2967,20 @@ impl Node {
             role: "user".into(),
             content: text.to_string(),
         }];
-        let full = self.chat_core_src(&msgs, None, source).await?;
+        let opts = AiCallOptions {
+            thinking,
+            ..Default::default()
+        };
+        let outcome = self.chat_core_src(&msgs, None, source, &opts).await?;
+        if outcome.thinking_applied == Some(false) {
+            self.emit(Event::AiThinkingNote);
+        }
         let mut a = Message {
             id: new_id(),
             conversation_id: conv_id.to_string(),
             sender: Sender::Ai,
             kind: MessageKind::Text,
-            body: full,
+            body: outcome.text,
             file_id: None,
             reply_to: Some(qid),
             status: MessageStatus::Received,
@@ -2469,11 +2992,208 @@ impl Node {
         Ok(a)
     }
 
+    /// 聊天里 @AI 回答的重新生成（v2.6.1 补齐 ⑭）：按回答消息定位它
+    /// 引用的问题，删掉旧回答、用默认来源重新提问，新回答挂回原问题。
+    /// 动作记 essential 日志——「点了没反应」必须能凭日志分辨是没发出还是在等。
+    pub async fn chat_regenerate_ai(
+        self: &Arc<Self>,
+        answer_msg_id: &str,
+        thinking: Option<bool>,
+    ) -> Result<Message, ServiceError> {
+        let answer = self
+            .storage
+            .get_message(answer_msg_id)?
+            .ok_or_else(|| ServiceError::Other("要重新生成的回答不存在".into()))?;
+        if answer.sender != Sender::Ai {
+            return Err(ServiceError::Other("只能重新生成 AI 的回答".into()));
+        }
+        let qid = answer
+            .reply_to
+            .clone()
+            .ok_or_else(|| ServiceError::Other("这条回答没有对应的问题，无法重新生成".into()))?;
+        let question = self
+            .storage
+            .get_message(&qid)?
+            .ok_or_else(|| ServiceError::Other("原问题已不存在，无法重新生成".into()))?;
+        log::log_line(
+            "ai",
+            &format!(
+                "重新生成（聊天 @AI 回答）：已发出新请求（会话 {}）",
+                answer.conversation_id
+            ),
+        );
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: question.body.clone(),
+        }];
+        let opts = AiCallOptions {
+            thinking,
+            ..Default::default()
+        };
+        let source = self.default_ai_source();
+        // 先生成、新答到手再删旧答：生成失败时原回答不丢
+        let outcome = self.chat_core_src(&msgs, None, source, &opts).await?;
+        self.storage.delete_message(answer_msg_id)?;
+        if outcome.thinking_applied == Some(false) {
+            self.emit(Event::AiThinkingNote);
+        }
+        let mut a = Message {
+            id: new_id(),
+            conversation_id: answer.conversation_id.clone(),
+            sender: Sender::Ai,
+            kind: MessageKind::Text,
+            body: outcome.text,
+            file_id: None,
+            reply_to: Some(qid),
+            status: MessageStatus::Received,
+            created_at: now_ms(),
+            seq: 0,
+        };
+        a.seq = self.storage.insert_message(&a)?;
+        self.emit(Event::MessageNew(a.clone()));
+        Ok(a)
+    }
+
+    /// ㉓ 上下文组装（发送端一处，本机与对端转发两条路共用）：按 token
+    /// 预算从最新往旧装历史、装满为止；最新一条无条件完整保留（最新
+    /// 一轮不许截断）。被预算丢弃的老内容先摘要成一段纪要（见
+    /// ai_summary_for），纪要作为 system 注记放最前面。
+    async fn assemble_ai_context(
+        self: &Arc<Self>,
+        conv_id: &str,
+    ) -> Result<Vec<ChatMessage>, ServiceError> {
+        let all = self.storage.list_messages(conv_id, None, 100_000)?;
+        let bodies: Vec<&str> = all.iter().map(|m| m.body.as_str()).collect();
+        let kept_from = ai_kept_from(&bodies);
+        let dropped = &all[..kept_from];
+        let kept = &all[kept_from..];
+        let kept_tokens: usize = kept.iter().map(|m| estimate_tokens(&m.body) + 4).sum();
+        log_line(
+            "ai",
+            &format!(
+                "essential: 上下文组装（会话 {conv_id}）：共 {} 条，保留 {} 条（估算 {kept_tokens} token），丢弃 {} 条走摘要",
+                all.len(),
+                kept.len(),
+                dropped.len()
+            ),
+        );
+        let mut out: Vec<ChatMessage> = Vec::new();
+        if !dropped.is_empty() {
+            if let Some(summary) = self.ai_summary_for(conv_id, dropped).await {
+                out.push(ChatMessage {
+                    role: "system".into(),
+                    content: format!("此前对话摘要：{summary}"),
+                });
+            }
+        }
+        for m in kept.iter() {
+            out.push(ChatMessage {
+                role: if m.sender == Sender::Ai {
+                    "assistant".into()
+                } else {
+                    "user".into()
+                },
+                content: m.body.clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// ㉓ 被预算丢弃的老内容摘要：纪要按会话存 settings（覆盖水位
+    /// ai_summary_upto_<会话> + 正文 ai_summary_text_<会话>）。已有纪要
+    /// 只覆盖到水位时，把旧纪要与新丢弃段合并重摘一次；没有新丢弃段
+    /// 直接用旧纪要。任何失败都退化（用旧纪要或纯截断），不阻塞发送。
+    async fn ai_summary_for(
+        self: &Arc<Self>,
+        conv_id: &str,
+        dropped: &[Message],
+    ) -> Option<String> {
+        let upto_key = format!("ai_summary_upto_{conv_id}");
+        let text_key = format!("ai_summary_text_{conv_id}");
+        let old_upto: i64 = self
+            .storage
+            .get_setting(&upto_key)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let old_text = self
+            .storage
+            .get_setting(&text_key)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let max_seq = dropped.iter().map(|m| m.seq).max().unwrap_or(0);
+        if max_seq <= old_upto {
+            return if old_text.is_empty() {
+                None
+            } else {
+                Some(old_text)
+            };
+        }
+        let mut src = String::new();
+        if !old_text.is_empty() {
+            src.push_str(&format!("【已有摘要】{old_text}\n"));
+        }
+        for m in dropped.iter().filter(|m| m.seq > old_upto) {
+            let who = if m.sender == Sender::Ai { "AI" } else { "用户" };
+            src.push_str(&format!("{who}：{}\n", m.body));
+        }
+        let prompt = format!(
+            "请把下面这段对话压缩成一段不超过 {} 字的中文纪要，只保留后续对话需要知道的事实、话题与结论，不要寒暄、不要分点罗列，写成连贯的一段话：\n\n{src}",
+            AI_SUMMARY_MAX_CHARS
+        );
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: prompt,
+        }];
+        let opts = AiCallOptions::default();
+        let source = self.default_ai_source();
+        // on_delta=None：摘要调用不往界面推流式增量，安静地一次拿全
+        match self.chat_core_src(&msgs, None, source, &opts).await {
+            Ok(outcome) => {
+                let mut text = outcome.text.trim().to_string();
+                if text.chars().count() > AI_SUMMARY_MAX_CHARS {
+                    text = text.chars().take(AI_SUMMARY_MAX_CHARS).collect();
+                }
+                if text.is_empty() {
+                    return if old_text.is_empty() {
+                        None
+                    } else {
+                        Some(old_text)
+                    };
+                }
+                let _ = self.storage.set_setting(&upto_key, &max_seq.to_string());
+                let _ = self.storage.set_setting(&text_key, &text);
+                log_line(
+                    "ai",
+                    &format!(
+                        "essential: 历史摘要已更新（会话 {conv_id}，覆盖至 seq {max_seq}，{} 字）",
+                        text.chars().count()
+                    ),
+                );
+                Some(text)
+            }
+            Err(e) => {
+                log_line(
+                    "ai",
+                    &format!("essential: 历史摘要生成失败，退化为纯截断：{e}"),
+                );
+                if old_text.is_empty() {
+                    None
+                } else {
+                    Some(old_text)
+                }
+            }
+        }
+    }
+
     /// 把一条用户消息写入 AI 会话并生成回复（AI 页提问与「问AI」共用）。
     async fn ai_push_and_answer(
         self: &Arc<Self>,
         conv_id: &str,
         text: &str,
+        thinking: Option<bool>,
     ) -> Result<Message, ServiceError> {
         let conv_id = conv_id.to_string();
         let mut user_msg = Message {
@@ -2491,21 +3211,14 @@ impl Node {
         user_msg.seq = self.storage.insert_message(&user_msg)?;
         self.emit(Event::MessageNew(user_msg));
 
-        // 组装上下文（最近 20 条）
-        let history = self.storage.list_messages(&conv_id, None, 20)?;
-        let msgs: Vec<ChatMessage> = history
-            .iter()
-            .map(|m| ChatMessage {
-                role: if m.sender == Sender::Ai {
-                    "assistant".into()
-                } else {
-                    "user".into()
-                },
-                content: m.body.clone(),
-            })
-            .collect();
+        // ㉓ 组装上下文：token 预算（24K）+ 老内容摘要，不再固定最近 20 条
+        let msgs = self.assemble_ai_context(&conv_id).await?;
 
-        let full = self.chat_anywhere(&conv_id, &msgs).await?;
+        let opts = AiCallOptions {
+            thinking,
+            ..Default::default()
+        };
+        let full = self.chat_anywhere(&conv_id, &msgs, &opts).await?;
 
         let mut ai_msg = Message {
             id: new_id(),
@@ -2528,8 +3241,16 @@ impl Node {
     }
 
     /// 重新生成最后一条 AI 回复：删掉旧回复，用同一上下文再生成一条。
-    pub async fn ai_regenerate(self: &Arc<Self>) -> Result<Message, ServiceError> {
-        let conv_id = self.ensure_ai_conversation()?;
+    /// 动作记 essential 日志（⑭）：用户点了之后是真发出了请求还是卡在半路，
+    /// 凭日志可查，不靠猜。
+    pub async fn ai_regenerate(
+        self: &Arc<Self>,
+        thinking: Option<bool>,
+        conversation_id: Option<String>,
+    ) -> Result<Message, ServiceError> {
+        log::log_line("ai", "重新生成（AI 页）：已发出新请求");
+        // ㉕ 跟随 AI 页当前打开的会话重新生成，不传则落 ai-default
+        let conv_id = self.resolve_ai_conversation(conversation_id)?;
         let history = self.storage.list_messages(&conv_id, None, 50)?;
         // 找到并删除最后一条 AI 回复
         if let Some(last_ai) = history.iter().rev().find(|m| m.sender == Sender::Ai) {
@@ -2539,18 +3260,13 @@ impl Node {
         if !history.iter().any(|m| m.sender == Sender::Me) {
             return Err(ServiceError::Other("还没有提问过，无法重新生成".into()));
         }
-        let msgs: Vec<ChatMessage> = history
-            .iter()
-            .map(|m| ChatMessage {
-                role: if m.sender == Sender::Ai {
-                    "assistant".into()
-                } else {
-                    "user".into()
-                },
-                content: m.body.clone(),
-            })
-            .collect();
-        let full = self.chat_anywhere(&conv_id, &msgs).await?;
+        // ㉓ 重新生成同口径：token 预算组装 + 老内容摘要
+        let msgs = self.assemble_ai_context(&conv_id).await?;
+        let opts = AiCallOptions {
+            thinking,
+            ..Default::default()
+        };
+        let full = self.chat_anywhere(&conv_id, &msgs, &opts).await?;
         let mut ai_msg = Message {
             id: new_id(),
             conversation_id: conv_id.clone(),
@@ -2589,41 +3305,62 @@ impl Node {
         }
     }
 
-    async fn chat_core(
-        &self,
-        msgs: &[ChatMessage],
-        on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
-    ) -> Result<String, ServiceError> {
-        self.chat_core_src(msgs, on_delta, AiSource::Auto).await
-    }
-
     /// 按指定来源提问：Local 只走本机配置、Peer 只走对端转发、Auto 本机优先否则转发。
+    /// opts 是请求级选项（思考开关/网关透传参数），随请求走、端到端不落配置。
+    /// 路由决定与失败都记 essential 日志（v2.6.1 补可见性：此前 AI 请求在
+    /// 普通模式日志里零记录，TRAE 422 一类问题无据可查）。日志只记模型名
+    /// 与错误原文（错误文案本身不含密钥），绝不记密钥与提示词全文。
     async fn chat_core_src(
         &self,
         msgs: &[ChatMessage],
         on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
         source: AiSource,
-    ) -> Result<String, ServiceError> {
+        opts: &AiCallOptions,
+    ) -> Result<AiOutcome, ServiceError> {
         let cfg = self.ai_cfg.lock().await.clone();
         if source != AiSource::Peer {
             if let Some(cfg) = cfg.filter(|c| c.is_ready()) {
+                log::log_line(
+                    "ai",
+                    &format!(
+                        "AI 请求路由：本机接口（模型 {}，{} 条消息）",
+                        cfg.model,
+                        msgs.len()
+                    ),
+                );
                 let client = AiClient::new(cfg.clone());
+                let applied_of = |applied: bool| {
+                    opts.thinking.map(|_| applied)
+                };
                 if cfg.stream {
                     let mut cb = on_delta;
-                    let full = client
-                        .chat_stream(msgs, |d| {
+                    let (full, applied) = client
+                        .chat_stream_opts(msgs, opts, |d| {
                             if let Some(f) = cb.as_deref_mut() {
                                 f(d);
                             }
                         })
-                        .await?;
-                    return Ok(full);
+                        .await
+                        .map_err(|e| {
+                            log::log_line("ai", &format!("AI 请求失败（本机接口）：{e}"));
+                            e
+                        })?;
+                    return Ok(AiOutcome {
+                        text: full,
+                        thinking_applied: applied_of(applied),
+                    });
                 }
-                let full = client.chat_once(msgs).await?;
+                let (full, applied) = client.chat_once_opts(msgs, opts).await.map_err(|e| {
+                    log::log_line("ai", &format!("AI 请求失败（本机接口）：{e}"));
+                    e
+                })?;
                 if let Some(f) = on_delta {
                     f(&full);
                 }
-                return Ok(full);
+                return Ok(AiOutcome {
+                    text: full,
+                    thinking_applied: applied_of(applied),
+                });
             }
             if source == AiSource::Local {
                 return Err(bluelink_ai::AiError::NotConfigured.into());
@@ -2631,7 +3368,14 @@ impl Node {
         }
         if source != AiSource::Local {
             if self.is_connected().await {
-                return self.proxy_to_peer(msgs, on_delta).await;
+                log::log_line(
+                    "ai",
+                    &format!("AI 请求路由：经对方设备转发（{} 条消息）", msgs.len()),
+                );
+                return self.proxy_to_peer(msgs, on_delta, opts).await.map_err(|e| {
+                    log::log_line("ai", &format!("AI 请求失败（对端转发）：{e}"));
+                    e
+                });
             }
             if source == AiSource::Peer {
                 return Err(ServiceError::NotConnected);
@@ -2641,10 +3385,12 @@ impl Node {
     }
 
     /// AI 页的一轮调用：增量同步转成 AiChunk 事件推给前端。
+    /// 思考开关带了却没生效时经 AiThinkingNote 事件让前端如实提示。
     async fn chat_anywhere(
         self: &Arc<Self>,
         conv_id: &str,
         msgs: &[ChatMessage],
+        opts: &AiCallOptions,
     ) -> Result<String, ServiceError> {
         let node = self.clone();
         let cid = conv_id.to_string();
@@ -2656,18 +3402,35 @@ impl Node {
         };
         // AI 页提问遵循「默认 AI」设置（本机 / 对方设备 / 自动）
         let source = self.default_ai_source();
-        self.chat_core_src(msgs, Some(&mut cb), source).await
+        let outcome = self.chat_core_src(msgs, Some(&mut cb), source, opts).await?;
+        if outcome.thinking_applied == Some(false) {
+            self.emit(Event::AiThinkingNote);
+        }
+        Ok(outcome.text)
     }
 
     /// 本地 API 网关入口：供本机其他软件经 OpenAI 兼容接口调用（见应用层本地 API 服务）。
     /// 路由与 AI 页一致：本机配置优先，否则经已连接设备转发；请求里带的模型名仅作参考，
     /// 实际模型以真正调用上游一侧的配置为准（/v1/models 如实返回该模型名）。
+    /// opts 透传调用方软件给的 temperature/max_tokens/top_p（见 local_api 解析）。
     pub async fn gateway_chat(
         &self,
         msgs: &[ChatMessage],
+        opts: &AiCallOptions,
         on_delta: &mut (dyn FnMut(&str) + Send),
     ) -> Result<String, ServiceError> {
-        self.chat_core(msgs, Some(on_delta)).await
+        log::log_line(
+            "api",
+            &format!("本地 API 网关请求：{} 条消息", msgs.len()),
+        );
+        let outcome = self
+            .chat_core_src(msgs, Some(on_delta), AiSource::Auto, opts)
+            .await
+            .map_err(|e| {
+                log::log_line("api", &format!("本地 API 网关请求失败：{e}"));
+                e
+            })?;
+        Ok(outcome.text)
     }
 
     /// 本机当前生效的 AI 模型名（本地接口 /v1/models 用）：本机配置优先，
@@ -2681,14 +3444,16 @@ impl Node {
     }
 
     /// 经对端代理提问：响应帧由 handle_ai_proxy_frame 转入等待通道，增量同步回调。
+    /// opts（思考开关/网关参数）随 AiProxyRequest 一起带给对端、对端原样用。
     async fn proxy_to_peer(
         &self,
         msgs: &[ChatMessage],
         mut on_delta: Option<&mut (dyn FnMut(&str) + Send)>,
-    ) -> Result<String, ServiceError> {
+        opts: &AiCallOptions,
+    ) -> Result<AiOutcome, ServiceError> {
         let session = self.session().await?;
         let request_id = new_id();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<String, String>>(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProxyRecv>(64);
         self.proxy_waiters
             .lock()
             .await
@@ -2703,23 +3468,32 @@ impl Node {
                 request_id: request_id.clone(),
                 messages: payload,
                 model: None,
+                thinking: opts.thinking,
+                temperature: opts.temperature,
+                max_tokens: opts.max_tokens,
+                top_p: opts.top_p,
             }))
             .await?;
         let mut full = String::new();
+        let mut thinking_applied: Option<bool> = None;
         while let Some(item) = rx.recv().await {
             match item {
-                Ok(delta) => {
-                    if delta.is_empty() {
-                        break;
-                    } // 空增量 = 结束信号
+                ProxyRecv::Delta(delta) => {
                     if let Some(f) = on_delta.as_deref_mut() {
                         f(&delta);
                     }
                     full.push_str(&delta);
                 }
-                Err(e) => {
-                    self.proxy_waiters.lock().await.remove(&request_id);
-                    return Err(ServiceError::Other(e));
+                ProxyRecv::Done {
+                    error,
+                    thinking_applied: applied,
+                } => {
+                    thinking_applied = applied;
+                    if let Some(e) = error {
+                        self.proxy_waiters.lock().await.remove(&request_id);
+                        return Err(ServiceError::Other(e));
+                    }
+                    break;
                 }
             }
         }
@@ -2727,23 +3501,35 @@ impl Node {
         if full.is_empty() {
             return Err(ServiceError::Other("对方未能提供 AI 代理".into()));
         }
-        Ok(full)
+        Ok(AiOutcome {
+            text: full,
+            thinking_applied,
+        })
     }
 
     async fn handle_ai_proxy_frame(&self, c: Control) {
         match c {
             Control::AiProxyChunk { request_id, delta } => {
-                // 空分片不入等待通道：空 Ok 是 Done 的结束哨兵，混入会误判结束。
+                // 空分片不入等待通道（转发端已滤空片，这里再防一手混版对端）。
                 if delta.is_empty() {
                     return;
                 }
                 if let Some(tx) = self.proxy_waiters.lock().await.get(&request_id) {
-                    let _ = tx.send(Ok(delta)).await;
+                    let _ = tx.send(ProxyRecv::Delta(delta)).await;
                 }
             }
-            Control::AiProxyDone { request_id, error } => {
+            Control::AiProxyDone {
+                request_id,
+                error,
+                thinking_applied,
+            } => {
                 if let Some(tx) = self.proxy_waiters.lock().await.get(&request_id) {
-                    let _ = tx.send(error.map(Err).unwrap_or(Ok(String::new()))).await;
+                    let _ = tx
+                        .send(ProxyRecv::Done {
+                            error,
+                            thinking_applied,
+                        })
+                        .await;
                 }
             }
             _ => {}
@@ -2780,18 +3566,31 @@ impl Node {
     /// 宿主侧：替无网对端调用本机 AI 并流式回传。
     /// 前置门槛：本机用户须在设置里开启「AI 转发」许可（默认关）——花的是本机密钥额度；
     /// 未开启时明确回绝，让对方界面能如实提示。
+    /// opts 是请求方随帧带来的请求级选项（思考开关/网关参数），原样用于组装
+    /// 上游请求；全程记 essential 日志（v2.6.1 补可见性：到达/路由/上游结果，
+    /// 只记条数与状态，绝不记密钥与内容全文）。
     async fn serve_ai_proxy(
         &self,
         session: Arc<PeerSession>,
         request_id: String,
         messages: Vec<serde_json::Value>,
+        opts: &AiCallOptions,
     ) -> Result<(), ServiceError> {
+        log::log_line(
+            "ai",
+            &format!(
+                "收到 AI 转发请求：{} 条消息（对方 {}）",
+                messages.len(),
+                session.peer.name
+            ),
+        );
         let allowed = self
             .storage
             .get_setting("ai_proxy_allow")
             .map(|v| v.as_deref() == Some("1"))
             .unwrap_or(false);
         if !allowed {
+            log::log_line("ai", "AI 转发请求被拒：本机未开启 AI 转发许可");
             session
                 .conn
                 .send(&Frame::Control(Control::AiProxyDone {
@@ -2799,17 +3598,20 @@ impl Node {
                     error: Some(
                         "对方未开启 AI 转发许可：请让对方在设置的「AI 转发」里打开允许开关".into(),
                     ),
+                    thinking_applied: None,
                 }))
                 .await?;
             return Ok(());
         }
         let cfg = self.ai_cfg.lock().await.clone();
         let Some(cfg) = cfg.filter(|c| c.is_ready()) else {
+            log::log_line("ai", "AI 转发请求被拒：本机未配置 AI");
             session
                 .conn
                 .send(&Frame::Control(Control::AiProxyDone {
                     request_id,
                     error: Some("对方未配置 AI".into()),
+                    thinking_applied: None,
                 }))
                 .await?;
             return Ok(());
@@ -2830,7 +3632,7 @@ impl Node {
             })
             .collect();
         let prompt_chars: u64 = msgs.iter().map(|m| m.content.chars().count() as u64).sum();
-        let client = AiClient::new(cfg);
+        let client = AiClient::new(cfg.clone());
         // 增量先入通道、由转发任务顺序发出，保证分片先于 Done 到达（不能逐段 spawn，会乱序）
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
         let conn_fwd = session.conn.clone();
@@ -2851,22 +3653,39 @@ impl Node {
             }
         });
         let result = client
-            .chat_stream(&msgs, |delta| {
+            .chat_stream_opts(&msgs, opts, |delta| {
                 let _ = tx.try_send(delta.to_string());
             })
             .await;
         drop(tx);
         let _ = forwarder.await;
-        let error = match &result {
-            Ok(full) => {
+        let (error, thinking_applied) = match &result {
+            Ok((full, applied)) => {
                 self.add_proxy_stats(prompt_chars + full.chars().count() as u64);
-                None
+                log::log_line(
+                    "ai",
+                    &format!(
+                        "AI 转发完成：上游模型 {}，回答 {} 字",
+                        cfg.model,
+                        full.chars().count()
+                    ),
+                );
+                (None, opts.thinking.map(|_| *applied))
             }
-            Err(e) => Some(e.to_string()),
+            Err(e) => {
+                // 上游错误原文截断后记日志（文案含状态码、不含密钥）
+                let brief: String = e.to_string().chars().take(120).collect();
+                log::log_line("ai", &format!("AI 转发失败：上游返回 {brief}"));
+                (Some(e.to_string()), None)
+            }
         };
         session
             .conn
-            .send(&Frame::Control(Control::AiProxyDone { request_id, error }))
+            .send(&Frame::Control(Control::AiProxyDone {
+                request_id,
+                error,
+                thinking_applied,
+            }))
             .await?;
         Ok(())
     }

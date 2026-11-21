@@ -13,6 +13,9 @@ sha2 = { workspace = true }
 zstd = { workspace = true }
 # 系统剪贴板读写（文字 + RGBA 图片）：三平台都有原生后端，纯系统 API、无需运行时服务
 arboard = "3"
+# 图片解码（查看器「复制图片」把文件解码为 RGBA 写剪贴板用，⑱）：
+# 只开锁文件里已有的纯 Rust 解码器（png/jpeg/bmp），不新增传递依赖
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
 bluelink-domain = { path = "../domain" }
 bluelink-protocol = { path = "../protocol" }
 bluelink-storage = { path = "../storage" }

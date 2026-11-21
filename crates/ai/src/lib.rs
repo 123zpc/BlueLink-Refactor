@@ -68,6 +68,29 @@ impl Default for AiConfig {
     }
 }
 
+/// 单次请求级选项（v2.6.1）：覆盖配置级参数，随请求走——本机直连时
+/// 直接进请求体，经对端转发时随 AiProxy 请求带到对端、对端组装请求体时用。
+/// 全部 None = 完全按配置走（旧行为）。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AiRequestOptions {
+    /// 思考模式开关：Some(true)=开、Some(false)=关、None=不指定。
+    /// 仅 DeepSeek 兼容接口认这个参数（见 thinking_supported），其余接口忽略。
+    pub thinking: Option<bool>,
+    /// 温度：Some 时覆盖配置里的温度。
+    pub temperature: Option<f32>,
+    /// 最大回复长度：Some 时覆盖配置里的设置。
+    pub max_tokens: Option<u32>,
+    /// top_p：配置里没有此项，只有请求级才有（本地 API 网关透传用）。
+    pub top_p: Option<f32>,
+}
+
+/// 上游是否支持思考模式开关：目前只有 DeepSeek 兼容接口认 thinking 参数
+/// （{"type":"enabled"/"disabled"}）。按接口地址判断——地址里带 deepseek
+/// 字样才算，宁可漏报不可假装支持（开关没生效必须如实提示用户）。
+pub fn thinking_supported(base_url: &str) -> bool {
+    base_url.to_ascii_lowercase().contains("deepseek")
+}
+
 impl AiConfig {
     pub fn is_ready(&self) -> bool {
         !self.base_url.trim().is_empty()
@@ -76,7 +99,21 @@ impl AiConfig {
     }
 
     /// 组装请求体：带上已设置的温度/最大长度；系统提示词自动置顶（调用方已带 system 时不重复加）。
+    /// 无选项版仅供单测与旧调用点，新代码走 build_body_opts。
+    #[allow(dead_code)]
     fn build_body(&self, messages: &[ChatMessage], stream: bool) -> serde_json::Value {
+        self.build_body_opts(messages, stream, &AiRequestOptions::default())
+            .0
+    }
+
+    /// 带请求级选项组装请求体。thinking 是否真被带上由返回值告知调用方
+    /// （不支持的上游不带、且要如实提示，不许假装开了）。
+    fn build_body_opts(
+        &self,
+        messages: &[ChatMessage],
+        stream: bool,
+        opts: &AiRequestOptions,
+    ) -> (serde_json::Value, bool) {
         let mut msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len() + 1);
         let prompt = self.system_prompt.trim();
         if !prompt.is_empty() && messages.first().map(|m| m.role.as_str()) != Some("system") {
@@ -92,13 +129,28 @@ impl AiConfig {
             "messages": msgs,
             "stream": stream,
         });
-        if let Some(t) = self.temperature {
+        // 请求级参数优先于配置级（网关/界面的单次指定不改用户保存的配置）
+        if let Some(t) = opts.temperature.or(self.temperature) {
             body["temperature"] = t.into();
         }
-        if let Some(m) = self.max_tokens {
+        if let Some(m) = opts.max_tokens.or(self.max_tokens) {
             body["max_tokens"] = m.into();
         }
-        body
+        if let Some(p) = opts.top_p {
+            body["top_p"] = p.into();
+        }
+        // 思考模式：仅 DeepSeek 兼容接口带 thinking 参数，其余接口不带并
+        // 经第二个返回值如实告知未生效。
+        let mut thinking_applied = false;
+        if let Some(on) = opts.thinking {
+            if thinking_supported(&self.base_url) {
+                body["thinking"] = serde_json::json!({
+                    "type": if on { "enabled" } else { "disabled" }
+                });
+                thinking_applied = true;
+            }
+        }
+        (body, thinking_applied)
     }
 }
 
@@ -148,10 +200,23 @@ impl AiClient {
     pub async fn chat_stream<F: FnMut(&str)>(
         &self,
         messages: &[ChatMessage],
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<String, AiError> {
+        Ok(self
+            .chat_stream_opts(messages, &AiRequestOptions::default(), on_delta)
+            .await?
+            .0)
+    }
+
+    /// 带请求级选项的流式对话：返回（完整文本，思考开关是否真被上游接受）。
+    pub async fn chat_stream_opts<F: FnMut(&str)>(
+        &self,
+        messages: &[ChatMessage],
+        opts: &AiRequestOptions,
+        mut on_delta: F,
+    ) -> Result<(String, bool), AiError> {
         self.check_ready()?;
-        let body = self.cfg.build_body(messages, true);
+        let (body, thinking_applied) = self.cfg.build_body_opts(messages, true, opts);
         let resp = self
             .http
             .post(self.endpoint())
@@ -185,13 +250,25 @@ impl AiClient {
         if full.is_empty() {
             return Err(AiError::BadResponse);
         }
-        Ok(full)
+        Ok((full, thinking_applied))
     }
 
     /// 非流式对话（代理模式与连通性测试用）。
     pub async fn chat_once(&self, messages: &[ChatMessage]) -> Result<String, AiError> {
+        Ok(self
+            .chat_once_opts(messages, &AiRequestOptions::default())
+            .await?
+            .0)
+    }
+
+    /// 带请求级选项的非流式对话：返回（完整文本，思考开关是否真被上游接受）。
+    pub async fn chat_once_opts(
+        &self,
+        messages: &[ChatMessage],
+        opts: &AiRequestOptions,
+    ) -> Result<(String, bool), AiError> {
         self.check_ready()?;
-        let body = self.cfg.build_body(messages, false);
+        let (body, thinking_applied) = self.cfg.build_body_opts(messages, false, opts);
         let resp = self
             .http
             .post(self.endpoint())
@@ -209,10 +286,12 @@ impl AiClient {
             });
         }
         let v: serde_json::Value = resp.json().await.map_err(|_| AiError::BadResponse)?;
-        v.pointer("/choices/0/message/content")
+        let text = v
+            .pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())
             .map(|s| s.to_string())
-            .ok_or(AiError::BadResponse)
+            .ok_or(AiError::BadResponse)?;
+        Ok((text, thinking_applied))
     }
 }
 
@@ -254,6 +333,75 @@ mod tests {
         assert!(plain.get("temperature").is_none());
         assert!(plain.get("max_tokens").is_none());
         assert_eq!(plain["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn 思考开关只给deepseek接口带参数() {
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let opts = AiRequestOptions {
+            thinking: Some(true),
+            ..Default::default()
+        };
+        // DeepSeek 地址：带 thinking enabled，且如实报告已生效
+        let ds = AiConfig {
+            base_url: "https://api.deepseek.com".into(),
+            api_key: "k".into(),
+            model: "deepseek-chat".into(),
+            ..Default::default()
+        };
+        let (body, applied) = ds.build_body_opts(&msgs, true, &opts);
+        assert!(applied);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        // 关：disabled
+        let off = AiRequestOptions {
+            thinking: Some(false),
+            ..Default::default()
+        };
+        let (body, applied) = ds.build_body_opts(&msgs, true, &off);
+        assert!(applied);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        // 其他接口：不带参数、如实报告未生效
+        let other = AiConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "k".into(),
+            model: "gpt-4o-mini".into(),
+            ..Default::default()
+        };
+        let (body, applied) = other.build_body_opts(&msgs, true, &opts);
+        assert!(!applied);
+        assert!(body.get("thinking").is_none());
+        // 不指定（None）：谁都不带
+        let (body, applied) = ds.build_body_opts(&msgs, true, &AiRequestOptions::default());
+        assert!(!applied);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn 请求级参数覆盖配置级() {
+        let cfg = AiConfig {
+            base_url: "http://x/v1".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            temperature: Some(0.7),
+            max_tokens: Some(512),
+            ..Default::default()
+        };
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let opts = AiRequestOptions {
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+        let (body, _) = cfg.build_body_opts(&msgs, false, &opts);
+        assert!((body["temperature"].as_f64().unwrap() - 0.2).abs() < 0.001);
+        assert_eq!(body["max_tokens"], 512); // 没覆盖的仍用配置
+        assert!((body["top_p"].as_f64().unwrap() - 0.9).abs() < 0.001);
     }
 
     #[test]

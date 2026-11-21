@@ -532,13 +532,127 @@ async fn bt_connect(
                 .unwrap_or_else(|| "无信号值".to_string())
         ),
     );
+    let code_clean: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+    // 双边同连仲裁登记（v2.6.1）：握手期间若对方同时连进来，服务层按
+    // 设备 ID 字典序裁决让行/拒绝（见 services 的 handshake）。整个连接
+    // 流程（含可能的重试）结束才注销。
+    let out_gen = state.node.begin_outbound_attempt(&name).await;
+    let result = bt_connect_once(&state, gen, resolved, &device_id, &code_clean).await;
+    let result = match result {
+        Err(e)
+            if matches!(resolved, "ble" | "simpleble")
+                && state.connect_current(gen)
+                && is_stale_endpoint_failure(&e) =>
+        {
+            // 缓存过期家族（v2.6.1，2026-11-21 双机日志定案）：对端重启后
+            // 本机连到缓存里的旧端点——无线电/GATT 能通但对端应用层零
+            // 入站，握手必然超时。清缓存 + 强制重扫拿到新地址后自动重试
+            // 一次，不让用户手动重扫重连。
+            bluelink_services::log_line(
+                resolved,
+                &format!(
+                    "首次连接失败（疑似缓存旧端点：{e}），清缓存并重新扫描后自动重试一次"
+                ),
+            );
+            match rescan_fresh_id(&state, resolved, &device_id, &name).await {
+                Some(fresh_id) => {
+                    bluelink_services::log_line(
+                        resolved,
+                        &format!("重扫已定位目标新地址 {fresh_id}，开始重试"),
+                    );
+                    bt_connect_once(&state, gen, resolved, &fresh_id, &code_clean).await
+                }
+                None => {
+                    bluelink_services::log_line(
+                        resolved,
+                        "重扫 8 秒内未再发现目标设备，放弃重试",
+                    );
+                    Err(e)
+                }
+            }
+        }
+        other => other,
+    };
+    state.node.end_outbound_attempt(out_gen).await;
+    // 双边同连让行不是失败：本机出站虽收尾，但对方连入的链路已把会话
+    // 建立起来——按成功返回（目标名即用户点的那台，不会记错上次连接）。
+    if let Err(e) = &result {
+        if e.contains("已让行入站连接") && state.node.is_connected().await {
+            return Ok(name);
+        }
+    }
+    result
+}
+
+/// 是否为「缓存旧端点」家族的失败：握手超时（连到不应答的旧端点）、
+/// 握手期连接被关（旧端点残链）、步骤1 等 10 秒仍不在扫描缓存。
+/// 都是「地址/缓存过期」的一种表现，清缓存重扫后值得自动重试一次；
+/// 连接码错误、用户取消等不在此列，重试只会再错一次。
+fn is_stale_endpoint_failure(err: &str) -> bool {
+    err.contains("握手超时") || err.contains("不在扫描范围内") || err.contains("连接已关闭")
+}
+
+/// 清缓存 + 强制重新扫描，按设备名找回目标的新鲜条目（最长等 8 秒）。
+/// BLE 与 SimpleBLE 各走自己的中心端；经典蓝牙不经此路（无此缓存问题）。
+async fn rescan_fresh_id(
+    state: &AppState,
+    resolved: &str,
+    old_id: &str,
+    name: &str,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    match resolved {
+        "simpleble" => {
+            let central = state.sble_central.clone()?;
+            central.forget_device(old_id).await;
+            let _ = central.start_scan().await;
+            loop {
+                if let Ok(devices) = central.list_found().await {
+                    if let Some(d) = devices.iter().find(|d| d.name == name) {
+                        return Some(d.id.clone());
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        _ => {
+            let central = state.central.clone()?;
+            central.forget_device(old_id).await;
+            let _ = central.start_scan().await;
+            loop {
+                if let Ok(devices) = central.list_found().await {
+                    if let Some(d) = devices.iter().find(|d| d.name == name) {
+                        return Some(d.id.clone());
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+/// 一次完整的连接尝试：传输连接 → 取消核对 → 握手接管 → 取消核对。
+/// bt_connect 的重试逻辑复用它（参数与原 bt_connect 主体一致）。
+async fn bt_connect_once(
+    state: &AppState,
+    gen: u64,
+    resolved: &str,
+    device_id: &str,
+    code_clean: &str,
+) -> Result<String, String> {
     let conn = match resolved {
         "classic" => {
             let central = state
                 .classic_central
                 .clone()
                 .ok_or_else(|| "经典蓝牙不可用".to_string())?;
-            central.connect(&device_id).await.map_err(|e| {
+            central.connect(device_id).await.map_err(|e| {
                 let m = format!("经典蓝牙连接失败：{e}");
                 bluelink_services::log_line("app", &m);
                 m
@@ -549,7 +663,7 @@ async fn bt_connect(
                 .sble_central
                 .clone()
                 .ok_or_else(|| "SimpleBLE 不可用".to_string())?;
-            central.connect(&device_id).await.map_err(|e| {
+            central.connect(device_id).await.map_err(|e| {
                 let m = format!("SimpleBLE 连接失败：{e}");
                 bluelink_services::log_line("app", &m);
                 m
@@ -560,7 +674,7 @@ async fn bt_connect(
                 .central
                 .clone()
                 .ok_or_else(|| "蓝牙不可用".to_string())?;
-            central.connect(&device_id).await.map_err(|e| {
+            central.connect(device_id).await.map_err(|e| {
                 let m = format!("蓝牙连接失败：{e}");
                 bluelink_services::log_line("app", &m);
                 m
@@ -573,10 +687,9 @@ async fn bt_connect(
         drop(conn);
         return Err("连接已取消".into());
     }
-    let code_clean: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
     let peer = state
         .node
-        .attach(conn, false, &code_clean)
+        .attach(conn, false, code_clean)
         .await
         .map_err(|e| {
             let m = e.to_string();
@@ -858,14 +971,44 @@ fn save_text_file(path: String, content: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn ai_send(state: State<'_, AppState>, text: String) -> Result<Message, String> {
+async fn ai_send(
+    state: State<'_, AppState>,
+    text: String,
+    thinking: Option<bool>,
+    conversation_id: Option<String>,
+) -> Result<Message, String> {
     let (tx, rx) = oneshot::channel::<()>();
     *state.ai_cancel.lock().await = Some(tx);
     let node = state.node.clone();
     tokio::select! {
-        r = node.ai_send(&text) => r.map_err(|e| e.to_string()),
+        r = node.ai_send(&text, thinking, conversation_id) => r.map_err(|e| e.to_string()),
         _ = rx => Err("已停止生成".to_string()),
     }
+}
+
+/// ㉕ 新建 AI 会话（AI 页「新建会话」）。
+#[tauri::command]
+fn create_ai_conversation(
+    state: State<'_, AppState>,
+    title: Option<String>,
+) -> Result<Conversation, String> {
+    state
+        .node
+        .create_ai_conversation(title)
+        .map_err(|e| e.to_string())
+}
+
+/// ㉕ AI 会话改名。
+#[tauri::command]
+fn rename_ai_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    title: String,
+) -> Result<(), String> {
+    state
+        .node
+        .rename_ai_conversation(&conversation_id, &title)
+        .map_err(|e| e.to_string())
 }
 
 /// 聊天页「问AI」：把指定聊天消息作为上下文发给默认 AI，问答落在 AI 会话。
@@ -874,12 +1017,14 @@ async fn ai_ask_message(
     state: State<'_, AppState>,
     conversation_id: String,
     message_id: String,
+    thinking: Option<bool>,
+    extra: Option<String>,
 ) -> Result<Message, String> {
     let (tx, rx) = oneshot::channel::<()>();
     *state.ai_cancel.lock().await = Some(tx);
     let node = state.node.clone();
     tokio::select! {
-        r = node.ai_ask_message(&conversation_id, &message_id) => r.map_err(|e| e.to_string()),
+        r = node.ai_ask_message(&conversation_id, &message_id, thinking, extra) => r.map_err(|e| e.to_string()),
         _ = rx => Err("已停止生成".to_string()),
     }
 }
@@ -891,6 +1036,7 @@ async fn chat_ask_ai(
     conversation_id: String,
     source: String,
     text: String,
+    thinking: Option<bool>,
 ) -> Result<Message, String> {
     state
         .node
@@ -898,7 +1044,22 @@ async fn chat_ask_ai(
             &conversation_id,
             bluelink_services::AiSource::parse(&source),
             &text,
+            thinking,
         )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 聊天里 @AI 回答的重新生成（v2.6.1）：按回答消息 ID 定位原问题重答。
+#[tauri::command]
+async fn chat_regenerate_ai(
+    state: State<'_, AppState>,
+    message_id: String,
+    thinking: Option<bool>,
+) -> Result<Message, String> {
+    state
+        .node
+        .chat_regenerate_ai(&message_id, thinking)
         .await
         .map_err(|e| e.to_string())
 }
@@ -930,12 +1091,16 @@ fn set_ai_source(state: State<'_, AppState>, source: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-async fn ai_regenerate(state: State<'_, AppState>) -> Result<Message, String> {
+async fn ai_regenerate(
+    state: State<'_, AppState>,
+    thinking: Option<bool>,
+    conversation_id: Option<String>,
+) -> Result<Message, String> {
     let (tx, rx) = oneshot::channel::<()>();
     *state.ai_cancel.lock().await = Some(tx);
     let node = state.node.clone();
     tokio::select! {
-        r = node.ai_regenerate() => r.map_err(|e| e.to_string()),
+        r = node.ai_regenerate(thinking, conversation_id) => r.map_err(|e| e.to_string()),
         _ = rx => Err("已停止生成".to_string()),
     }
 }
@@ -1034,9 +1199,22 @@ async fn set_ai_config(
     Ok(())
 }
 
+/// 测试连接（v2.6.1 改）：用设置表单的当前值直测，不必先保存。
+/// 密钥框留空 = 沿用已保存的密钥（表单从不回显密钥明文，留空语义即不修改），
+/// 其余字段（地址/模型）一律以表单为准；测通了再保存也不迟。
 #[tauri::command]
-async fn test_ai_connection(state: State<'_, AppState>) -> Result<String, String> {
-    let cfg = load_ai_config(&state.node.storage);
+async fn test_ai_connection(
+    state: State<'_, AppState>,
+    base_url: String,
+    api_key: String,
+    model: String,
+) -> Result<String, String> {
+    let mut cfg = load_ai_config(&state.node.storage);
+    cfg.base_url = base_url.trim().to_string();
+    if !api_key.trim().is_empty() {
+        cfg.api_key = api_key.trim().to_string();
+    }
+    cfg.model = model.trim().to_string();
     let client = AiClient::new(cfg);
     let t0 = std::time::Instant::now();
     let reply = client
@@ -1051,6 +1229,37 @@ async fn test_ai_connection(state: State<'_, AppState>) -> Result<String, String
         t0.elapsed().as_millis(),
         reply.chars().take(50).collect::<String>()
     ))
+}
+
+/// 用系统浏览器打开网址（设置页「项目」地址点击跳转用，v2.6.1）。
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    bluelink_services::open_url(&url).map_err(|e| e.to_string())
+}
+
+/// 前端把关键错误原文写进运行日志（检查更新失败的插件原文等，
+/// 界面上只展示人话版，原文留日志备查，v2.6.1）。
+#[tauri::command]
+fn log_frontend(msg: String) {
+    let brief: String = msg.chars().take(300).collect();
+    bluelink_services::log_line("ui", &brief);
+}
+
+/// 图片查看器「复制图片」（⑱）：按路径把当前显示的那张图经原生通道
+/// 写进系统剪贴板（解码 + arboard 写图都在 services，阻塞活放
+/// spawn_blocking）。成功返回尺寸文案供前端 toast。
+#[tauri::command]
+async fn copy_image_clipboard(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
+    let node = state.node.clone();
+    let p = std::path::PathBuf::from(path);
+    let (w, h) = tokio::task::spawn_blocking(move || node.copy_image_blocking(&p))
+        .await
+        .map_err(|e| format!("复制失败：{e}"))?
+        .map_err(|e| e.to_string())?;
+    Ok(format!("{w}×{h}"))
 }
 
 // ---------- 彩签分类（v2.2：颜色即分类） ----------
@@ -1488,6 +1697,11 @@ struct GatewaySettingsView {
     local_running: bool,
     local_addr: String,
     local_has_key: bool,
+    /// ㉙ 可用模型提示的数据面：model 取网关现成的 gateway_model()
+    /// （本机配了是真实模型名，未配是占位名 bluelink-proxy），
+    /// connected 是当前连接状态，前端据此区分三态口径。
+    model: String,
+    connected: bool,
 }
 
 fn gateway_view(state: &AppState) -> GatewaySettingsView {
@@ -1502,6 +1716,8 @@ fn gateway_view(state: &AppState) -> GatewaySettingsView {
         local_running: false, // 由命令层按任务句柄补齐
         local_addr: format!("http://127.0.0.1:{}/v1", local_api::PORT),
         local_has_key: !get("local_api_key").is_empty(),
+        model: String::new(), // 由命令层异步补齐（gateway_model 是异步的）
+        connected: false,
     }
 }
 
@@ -1509,6 +1725,8 @@ fn gateway_view(state: &AppState) -> GatewaySettingsView {
 async fn get_gateway_settings(state: State<'_, AppState>) -> Result<GatewaySettingsView, String> {
     let mut v = gateway_view(&state);
     v.local_running = local_api::is_running();
+    v.model = state.node.gateway_model().await;
+    v.connected = state.node.is_connected().await;
     Ok(v)
 }
 
@@ -1698,10 +1916,12 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
                 Ok(Event::ConnectionChanged {
                     connected,
                     peer_name,
+                    peer_device_id,
+                    conversation_id,
                 }) => {
                     let _ = app.emit(
                         "connection_state",
-                        serde_json::json!({"connected": connected, "peer_name": peer_name}),
+                        serde_json::json!({"connected": connected, "peer_name": peer_name, "peer_device_id": peer_device_id, "conversation_id": conversation_id}),
                     );
                 }
                 Ok(Event::MessageNew(m)) => {
@@ -1758,6 +1978,9 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
                         serde_json::json!({"conversation_id": conversation_id, "error": error}),
                     );
                 }
+                Ok(Event::AiThinkingNote) => {
+                    let _ = app.emit("ai_thinking_note", serde_json::json!({}));
+                }
                 Ok(Event::PeerTyping(t)) => {
                     let _ = app.emit("peer_typing", t);
                 }
@@ -1781,6 +2004,38 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
     });
 }
 
+/// ㉗ 按主显示器工作区把窗口居中并钳制在工作区内（见 setup 调用点）。
+/// 窗口物理尺寸不读 outer_size——setup 时机上窗口可能还没完成首帧
+/// 尺寸协商（Linux 实测读到 0×0，居中会算成左上角落屏幕正中）；用
+/// 配置里的逻辑尺寸 × 显示器缩放比换算，与实际尺寸恒等（窗口尺寸
+/// 固定、最小尺寸同值）。
+fn center_window_clamped(win: &tauri::WebviewWindow, logical_w: f64, logical_h: f64) {
+    let Ok(Some(monitor)) = win.primary_monitor() else {
+        return;
+    };
+    let wa = monitor.work_area();
+    let scale = monitor.scale_factor();
+    let pw = (logical_w * scale) as i32;
+    let ph = (logical_h * scale) as i32;
+    let x = wa.position.x + ((wa.size.width as i32 - pw) / 2).max(0);
+    let y = wa.position.y + ((wa.size.height as i32 - ph) / 2).max(0);
+    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+/// ㉘ 前端主界面就绪（init 走完）后调用：窗口在 setup 里已随外壳显示，
+/// 这里只做聚焦确认（幂等）。托盘恢复走托盘自己的 show，不经这里、
+/// 更不会重新居中。
+#[tauri::command]
+fn ui_ready(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("main") {
+        if !win.is_visible().unwrap_or(false) {
+            win.show().map_err(|e| e.to_string())?;
+        }
+        let _ = win.set_focus();
+    }
+    Ok(())
+}
+
 fn main() {
     // 传输层诊断日志（连接分步日志等）接上运行日志通道
     bluelink_transport::set_log_sink(bluelink_services::log_line);
@@ -1800,6 +2055,23 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // ㉗ 启动居中（只在进程启动这一次）：按主屏工作区实测现算，
+            // 禁止写死坐标；工作区比窗口小时钳回左上角，保标题栏可见、
+            // 绝不落负坐标。托盘恢复不走这里（保持原位）。
+            // ㉘ 居中后立刻显示：窗口底色已在配置里设成应用底色，页面一
+            // 解析先画启动外壳（品牌+加载指示），主界面就绪后由前端撤下
+            // 外壳——全程没有纯白屏，外壳也不设最短停留。
+            if let Some(win) = app.get_webview_window("main") {
+                let (lw, lh) = app
+                    .config()
+                    .app
+                    .windows
+                    .first()
+                    .map(|w| (w.width, w.height))
+                    .unwrap_or((900.0, 600.0));
+                center_window_clamped(&win, lw, lh);
+                let _ = win.show();
+            }
             // Windows 原生通知（WinRT toast + 点击激活回调）尽早初始化：
             // COM 激活类注册要赶在系统可能投递激活请求之前完成。
             #[cfg(windows)]
@@ -1847,14 +2119,19 @@ fn main() {
             // 无适配器或未开启时为 None，应用照常启动，界面如实提示（bt_state）。
             let (central, server, server_error, server_note) =
                 tauri::async_runtime::block_on(async {
-                let central = bluelink_transport::ble::ble_central()
-                    .await
-                    .map(Arc::new)
-                    .map_err(|e| {
-                        bluelink_services::log_line("ble", &format!("蓝牙中心端不可用：{e}"));
-                        e
-                    })
-                    .ok();
+                // ㉘ 中心端与服务端互不依赖，并行初始化（旧版串行 await，
+                // 启动墙钟是两者之和；真机上 GATT 注册并不便宜）
+                let central_fut = async {
+                    bluelink_transport::ble::ble_central()
+                        .await
+                        .map(Arc::new)
+                        .map_err(|e| {
+                            bluelink_services::log_line("ble", &format!("蓝牙中心端不可用：{e}"));
+                            e
+                        })
+                        .ok()
+                };
+                let server_fut = async {
                 let mut server_error = None;
                 let mut server_note = None;
                 let server = if want_sble_server {
@@ -1895,6 +2172,10 @@ fn main() {
                     }
                     }
                 };
+                (server, server_error, server_note)
+                };
+                let (central, (server, server_error, server_note)) =
+                    tokio::join!(central_fut, server_fut);
                 (central, server, server_error, server_note)
             });
             // 经典蓝牙运行时（仅 Windows）：Inquiry 中心端 + RFCOMM 服务端（SDP 注册 SPP）。
@@ -2033,6 +2314,19 @@ fn main() {
                 } else {
                     (None, None, None, None)
                 };
+            // ㉘ 兜底：前端若因异常没调 ui_ready，8 秒后也把窗口亮出来，
+            // 绝不让用户对着一个看不见的进程干等。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                    if let Some(win) = handle.get_webview_window("main") {
+                        if !win.is_visible().unwrap_or(true) {
+                            let _ = win.show();
+                        }
+                    }
+                });
+            }
             app.manage(AppState {
                 node,
                 data_dir,
@@ -2193,8 +2487,11 @@ fn main() {
             save_draft,
             save_text_file,
             ai_send,
+            create_ai_conversation,
+            rename_ai_conversation,
             ai_ask_message,
             chat_ask_ai,
+            chat_regenerate_ai,
             get_ai_source,
             set_ai_source,
             ai_regenerate,
@@ -2202,6 +2499,10 @@ fn main() {
             get_ai_config,
             set_ai_config,
             test_ai_connection,
+            open_external_url,
+            log_frontend,
+            copy_image_clipboard,
+            ui_ready,
             list_categories,
             rename_category,
             set_message_category,

@@ -5,8 +5,27 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BlueLink</title>
 <link rel="stylesheet" href="style.css">
+<style>
+/* ㉘ 启动外壳：纯内联样式，文档解析到 body 头部即渲染，不等 style.css
+   与 app.js；主界面就绪后由 app.js 立刻撤下（不设最短停留）。窗口本身
+   启动期不可见（tauri 配置 visible:false），前端就绪才经 ui_ready 显示，
+   所以用户第一眼看到的要么是外壳、要么是主界面，永不纯白屏。 */
+#splash { position: fixed; inset: 0; z-index: 9999; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 14px; background: #F5F5F4; color: #1D1D1F;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; transition: opacity .18s ease; }
+#splash.done { opacity: 0; pointer-events: none; }
+#splash .sp-logo { width: 54px; height: 54px; border-radius: 14px; background: #2563EB;
+  display: flex; align-items: center; justify-content: center; color: #fff; }
+#splash .sp-name { font-size: 19px; font-weight: 600; letter-spacing: .02em; }
+#splash .sp-sub { font-size: 12.5px; color: #86868B; display: flex; align-items: center; gap: 8px; }
+#splash .sp-spin { width: 14px; height: 14px; border-radius: 50%; flex: none;
+  border: 2px solid rgba(37,99,235,.25); border-top-color: #2563EB; animation: sp-rot .7s linear infinite; }
+@keyframes sp-rot { to { transform: rotate(360deg); } }
+@media (prefers-color-scheme: dark) { #splash { background: #17181A; color: #F5F5F7; } }
+</style>
 </head>
 <body>
+<div id="splash"><div class="sp-logo"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div><div class="sp-name">BlueLink</div><div class="sp-sub"><span class="sp-spin"></span>正在启动…</div></div>
 <!-- SVG 图标集（线性图标，24 视图框，描边风格，全应用统一） -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <defs>
@@ -17,6 +36,7 @@
     <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h10"/><path d="M18 6h2"/><circle cx="16" cy="6" r="2"/><path d="M4 12h4"/><path d="M12 12h8"/><circle cx="10" cy="12" r="2"/><path d="M4 18h12"/><path d="M20 18h0"/><circle cx="18" cy="18" r="2"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></symbol>
     <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
     <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></symbol>
     <symbol id="i-clip" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
     <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M9 13h6"/><path d="M9 17h6"/></symbol>
@@ -41,7 +61,8 @@
   <!-- 一级导航 -->
   <nav id="nav">
     <div class="nav-logo" id="nav-logo" title="BlueLink：左链节是本机，右链节是链接的机器"><svg viewBox="0 0 48 48" class="logo-mark"><g class="ring-me"><rect x="9" y="18.25" width="21" height="11.5" rx="5.75" transform="rotate(-45 19.5 24)"/></g><g class="ring-peer"><rect x="18" y="18.25" width="21" height="11.5" rx="5.75" transform="rotate(-45 28.5 24)"/></g></svg></div>
-    <button class="nav-item active" data-view="chat" title="聊天"><svg class="ico"><use href="#i-chat"/></svg><span>聊天</span></button>
+    <button class="nav-item active" data-view="chat" title="聊天"><svg class="ico"><use href="#i-chat"/></svg><span>聊天</span><span id="nav-conn-dot" class="nav-dot" title="连接状态"></span></button>
+    <button class="nav-item" data-view="connect" title="连接设备"><svg class="ico"><use href="#i-link"/></svg><span>连接</span></button>
     <button class="nav-item" data-view="ai" title="AI 助手"><svg class="ico"><use href="#i-bot"/></svg><span>AI</span></button>
     <button class="nav-item" data-view="tags" title="彩签"><svg class="ico"><use href="#i-tag"/></svg><span>彩签</span></button>
     <button class="nav-item" data-view="favorites" title="收藏"><svg class="ico"><use href="#i-star"/></svg><span>收藏</span></button>
@@ -209,14 +230,12 @@
     <section id="chat-view" class="hidden">
       <header class="chat-head">
         <div class="head-peer">
-          <div>
-            <div id="peer-name" class="chat-title">未连接</div>
-            <div id="peer-state" class="muted small">离线</div>
-          </div>
+          <span id="peer-name" class="chat-title">未连接</span>
+          <span id="peer-state" class="peer-state"><span id="peer-dot" class="status-dot"></span><span id="peer-state-text">离线</span></span>
         </div>
         <div class="head-actions">
-          <button id="btn-export" class="btn small-btn"><svg class="ico ico-14"><use href="#i-download"/></svg>导出</button>
-          <button id="btn-disconnect" class="btn small-btn">断开</button>
+          <button id="btn-export" class="icon-btn" title="导出聊天记录"><svg class="ico"><use href="#i-download"/></svg></button>
+          <button id="btn-disconnect" class="danger-text-btn" title="断开连接">断开</button>
         </div>
       </header>
       <div id="pin-bar" class="hidden"></div>
@@ -249,6 +268,7 @@
           <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
           <button id="btn-send" class="send-round" title="发送"><svg class="ico ico-16"><use href="#i-arrow-up"/></svg></button>
         </div>
+        <div id="offline-band" class="hidden"><span>当前未连接，只能查看记录</span><button id="btn-go-connect" class="btn small-btn">去连接</button></div>
       </div>
     </section>
 
@@ -256,10 +276,8 @@
     <section id="ai-view" class="hidden">
       <header class="chat-head">
         <div class="head-peer">
-          <div>
-            <div class="chat-title">AI 助手</div>
-            <div id="ai-state" class="muted small">本机配置优先，未配置时经对方电脑代理</div>
-          </div>
+          <span class="chat-title" id="ai-title">AI 助手</span>
+          <span id="ai-state" class="muted small ai-state-inline">本机配置优先，未配置时经对方电脑代理</span>
         </div>
         <div class="head-actions">
           <label class="muted small ai-source-label">默认AI
@@ -273,10 +291,17 @@
           <button id="btn-ai-stop" class="btn small-btn hidden"><svg class="ico ico-14"><use href="#i-stop"/></svg>停止</button>
         </div>
       </header>
+      <div id="ai-conv-bar"><div id="ai-conv-list"></div><button id="btn-ai-new-conv" class="btn small-btn">＋ 新建会话</button></div>
+      <div id="ai-pin-bar" class="hidden"></div>
+      <div id="ai-pin-list" class="hidden"></div>
       <div id="ai-messages"></div>
+      <button id="btn-ai-bottom" class="hidden" title="回到最新">回到最新</button>
+      <div id="ai-think-note" class="hidden">当前接口不支持思考模式开关，本次已忽略该设置</div>
+      <div id="ai-quote-bar" class="hidden"><span id="ai-quote-text"></span><button id="ai-quote-x" class="ghost" title="取消引用">×</button></div>
       <div id="ai-composer">
         <div class="composer-row composer-card">
-          <textarea id="ai-input" rows="1" placeholder="向 AI 提问，Enter 发送"></textarea>
+          <label id="ai-thinking-wrap" title="开启后请 AI 先思考再回答（仅 DeepSeek 等支持的接口生效）"><input type="checkbox" id="ai-thinking">思考</label>
+          <textarea id="ai-input" rows="1" placeholder="向 AI 提问，Enter 发送，Shift+Enter 换行"></textarea>
           <button id="btn-ai-send" class="send-round" title="发送"><svg class="ico ico-16"><use href="#i-arrow-up"/></svg></button>
         </div>
       </div>
@@ -346,6 +371,7 @@
           <button id="btn-copy-api-addr" class="btn small-btn">复制</button></span>
         </div>
         <div class="setting-row"><span>服务状态</span><span id="local-api-status" class="muted small">未开启</span></div>
+        <div class="setting-row"><span>可用模型</span><span id="local-api-model" class="muted small">开启后显示</span></div>
         <label class="field">本机访问密钥（可空，设置后调用需带此密钥）<input id="local-api-key" type="password" placeholder="留空表示不修改"></label>
         <div class="row-gap">
           <button id="btn-local-api-save" class="btn">保存密钥</button>
@@ -388,7 +414,7 @@
         <div class="setting-row"><span>软件更新</span><span class="row-gap"><span id="update-status" class="muted small">仅手动检查，不会自动联网</span><button id="btn-check-update" class="btn small-btn">检查更新</button></span></div>
         <div class="setting-row"><span>作者</span><b>ZPC</b></div>
         <div class="setting-row"><span>邮箱</span><span class="muted small">privacyporton@proton.me</span></div>
-        <div class="setting-row"><span>项目</span><span class="muted small">https://github.com/123zpc/BlueLink</span></div>
+        <div class="setting-row"><span>项目</span><a id="project-link" class="small" href="https://github.com/123zpc/BlueLink">https://github.com/123zpc/BlueLink</a></div>
        </div>
       </div>
     </section>
@@ -542,6 +568,7 @@
         <button id="vi-actual" class="btn small-btn">1:1</button>
         <button id="vi-rotl" class="btn small-btn">↺ 左旋</button>
         <button id="vi-rotr" class="btn small-btn">↻ 右旋</button>
+        <button id="vi-copy" class="btn small-btn">复制图片</button>
         <span id="vi-count" class="muted small"></span>
         <span id="vi-zoom" class="muted small"></span>
         <span class="muted small">滚轮缩放 · 拖动平移 · 双击适屏/1:1</span>

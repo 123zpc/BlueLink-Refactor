@@ -178,11 +178,11 @@ async fn ai代理无网方经有网方提问() {
     连接两节点(&a, &b).await;
 
     // 未开启转发许可时必须被明确拒绝（默认关，花的是 B 的额度）
-    let denied = a.ai_send("报个到").await;
+    let denied = a.ai_send("报个到", None, None).await;
     assert!(denied.is_err(), "未开许可不应转发成功");
     // 开启许可后转发通畅，且统计有记录
     b.storage.set_setting("ai_proxy_allow", "1").unwrap();
-    let reply = a.ai_send("报个到").await.unwrap();
+    let reply = a.ai_send("报个到", None, None).await.unwrap();
     assert_eq!(reply.body, "你好世界");
     assert_eq!(b.proxy_today_stats().0, 1);
     assert_eq!(reply.sender, Sender::Ai);
@@ -231,4 +231,21 @@ async fn 剪贴板同步开关默认关且状态双向通告() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(!b.clipboard_peer_on(), "乙未收到甲的关闭通告");
+}
+
+/// ⑱ 复制图片的失败口径（成功路径要真剪贴板，留给 GUI 自测在 Xvfb 下
+/// 点按钮 + 读回验证）：文件不存在 → 「已不存在」；内容不是图片 →
+/// 「解码失败」。两条都在碰剪贴板之前返回，无显示环境也能测。
+#[tokio::test]
+async fn 复制图片失败口径() {
+    let a = Node::new(&临时目录("ci"), "甲").unwrap();
+    let err = a
+        .copy_image_blocking(Path::new("/nonexistent/没有这张图.png"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("已不存在"), "实际：{err}");
+    let bad = 临时目录("ci-bad").join("假图片.png");
+    std::fs::write(&bad, b"this is not an image").unwrap();
+    let err = a.copy_image_blocking(&bad).unwrap_err().to_string();
+    assert!(err.contains("解码失败"), "实际：{err}");
 }

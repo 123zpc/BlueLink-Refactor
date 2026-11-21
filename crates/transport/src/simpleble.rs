@@ -204,6 +204,26 @@ mod imp {
             Ok(merge_same_name(out))
         }
 
+        /// 清掉一台设备的缓存状态（v2.6.1，与 ble 路同口径）：从发现表
+        /// 移除其句柄并断开可能残留的连接。对端重启后旧句柄指向已失效的
+        /// 广播地址/栈状态，不清掉重试只会再撞一次握手超时。
+        pub async fn forget_device(&self, device_id: &str) {
+            let peripheral = {
+                let mut found = self.found.lock().unwrap();
+                found.order.retain(|x| x != device_id);
+                found.map.remove(device_id)
+            };
+            if let Some(p) = peripheral {
+                // FFI 是阻塞调用，放阻塞线程执行；未连接时 disconnect
+                // 返回错误，忽略即可——目的只是不留残留链路。
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = p.disconnect();
+                })
+                .await;
+                crate::probe::log("simpleble", "已清掉目标的缓存句柄并断开残留连接");
+            }
+        }
+
         /// 连接指定设备并订阅 OUTBOX 通知，返回可直接交给服务层握手的连接。
         pub async fn connect(&self, device_id: &str) -> Result<Conn, TransportError> {
             // 连接分步日志（与 ble 路同一口径，步骤1–4/6，5–6 是服务层握手）
@@ -711,6 +731,8 @@ mod imp {
         pub async fn connect(&self, _device_id: &str) -> Result<Conn, TransportError> {
             Err(not_compiled())
         }
+
+        pub async fn forget_device(&self, _device_id: &str) {}
     }
 
     /// SimpleBLE 服务端空壳（未编译）。
