@@ -11,6 +11,10 @@ const state = {
   view: "chat",
   peerConvId: null,
   peerConvTitle: "", // ㉛ 当前打开的设备会话标题（顶栏如实用）
+  // 入口模型定版（v2.6.4，用户 2026-11-22 亲自复述确认）：会话详情只许由
+  // 明确动作打开——会话列表点选、连接成功落点、定位/通知直达；本旗标
+  // 记「详情已被打开过」，左栏「聊天」的分流（goChat）以它为恢复优先据。
+  chatDetailOpen: false,
   connectedConvId: null, // ㉛ 实际连接的对端会话 id（落点规则用）
   aiConvId: "ai-default",
   replyTo: null,
@@ -511,6 +515,8 @@ async function locateMessage(conversationId, messageId, colorHex) {
     if (isAi && conversationId !== state.aiConvId) {
       state.aiConvId = conversationId;
     }
+    // 入口模型定版：定位直达同样是「明确打开详情」，置旗供切回恢复
+    if (!isAi) state.chatDetailOpen = true;
     switchView(isAi ? "ai" : "chat");
     if (isAi) loadAiConversations();
     const container = isAi ? $("ai-messages") : $("messages");
@@ -613,15 +619,50 @@ function switchView(view) {
 }
 
 document.querySelectorAll(".nav-item").forEach((b) =>
-  b.addEventListener("click", () => switchView(b.dataset.view)));
+  b.addEventListener("click", () => {
+    // 「聊天」不直达视图：按入口模型定版分流（见 goChat）；其余页签直达。
+    if (b.dataset.view === "chat") goChat();
+    else switchView(b.dataset.view);
+  }));
 
-// ---------- 会话列表收起/展开（列表只属于聊天页；收起即整列消失，不留残条） ----------
+/** 入口模型定版（v2.6.4，用户 2026-11-22 亲自复述确认）——左栏「聊天」
+ * （及命令面板/连接页「进入聊天」等同义入口）的分流，判定顺序：
+ * ① 恢复优先：已打开过会话详情 → 回到刚才那个详情（切去别页再切回不丢）；
+ * ② 已连接 → 当前连接对端的会话（「有连接了，那么就是这个会话」）；
+ * ③ 未连接 → 一律落连接页（不分有无会话），不许落到「进聊天页但没选
+ * 会话」的空态。进详情的手动路径唯一：展开会话列表点某个具体会话。 */
+async function goChat() {
+  if (state.chatDetailOpen && state.peerConvId) { switchView("chat"); return; }
+  if (state.connected) {
+    if (state.connectedConvId) {
+      const switching = state.peerConvId !== state.connectedConvId;
+      state.peerConvId = state.connectedConvId;
+      if (switching) {
+        const cur = (await invoke("list_conversations").catch(() => []))
+          .find((c) => c.id === state.connectedConvId);
+        if (cur) state.peerConvTitle = cur.title || "";
+      }
+      state.chatDetailOpen = true;
+      switchView("chat");
+      if (switching) loadChatMessages();
+      syncPeerHead();
+      return;
+    }
+    switchView("chat");
+    return;
+  }
+  switchView("connect");
+}
+
+// ---------- 会话列表收起/展开（列表为应用级组件：聊天页与连接页可用；收起即整列消失，不留残条） ----------
 // 默认收起（用户裁定，两次确认）：每次启动程序都以收起状态进入，不沿用上次退出时的展开状态；
 // 本次运行内用户展开/收起的选择照常生效，重启后回到收起。
 // 状态只许由悬浮开关改：页面切换永不自动弹开（v2.4.1 修——旧版导航点「聊天」时
 // 会强制把收起状态改成展开，用户反馈一切换菜单列表就自己弹开）。
 // 开关形态（v2.4.1 用户定版）：唯一的展开/收起入口是骑在左导航/列表与内容区分界线上的
-// 圆形悬浮按钮（原页头 » 展开按钮与列表头 « 收起按钮已收敛删除），仅聊天页出现。
+// 圆形悬浮按钮（原页头 » 展开按钮与列表头 « 收起按钮已收敛删除），
+// 聊天页与连接页出现（v2.6.4 入口模型定版：身处连接页也要能展开列表、
+// 点会话进详情——未连接时进详情的手动路径唯一就是列表点选）。
 let asideBootDone = false;
 function applyAside() {
   if (!asideBootDone) {
@@ -629,13 +670,14 @@ function applyAside() {
     localStorage.setItem("bl-aside", "collapsed");
   }
   const collapsed = localStorage.getItem("bl-aside") === "collapsed";
-  $("aside").classList.toggle("hidden", state.view !== "chat" || collapsed);
+  // 列表可用页：聊天页与连接页（v2.6.4 起连接页同列）；其余页整列隐藏。
+  const onListView = state.view === "chat" || state.view === "connect";
+  $("aside").classList.toggle("hidden", !onListView || collapsed);
   // 悬浮开关定位：收起时贴导航右缘、展开时贴列表右缘（按实测宽：导航宽 + 列表实宽，
   // 列表隐藏时实宽为 0，自然落在导航右缘）；图标随状态翻转。
   const fb = $("btn-aside-float");
-  const onChat = state.view === "chat";
-  fb.classList.toggle("hidden", !onChat);
-  if (onChat) {
+  fb.classList.toggle("hidden", !onListView);
+  if (onListView) {
     fb.style.left = ($("nav").offsetWidth + $("aside").offsetWidth) + "px";
     fb.querySelector(".float-ico-open").classList.toggle("hidden", !collapsed);
     fb.querySelector(".float-ico-close").classList.toggle("hidden", collapsed);
@@ -681,6 +723,7 @@ async function loadConversations() {
         const switching = state.peerConvId !== c.id;
         state.peerConvId = c.id;
         state.peerConvTitle = c.title || "";
+        state.chatDetailOpen = true; // 入口模型定版：进详情的手动路径唯一就是列表点选
         switchView("chat");
         if (switching) loadChatMessages();
         syncPeerHead();
@@ -1268,7 +1311,7 @@ $("reconnect-stop").addEventListener("click", async () => {
   $("reconnect-banner").classList.add("hidden");
 });
 $("btn-connected-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
-$("btn-goto-chat").addEventListener("click", () => switchView("chat"));
+$("btn-goto-chat").addEventListener("click", () => goChat());
 
 // ---------- 连接（蓝牙） ----------
 // 传输选择（仅开发者模式可用，存设置键 bt_transport）：
@@ -3218,7 +3261,7 @@ const paletteState = { items: [], sel: 0 };
 async function refreshPalette(q) {
   const items = [];
   for (const [v, label] of [["chat", "聊天"], ["ai", "AI 对话"], ["tags", "标签总览"], ["favorites", "收藏"], ["settings", "设置"]])
-    items.push({ label: `打开：${label}`, run: () => switchView(v) });
+    items.push({ label: `打开：${label}`, run: () => { if (v === "chat") goChat(); else switchView(v); } });
   if (state.connected) items.push({ label: "断开连接", run: () => $("btn-disconnect").click() });
   if (state.peerConvId) items.push({ label: "导出当前会话", run: () => exportCurrentConv() });
   try {
@@ -3291,6 +3334,7 @@ async function wireEvents() {
       // 会话 A 去连接、连上 B 就落 B 的会话，不回 A
       if (state.connectedConvId) {
         state.peerConvId = state.connectedConvId;
+        state.chatDetailOpen = true; // 入口模型定版：连接落点即详情已打开
         const cur = (await invoke("list_conversations").catch(() => []))
           .find((c) => c.id === state.connectedConvId);
         if (cur) state.peerConvTitle = cur.title || "";
@@ -3316,6 +3360,7 @@ async function wireEvents() {
     // 这里只负责打开对应会话（设备会话回聊天页，AI 会话回 AI 页）。
     const cid = e.payload && e.payload.conversation_id;
     if (cid && (cid === state.aiConvId || cid.startsWith("ai"))) { switchView("ai"); return; }
+    state.chatDetailOpen = true; // 通知直达打开详情（入口模型定版的明确动作）
     switchView("chat");
     loadChatMessages(); // ㉛ 通知回窗看历史同样不问连接状态
   });
