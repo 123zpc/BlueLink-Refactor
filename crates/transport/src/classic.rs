@@ -298,6 +298,7 @@ mod imp {
         let StreamEnds {
             incoming_tx,
             mut outgoing_rx,
+            aired_bytes,
         } = ends;
         // 读泵：socket → 通道
         {
@@ -317,6 +318,7 @@ mod imp {
             });
         }
         // 写泵：通道 → socket
+        let aired_w = aired_bytes.clone();
         std::thread::spawn(move || {
             while let Some((bytes, _slot)) = outgoing_rx.blocking_recv() {
                 let mut off = 0usize;
@@ -333,13 +335,15 @@ mod imp {
                 if failed {
                     break;
                 }
+                // 整条消息已交给套接字：记空中字节（#12 排空判定）
+                aired_w.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             unsafe {
                 shutdown(sock, SD_BOTH);
                 closesocket(sock);
             }
         });
-        Conn::new(stream, peer)
+        Conn::new_with_air(stream, peer, aired_bytes)
     }
 
     // ================= 中心端（Inquiry 扫描 / 主动连接） =================

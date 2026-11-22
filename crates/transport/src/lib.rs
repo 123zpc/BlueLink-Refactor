@@ -12,7 +12,7 @@ pub mod simpleble;
 
 pub use probe::{set_log_sink, set_step_sink, take_probe_lines};
 
-use bluelink_protocol::{write_frame, Frame, FrameDecoder, ProtocolError};
+use bluelink_protocol::{Frame, FrameDecoder, ProtocolError};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -39,6 +39,14 @@ struct RecvState {
     logged_dropped: u64,
 }
 
+/// 当前时刻（Unix 毫秒），与服务层 now_ms 同一口径。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 一条已建立的连接：内部对写端加锁，允许多个任务并发发送。
 pub struct Conn {
     reader: Mutex<Box<dyn AsyncRead + Unpin + Send>>,
@@ -46,10 +54,48 @@ pub struct Conn {
     recv_state: Mutex<RecvState>,
     /// 对端地址描述（TCP 地址或 "loopback"）。
     pub peer_addr: String,
+    /// 已接受发送的字节总数（send 编码后全长）。
+    written_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// 已真正交给底层（无线电/套接字）的字节数：通道类传输由泵逐片
+    /// 累加（见 ble::StreamEnds::aired_bytes，与本字段是同一个计数器）；
+    /// 直连流（TCP/环回）在 flush 完成后即视为已交付、与 written 同步。
+    aired_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// aired 计数是否由外部泵驱动（通道类传输在构造时注入共享计数器）：
+    /// true 时 send 只记 written、aired 等泵逐片累加；false（直连流）
+    /// 时 flush 完成即视为已交付，aired 与 written 同步推进。
+    external_air: bool,
+    /// 最近一次读到底层字节的时刻（毫秒）：长帧传输期间完整帧迟迟不
+    /// 成帧，但字节一直在流——心跳判死必须看这个而不是只看成帧时刻，
+    /// 否则一张大图传一半就会被自家心跳误杀（v2.6.5，#18 定案）。
+    last_inbound_byte_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Conn {
     pub fn new<S>(stream: S, peer_addr: String) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::build(stream, peer_addr, None)
+    }
+
+    /// 通道类传输（BLE/SimpleBLE/经典）用：aired 计数器与泵共享，
+    /// 泵每送出一片就累加，outbound_lag 才反映真实空中滞留。
+    pub fn new_with_air<S>(
+        stream: S,
+        peer_addr: String,
+        aired_bytes: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::build(stream, peer_addr, Some(aired_bytes))
+    }
+
+    fn build<S>(
+        stream: S,
+        peer_addr: String,
+        aired: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -63,13 +109,50 @@ impl Conn {
                 logged_dropped: 0,
             }),
             peer_addr,
+            written_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            external_air: aired.is_some(),
+            aired_bytes: aired.unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            last_inbound_byte_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 出站滞留字节：已接受发送但还没真正交到底层的部分。通道类传输
+    /// 上 >0 表示队列/泵里还有货在空中排队；直连流恒为 0（flush 即交付）。
+    pub fn outbound_lag(&self) -> u64 {
+        let w = self
+            .written_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let a = self.aired_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        w.saturating_sub(a)
+    }
+
+    /// 最近一次读到底层字节的时刻（Unix 毫秒，0 = 还没读到过）。
+    pub fn last_inbound_byte_ms(&self) -> u64 {
+        self.last_inbound_byte_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 发送一帧。
     pub async fn send(&self, frame: &Frame) -> Result<(), TransportError> {
-        let mut w = self.writer.lock().await;
-        write_frame(&mut **w, frame).await?;
+        let bytes = bluelink_protocol::encode(frame)?;
+        let n = bytes.len() as u64;
+        {
+            let mut w = self.writer.lock().await;
+            w.write_all(&bytes).await?;
+            w.flush().await?;
+            // written 在锁内累加（第三方评审采纳）：与字节进通道原子
+            // 成对，排空判定读到的 written 永远不落后于已入通道的字节。
+            self.written_bytes
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !self.external_air {
+            // 直连流：flush 完成即已交付，aired 与 written 同步推进
+            self.aired_bytes.store(
+                self.written_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Ok(())
     }
 
@@ -115,6 +198,9 @@ impl Conn {
             if n == 0 {
                 return Err(TransportError::Closed);
             }
+            // 字节级入站活动（#18）：成帧之前先记一笔，心跳判死看它
+            self.last_inbound_byte_ms
+                .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
             decoder.push(&scratch[..n]);
         }
     }

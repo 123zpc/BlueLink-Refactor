@@ -16,6 +16,7 @@ const state = {
   // 记「详情已被打开过」，左栏「聊天」的分流（goChat）以它为恢复优先据。
   chatDetailOpen: false,
   connectedConvId: null, // ㉛ 实际连接的对端会话 id（落点规则用）
+  linkState: "off", // #17 连接链路状态：off/connecting/on/reconnecting（断开钮显隐的唯一依据）
   aiConvId: "ai-default",
   replyTo: null,
   renderedChat: new Set(),
@@ -34,7 +35,7 @@ const state = {
   // 为 true；用户手势（滚轮/触摸/拖滚动条/键盘）一出立即置 false，
   // 不靠位置猜；恢复只由自滚回底/点回到最新/本人发送触发。
   follow: { chat: true, ai: true },
-  chatWaitRow: null,
+  aiWaitRows: {}, // #3：各消息容器当前的 AI 等待行（按 container.id 登记），问题行落库渲染时锚定到其正下方
   quoteFrom: null,
   favIds: new Set(),
   pins: [],
@@ -281,6 +282,17 @@ function buildMessageEl(m, opts = {}) {
     });
   } else if (m.sender === "ai") {
     bubble.innerHTML = md(m.body);
+  } else if (m.body.length > 20000) {
+    // #2 渲染保险（v2.6.5）：巨型正文（旧版本/对方发来的）整篇进 DOM
+    // 布局同样冻死——显示截断到 2 万字并注明，全文不在气泡里展开。
+    const textDiv = document.createElement("div");
+    textDiv.className = "msg-text collapsed";
+    textDiv.textContent = m.body.slice(0, 20000);
+    const note = document.createElement("div");
+    note.className = "muted small";
+    note.textContent = `（全文 ${m.body.length.toLocaleString()} 字，过长已截断显示；完整内容请以文件发送）`;
+    bubble.appendChild(textDiv);
+    bubble.appendChild(note);
   } else if (m.body.length > 500 || m.body.split("\n").length > 10) {
     // 长文本默认折叠，避免单个气泡刷屏，需要时点开全文
     const textDiv = document.createElement("div");
@@ -327,6 +339,7 @@ function buildMessageEl(m, opts = {}) {
     b.textContent = label;
     if (label === "收藏") { b.classList.add("fav-btn"); paintFavBtn(b, state.favIds.has(m.id)); }
     if (label === "置顶") { b.classList.add("pin-btn"); paintPinBtn(b, state.pinIds.has(m.id)); }
+    if (m.sender === "ai" && (label === "展开" || label === "收起")) b.classList.add("ai-collapse-btn");
     b.addEventListener("click", fn);
     actions.appendChild(b);
   }
@@ -361,16 +374,26 @@ function applyAiCollapse(bubble, m) {
   bar.addEventListener("click", () => toggleAiCollapse(m, bubble, null));
   bubble.appendChild(bar);
 }
-function toggleAiCollapse(m, bubble, btn) {
+function toggleAiCollapse(m, bubble, _btn) {
   const set = aiCollapsedSet();
   if (set.has(m.id)) set.delete(m.id); else set.add(m.id);
   localStorage.setItem("bl-collapsed-msgs", JSON.stringify([...set].slice(-500)));
-  if (set.has(m.id)) {
+  const collapsed = set.has(m.id);
+  if (collapsed) {
     applyAiCollapse(bubble, m);
   } else {
     bubble.innerHTML = md(m.body);
   }
-  if (btn) btn.textContent = set.has(m.id) ? "展开" : "收起";
+  // #9 单一状态源（v2.6.5）：状态只认持久化集合，切换后把这条消息的
+  // 全部收起/展开控件统一回写——旧版只改被点的那个按钮，从收缩条
+  // 展开后动作列按钮还停在「展开」（真机实锤）。展开态只许出现
+  // 「收起」、收起态只许出现「展开」，两处入口永远一致。
+  const row = bubble.closest(".msg-row");
+  if (row) {
+    row.querySelectorAll(".ai-collapse-btn").forEach((b) => {
+      b.textContent = collapsed ? "展开" : "收起";
+    });
+  }
 }
 
 /** 消息状态展示：失败时标红可点重试（文本原地重发；文件重发会生成新气泡并移除旧的）。 */
@@ -392,6 +415,30 @@ function applyStatus(el, mid, status) {
 
 // ---------- 引用 ----------
 const quoteCache = new Map();
+
+/** #11 统一消息摘要（v2.6.5）：凡是把一条消息压成一行展示的地方都
+ * 走这里——按消息类型生成人话摘要，内部载荷（图片组正文是 JSON
+ * 清单）一律不许原样上屏（v2.6.4 在置顶条/收藏/彩签弹层三处实锤）。
+ * max 是文本节选的字数上限。 */
+function msgSummary(m, max = 60) {
+  if (!m) return "";
+  if (m.kind === "imagegroup") {
+    // 清单体是对象 {v, items:[…]}（不是数组）：取 items 长度
+    let n = 0;
+    try {
+      const g = JSON.parse(m.body);
+      const arr = Array.isArray(g) ? g : (g && g.items);
+      n = arr ? arr.length : 0;
+    } catch (_) { n = 0; }
+    return n > 0 ? `图片组 · 共 ${n} 张` : "图片组";
+  }
+  if (m.kind === "file") {
+    return isImageExt(fileExt(m.body || "")) ? `图片 · ${m.body}` : `文件 · ${m.body}`;
+  }
+  const t = (m.body || "").replace(/\s+/g, " ").trim();
+  return t.length > max ? t.slice(0, max) + "…" : t;
+}
+
 async function fillQuote(el, m) {
   try {
     let orig = quoteCache.get(m.reply_to);
@@ -401,9 +448,7 @@ async function fillQuote(el, m) {
     }
     if (!orig) { el.textContent = "原消息已删除"; return; }
     const who = orig.sender === "me" ? "我" : orig.sender === "ai" ? "AI" : "对方";
-    el.textContent = orig.kind === "imagegroup"
-      ? `${who}：[图片组]`
-      : `${who}：${orig.body.slice(0, 80)}`;
+    el.textContent = `${who}：${msgSummary(orig, 80)}`;
   } catch (_) { el.textContent = "引用消息"; }
 }
 
@@ -467,8 +512,9 @@ async function refreshMessageCategory(mid, span) {
 
 function appendMessage(container, m, renderedSet, opts) {
   if (renderedSet.has(m.id)) return;
-  // 日期分隔
-  const rows = container.querySelectorAll(".msg-row");
+  // 日期分隔：基准行必须是真消息行——AI 等待行没有时间戳，拿它当基准
+  // 会算出假的「新的一天」、把分隔线插到等待气泡和问题之间（#3 实锤）。
+  const rows = [...container.querySelectorAll(".msg-row")].filter((r) => !r.dataset.waiting);
   const last = rows.length ? rows[rows.length - 1] : null;
   const lastTs = last ? Number(last.dataset.ts || 0) : 0;
   const newDay = !lastTs || fmtDay(lastTs) !== fmtDay(m.created_at);
@@ -487,11 +533,22 @@ function appendMessage(container, m, renderedSet, opts) {
   }
   container.appendChild(el);
   renderedSet.add(m.id);
-  // #5 等待占位锚定：@AI 的问题行落库渲染时，把等待行挪到问题行
-  // 正下方——等待行不落库、无 seq，旧版先挂末尾、问题行随后追加，
-  // 等待气泡反而跑到问题上方甚至越过日期分隔线。
-  if (container.id === "messages" && state.chatWaitRow && state.chatWaitRow.isConnected && m.sender === "me") {
-    el.after(state.chatWaitRow);
+  // #3 等待行锚定（v2.6.5 重做，聊天与 AI 页同机制）：等待/流式行创建
+  // 时问题可能还没落库渲染，只能先挂末尾；问题行一到，立刻把等待行
+  // 挪到问题行正下方——等待→流式→完成全生命周期不许跳位。旧版只给
+  // 聊天容器做了锚定且 AI 页全无，等待气泡永远停在问题上方、完成时
+  // 靠整页重渲染「弹回」正确位置（v2.6.4 真机实锤）。
+  const wr = state.aiWaitRows && state.aiWaitRows[container.id];
+  if (wr && wr.isConnected && m.sender === "me") {
+    // 锚点按消息 id 绑定（第三方评审采纳）：未绑定时第一条到达的
+    // 「我」的消息就是提问、绑定它；绑定后只有锚点消息本身到达才
+    // 挪行——等待期间用户再发普通消息，等待行不许被新消息「拐走」。
+    if (!wr.dataset.anchorId) {
+      wr.dataset.anchorId = m.id;
+      el.after(wr);
+    } else if (wr.dataset.anchorId === m.id) {
+      el.after(wr);
+    }
   }
   // 滚动定版：跟随开着才贴底；关着时 scrollTop 分毫不动。
   const fkey = container.id === "ai-messages" ? "ai" : "chat";
@@ -557,7 +614,12 @@ function syncOfflineUI() {
   const off = !state.connected;
   $("offline-band").classList.toggle("hidden", !off);
   document.querySelector("#composer .composer-row").classList.toggle("hidden", off);
-  $("btn-disconnect").disabled = off; // 导出是历史功能，离线照常可用
+  // #17 断开钮随连接状态走（v2.6.5）：未连接时根本不显示（旧版只是
+  // 禁用、还摆在顶栏——状态写着未连接却挂着「断开」，真机两度实锤）；
+  // 连接中/已连接/重连中才出现，可点断开/取消。
+  const showDisc = state.linkState && state.linkState !== "off";
+  $("btn-disconnect").classList.toggle("hidden", !showDisc);
+  $("btn-disconnect").disabled = false;
   syncPeerHead();
 }
 
@@ -884,7 +946,7 @@ function renderPinBar(pins, convId, bar) {
   bar.classList.remove("hidden");
   // 1 条：保持现行文案与点击直跳；≥2 条：文案提示可多选，点击先弹列表
   bar.innerHTML = mine.length === 1
-    ? `${iconUse("i-pin", "ico ico-14")}<span>置顶：${esc(mine[0].body.slice(0, 40))}</span>`
+    ? `${iconUse("i-pin", "ico ico-14")}<span>置顶：${esc(msgSummary(mine[0], 40))}</span>`
     : `${iconUse("i-pin", "ico ico-14")}<span>置顶消息 · 共 ${mine.length} 条（点击选择）</span>`;
   bar.onclick = () => {
     state.pins = mine;
@@ -938,7 +1000,7 @@ function openPinList() {
   for (const m of state.pins) {
     const item = document.createElement("div");
     item.className = "rl-item";
-    const main = m.kind === "file" ? `[文件] ${m.body}` : m.body;
+    const main = msgSummary(m, 80);
     item.innerHTML = `<div class="rl-note">${esc(main)}</div><div class="rl-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div>`;
     item.title = main;
     // 回跳复用 locateMessage：目标不在已加载首屏时它会整段加载兜底定位
@@ -969,7 +1031,7 @@ function setReply(m) {
   state.replyTo = m.id;
   const bar = $("reply-bar");
   bar.classList.remove("hidden");
-  bar.innerHTML = `<span>引用：${esc(m.body.slice(0, 50))}</span><button class="btn small-btn" id="reply-cancel">取消</button>`;
+  bar.innerHTML = `<span>引用：${esc(msgSummary(m, 50))}</span><button class="btn small-btn" id="reply-cancel">取消</button>`;
   $("reply-cancel").addEventListener("click", () => {
     state.replyTo = null;
     bar.classList.add("hidden");
@@ -1154,10 +1216,38 @@ function insertTextAtCursor(text) {
   ta.dispatchEvent(new Event("input", { bubbles: true }));
   autoGrow(ta);
 }
+/** #2 超大粘贴闸值：超过这个字数的内容不再进输入框（30 万行级粘贴
+ * 实测把主线程冻死几十秒）。分类只采样、转文件走后端落盘。 */
+const PASTE_FILE_THRESHOLD = 100000;
+
+/** #2 超大粘贴转文件：采样分类 → 后端落盘 → 进待发队列，全程不碰
+ * 输入框的全文布局。 */
+async function stageHugeTextAsFile(text) {
+  const det = detectDocument(text.slice(0, 20000));
+  const name = det ? det.name : "长文.txt";
+  try {
+    const path = await invoke("stage_text_document", { name, content: text });
+    const added = await stageFilePaths([path]);
+    if (!added) throw new Error("文件入队失败");
+    showToast(`粘贴内容过大（${text.length.toLocaleString()} 字），已转成文件「${name}」，点发送即可发出`);
+    return true;
+  } catch (err) {
+    showToast("内容过大，转文件失败：" + err);
+    return false;
+  }
+}
+
 $("input").addEventListener("paste", async (e) => {
   const cd = e.clipboardData;
   if (!cd) return;
   const text = cd.getData("text/plain") || "";
+  // #2 超大粘贴必须在插入输入框之前拦下：全文插入 + 布局测量就是
+  // 冻死源。超限直接转文件，交互保持响应。
+  if (text.length > PASTE_FILE_THRESHOLD) {
+    e.preventDefault();
+    await stageHugeTextAsFile(text);
+    return;
+  }
   const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   const pathListOnly = lines.length > 0
     && lines.every((l) => /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(l));
@@ -1183,8 +1273,25 @@ $("input").addEventListener("paste", async (e) => {
 
 async function sendCurrent() {
   const raw = $("input").value;
-  const text = raw.trim();
+  let text = raw.trim();
   if (!text && !state.pendingFiles.length) return;
+  // #2 发送侧同闸（v2.6.5）：不管内容是怎么进输入框的，超限一律先转
+  // 文件入队、再走文件队列发送——文字发送路径要全文分类、落库后还要
+  // 渲染成巨气泡，30 万行级两头都是冻死源。转文件后 text 清空，下方
+  // 文件队列流程接管。
+  if (raw.length > PASTE_FILE_THRESHOLD) {
+    // 转文件成功后才清输入框（第三方评审采纳）：先清后转一旦失败，
+    // 输入框与草稿都已清空、文件又没入队，内容会静默丢失。失败时
+    // 输入框原样保留，用户可改走选文件等方式重试。
+    const ok = await stageHugeTextAsFile(raw);
+    if (!ok) return;
+    $("input").value = ""; autoGrow($("input"));
+    docDismissed = false;
+    updateDocBar();
+    invoke("save_draft", { conversationId: state.peerConvId, text: "" }).catch(() => {});
+    text = "";
+    if (!state.pendingFiles.length) return;
+  }
   // 滚动定版：本人点发送 = 主动回到当前，立即贴底并恢复跟随
   state.follow.chat = true;
   // 待发文件队列先逐个发（文件气泡由后端事件回推，与选文件发送一致；
@@ -1236,12 +1343,12 @@ async function sendCurrent() {
     chatAiBusy = true;
     // ④ 发出即挂等待气泡：回答经事件回推落库前界面必须有动静，
     // 否则走对方转发时十几秒空白像卡死。路由决定等待文案。
-    const waitRow = appendChatAiWaiting(src === "peer" || (src === "default" && aiRouteIsPeer()));
+    const waitRow = appendChatAiWaiting(src === "peer" || (src === "default" && aiRouteIsPeer()), { bindNext: true });
     try {
       await invoke("chat_ask_ai", { conversationId: state.peerConvId, source: src, text, thinking: currentThinking() });
     } catch (e) {
       showToast("问AI 失败：" + e);
-    } finally { waitRow.remove(); state.chatWaitRow = null; chatAiBusy = false; }
+    } finally { waitRow.remove(); delete state.aiWaitRows["messages"]; chatAiBusy = false; }
     return;
   }
   if (docBarTimer) { clearTimeout(docBarTimer); docBarTimer = 0; updateDocBarNow(); }
@@ -1281,7 +1388,10 @@ $("input").addEventListener("input", () => {
   typingTimer = setTimeout(() => invoke("send_typing", { typing: false }).catch(() => {}), 1500);
   clearTimeout(draftTimer);
   draftTimer = setTimeout(() => {
-    if (state.peerConvId) invoke("save_draft", { conversationId: state.peerConvId, text: $("input").value }).catch(() => {});
+    // #2：超大内容不存草稿（每次输入都整篇搬运过 IPC 本身就是负担，
+    // 且超限内容发送时一律转文件、草稿恢复也没有意义）
+    if (!state.peerConvId || $("input").value.length > PASTE_FILE_THRESHOLD) return;
+    invoke("save_draft", { conversationId: state.peerConvId, text: $("input").value }).catch(() => {});
   }, 400);
 });
 
@@ -1303,7 +1413,12 @@ $("btn-file").addEventListener("click", async () => {
   finally { state.pickingFiles = false; }
 });
 
-$("btn-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
+$("btn-disconnect").addEventListener("click", async () => {
+  // 连接进行中点断开要连带作废连接令牌（评审补强）：只调 disconnect
+  // 时无会话可断、令牌不失效，进行中的尝试可能随后接管成已连接
+  await invoke("cancel_connect").catch(() => {});
+  await invoke("disconnect");
+});
 // 重连横幅的「停止重连」：走断开命令——无会话时后端同样会作废
 // 重连代号并清目标（见 services disconnect 的无会话分支）。
 $("reconnect-stop").addEventListener("click", async () => {
@@ -1544,7 +1659,12 @@ function renderBtDevices(devices) {
   // 「上次连接」自动连检查必须每次快照都跑（不许被下面的渲染节流跳过：
   // 目标已在列表里时，快照可能与上次完全相同）
   if (pendingRemembered) {
-    const hit = devices.find((d) => d.id === pendingRemembered.deviceId);
+    // #19 按名匹配优先（v2.6.5）：BLE 家族的设备 id 随重启/地址轮换
+    // 变化，存下的旧 id 永远命不中——旧版因此必须手动重扫、在新鲜
+    // 结果里点连接才行。命中以扫描快照里的新鲜 id 为准连接，并把
+    // 新 id 回存记录，下次优先按新 id 找。
+    const hit = devices.find((d) => d.id === pendingRemembered.deviceId)
+      || (pendingRemembered.name ? devices.find((d) => d.name === pendingRemembered.name) : null);
     if (hit) {
       const p = pendingRemembered;
       pendingRemembered = null;
@@ -1553,9 +1673,14 @@ function renderBtDevices(devices) {
       state.btDeviceName = hit.name;
       state.connectTransport = p.transport;
       $("last-peer-status").textContent = `已找到「${hit.name}」，正在连接…`;
-      invoke("bt_connect", { deviceId: p.deviceId, code: p.code, transport: p.transport, name: hit.name || "", rssi: hit.rssi ?? null })
-        .then(() => saveLastPeer({ transport: p.transport, deviceId: p.deviceId, code: p.code, name: hit.name }))
-        .catch((e) => { $("last-peer-status").textContent = ""; $("connect-error").textContent = String(e); });
+      state.linkState = "connecting";
+      syncOfflineUI();
+      invoke("bt_connect", { deviceId: hit.id, code: p.code, transport: p.transport, name: hit.name || "", rssi: hit.rssi ?? null })
+        .then(() => saveLastPeer({ transport: p.transport, deviceId: hit.id, code: p.code, name: hit.name }))
+        .catch((e) => {
+          if (!state.connected) { state.linkState = "off"; syncOfflineUI(); }
+          $("last-peer-status").textContent = ""; $("connect-error").textContent = String(e);
+        });
       if (scanning) { invoke("bt_stop_scan").catch(() => {}); scanning = false; setScanningUI(); }
     }
   }
@@ -1571,7 +1696,8 @@ function renderBtDevices(devices) {
   $("device-count").textContent = `${devices.length} 台`;
   for (const d of devices) {
     const isConnectedPeer = state.connected && state.peerName && d.name === state.peerName;
-    const isLastPeer = !isConnectedPeer && state.lastPeer && state.lastPeer.deviceId === d.id;
+    const isLastPeer = !isConnectedPeer && state.lastPeer
+      && (state.lastPeer.deviceId === d.id || (state.lastPeer.name && state.lastPeer.name === d.name));
     const row = document.createElement("div");
     row.className = "bt-device" + (state.btDevice === d.id ? " selected" : "");
     row.innerHTML = `<span class="bt-device-ico">${iconUse("i-bt", "ico ico-20")}</span>
@@ -1675,7 +1801,7 @@ $("last-peer-connect").addEventListener("click", async () => {
     syncTransportSeg();
     refreshBtState();
     $("last-peer-status").textContent = `正在查找「${p.name}」，找到后自动连接…`;
-    pendingRemembered = { deviceId: p.deviceId, code: p.code, transport: t };
+    pendingRemembered = { deviceId: p.deviceId, name: p.name || "", code: p.code, transport: t };
     clearTimeout(rememberedTimer);
     rememberedTimer = setTimeout(() => {
       if (pendingRemembered) {
@@ -1877,12 +2003,15 @@ function openCodeCard(d) {
   $("code-card-title").textContent = `连接到 ${d.name}`;
   setCodeError("");
   $("bt-code-card").classList.remove("hidden");
+  // #1：输码态标记——矮窗下右栏靠它再收起两处次要行才装得下整页
+  $("connect-view").classList.add("code-open");
   $("bt-peer-code").focus();
 }
 
 /** 关闭输码卡：回到本机设备卡，清除选中高亮与错误。 */
 function closeCodeCard() {
   $("bt-code-card").classList.add("hidden");
+  $("connect-view").classList.remove("code-open");
   if (!state.connected) $("my-card").classList.remove("hidden");
   state.btDevice = null;
   state.btDeviceName = null;
@@ -1947,6 +2076,8 @@ $("btn-bt-connect").addEventListener("click", async () => {
   state.connectTransport = t;
   const my = ++connectAttempt;
   setConnectingUI(true);
+  state.linkState = "connecting"; // #17：连接中顶栏出现断开（可取消）
+  syncOfflineUI();
   try {
     await invoke("bt_connect", { deviceId: state.btDevice, code, transport: t, name: state.btDeviceName || "", rssi: (lastDevices.find((d) => d.id === state.btDevice) || {}).rssi ?? null });
     if (my !== connectAttempt) return; // 已取消：迟到的成功由后端自行断开
@@ -1956,6 +2087,7 @@ $("btn-bt-connect").addEventListener("click", async () => {
     closeCodeCard();
   } catch (e) {
     if (my !== connectAttempt) return; // 取消引发的失败不弹错（卡片已关）
+    if (!state.connected) { state.linkState = "off"; syncOfflineUI(); }
     setConnectingUI(false);
     setCodeError(codeErrorText(e));
   }
@@ -1997,7 +2129,7 @@ async function openCategoryDrawer(color) {
     const m = it.message;
     const item = document.createElement("div");
     item.className = "list-item";
-    item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(it.note || m.body.slice(0, 80))}</div>`;
+    item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(it.note || msgSummary(m, 80))}</div>`;
     item.addEventListener("click", () => locateMessage(m.conversation_id, m.id, CAT_COLORS[color]));
     list.appendChild(item);
   }
@@ -2063,7 +2195,7 @@ async function loadFavList() {
   for (const m of msgs) {
     const item = document.createElement("div");
     item.className = "list-item";
-    item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(m.body.slice(0, 80))}</div>`;
+    item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(msgSummary(m, 80))}</div>`;
     item.addEventListener("click", () => locateMessage(m.conversation_id, m.id));
     list.appendChild(item);
   }
@@ -2317,9 +2449,9 @@ function showRibbonList(color, tab) {
   for (const it of [...items].reverse()) {
     const d = document.createElement("div");
     d.className = "rl-item";
-    d.innerHTML = `<div class="rl-note">${esc(it.note || it.message.body.slice(0, 60))}</div><div class="rl-sub">${fmtDay(it.message.created_at)} ${fmtTime(it.message.created_at)}${it.note ? " · " + esc(it.message.body.slice(0, 40)) : ""}</div>`;
-    // 条目只显示一行（CSS 省略号）；悬停条目时用提示显示完整备注（无备注则显示完整正文）——用户 2026-11-18 裁定
-    d.title = it.note || it.message.body;
+    d.innerHTML = `<div class="rl-note">${esc(it.note || msgSummary(it.message, 60))}</div><div class="rl-sub">${fmtDay(it.message.created_at)} ${fmtTime(it.message.created_at)}${it.note ? " · " + esc(msgSummary(it.message, 40)) : ""}</div>`;
+    // 条目只显示一行（CSS 省略号）；悬停条目时用提示显示完整备注（无备注则显示摘要——图片组等内部载荷不许全文上提示，#11）
+    d.title = it.note || msgSummary(it.message, 200);
     d.addEventListener("click", () => {
       box.classList.add("hidden");
       locateMessage(it.message.conversation_id, it.message.id, CAT_COLORS[color]);
@@ -2425,7 +2557,7 @@ $("search-input").addEventListener("input", () => {
     for (const m of msgs.slice(0, 50)) {
       const item = document.createElement("div");
       item.className = "list-item";
-      item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(m.body.slice(0, 80))}</div>`;
+      item.innerHTML = `<div class="li-sub">${fmtDay(m.created_at)} ${fmtTime(m.created_at)}</div><div>${esc(msgSummary(m, 80))}</div>`;
       item.addEventListener("click", () => locateMessage(m.conversation_id, m.id));
       box.appendChild(item);
     }
@@ -2695,7 +2827,10 @@ function showAiWaiting() {
   row.className = "msg-row";
   row.id = "ai-waiting-row";
   row.innerHTML = `<div class="msg"><div class="bubble ai-waiting"><span class="wait-dots"><i></i><i></i><i></i></span>${aiWaitingText(aiRouteIsPeer())}</div></div>`;
-  container.appendChild(row);
+  // #3：不再无条件挂末尾——问题行随后经事件到达时由 appendMessage
+  // 锚定到问题正下方；重新生成时问题已在列表里、placeAiWaitingRow
+  // 直接把它放到最后一条问题之后。
+  placeAiWaitingRow(container, row);
   container.scrollTop = container.scrollHeight;
   syncAiBottomBtn();
   state.streamEl = row.querySelector(".bubble");
@@ -2705,6 +2840,7 @@ function showAiWaiting() {
 function clearAiWaiting() {
   const r = $("ai-waiting-row");
   if (r) r.remove();
+  delete state.aiWaitRows["ai-messages"];
   if (state.streamWaiting) {
     state.streamEl = null;
     state.streamText = "";
@@ -2720,6 +2856,37 @@ function currentThinking() {
   // 开关的接口每次回答都会误报「已忽略该设置」（自测抓到后修）
   const el = $("ai-thinking");
   return el && el.checked ? true : null;
+}
+
+/** #5 自动命名标题（v2.6.5 定案）：首条用户消息截短——上限 10 字、
+ * 宁短勿长；优先在标点/空白处断开（断点须落在第 4 字之后，太靠前的
+ * 断点丢信息不如满额截断）；纯附件无文字返回 null（保留「新会话」）。 */
+function autoNameFromText(text) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  if (t.length <= 10) return t;
+  const head = t.slice(0, 10);
+  const marks = ["，", "。", "、", "；", "：", "！", "？", ",", ".", " ", "…", "—"];
+  let cut = -1;
+  for (const mk of marks) cut = Math.max(cut, head.lastIndexOf(mk));
+  return cut >= 4 ? head.slice(0, cut) : head;
+}
+
+/** #5 自动命名：只对仍叫「新会话」的会话命名一次（命名后标题不再是
+ * 「新会话」，天然只发生一次）；用户手改过的标题永不覆盖；「AI 助手」
+ * （ai-default）不参与。失败静默——命名是锦上添花，不打扰提问。 */
+async function maybeAutoNameAiConversation(text) {
+  const cid = state.aiConvId;
+  if (!cid || cid === "ai-default") return;
+  const name = autoNameFromText(text);
+  if (!name) return;
+  try {
+    const convs = await invoke("list_conversations");
+    const conv = (convs || []).find((c) => c.id === cid && c.kind === "ai");
+    if (!conv || conv.title !== "新会话") return;
+    await invoke("rename_ai_conversation", { conversationId: cid, title: name });
+    loadAiConversations();
+  } catch (_) { /* 静默 */ }
 }
 
 async function sendAi() {
@@ -2744,6 +2911,8 @@ async function sendAi() {
       clearAskRef();
     } else {
       await invoke("ai_send", { text, thinking: currentThinking(), conversationId: state.aiConvId });
+      // #5：首条消息发出后给「新会话」自动命名（截短规则见上）
+      maybeAutoNameAiConversation(text);
     }
   } catch (e) {
     showToast("AI 提问失败：" + e);
@@ -2821,18 +2990,56 @@ function aiRouteName(key) {
   return "默认AI";
 }
 
-// 在聊天列表末尾挂一行 AI 等待气泡，返回该行元素（用完 remove）。
+// #3 等待行落位（双容器共用）：问题已在列表里（重新生成）时直接插到
+// 最后一条「我」的消息之后；问题还没落库渲染（新提问）时先挂末尾，
+// 登记后由 appendMessage 在问题行到达时锚定到其正下方。等待行打
+// data-waiting 标记：日期分隔/分组计算必须跳过它（它没有时间戳）。
+function placeAiWaitingRow(container, row, opts = {}) {
+  row.dataset.waiting = "1";
+  const rows = [...container.querySelectorAll(".msg-row")].filter((r) => !r.dataset.waiting);
+  if (opts.beforeMid) {
+    // 重新生成：等待行就插在旧回答之前（即问题之后），锚点绑问题 id
+    const arow = rows.find((r) => r.dataset.mid === opts.beforeMid);
+    if (arow) {
+      arow.before(row);
+      const prevMe = [...rows.slice(0, rows.indexOf(arow))].reverse()
+        .find((r) => r.dataset.sender === "me");
+      row.dataset.anchorId = prevMe ? (prevMe.dataset.mid || "") : "";
+      state.aiWaitRows[container.id] = row;
+      return row;
+    }
+  }
+  if (opts.bindNext) {
+    // 新提问（聊天 @AI）：问题还没落库，先挂末尾、不绑旧消息；
+    // appendMessage 会把锚点绑到随后到达的提问本身
+    container.appendChild(row);
+    row.dataset.anchorId = "";
+    state.aiWaitRows[container.id] = row;
+    return row;
+  }
+  const lastMe = [...rows].reverse().find((r) => r.dataset.sender === "me");
+  if (lastMe) {
+    lastMe.after(row);
+    // AI 页重新生成/等待：锚点当场绑这条问题（按 id）。AI 页生成期间
+    // 发送被 aiGenerating 锁住，不会有别的「我」的消息来抢锚。
+    row.dataset.anchorId = lastMe.dataset.mid || "";
+  } else {
+    container.appendChild(row);
+    row.dataset.anchorId = "";
+  }
+  state.aiWaitRows[container.id] = row;
+  return row;
+}
+
+// 在聊天列表挂一行 AI 等待气泡，返回该行元素（用完 remove）。
 // 聊天 @AI 与聊天重新生成共用（④）。
-function appendChatAiWaiting(peer) {
+function appendChatAiWaiting(peer, opts = {}) {
   const row = document.createElement("div");
   row.className = "msg-row";
   row.dataset.sender = "ai";
   row.innerHTML = `<div class="msg"><div class="bubble ai-waiting"><span class="wait-dots"><i></i><i></i><i></i></span>${aiWaitingText(peer)}</div></div>`;
   const c = $("messages");
-  c.appendChild(row);
-  // #5：登记等待行——问题行随后落库渲染时 appendMessage 会把它
-  // 锚定到问题行正下方（见 appendMessage 的锚定逻辑）。
-  state.chatWaitRow = row;
+  placeAiWaitingRow(c, row, opts);
   if (state.follow.chat) c.scrollTop = c.scrollHeight;
   return row;
 }
@@ -2843,7 +3050,7 @@ function appendChatAiWaiting(peer) {
 async function chatRegenerateAi(m) {
   if (chatAiBusy) { showToast("AI 正在回答上一个问题，请稍候"); return; }
   chatAiBusy = true;
-  const waitRow = appendChatAiWaiting(aiRouteIsPeer());
+  const waitRow = appendChatAiWaiting(aiRouteIsPeer(), { beforeMid: m.id });
   try {
     await invoke("chat_regenerate_ai", { messageId: m.id, thinking: currentThinking() });
     if (state.peerConvId) await loadChatMessages();
@@ -2851,7 +3058,7 @@ async function chatRegenerateAi(m) {
     showToast("重新生成失败：" + e);
   } finally {
     waitRow.remove();
-    state.chatWaitRow = null;
+    delete state.aiWaitRows["messages"];
     chatAiBusy = false;
   }
 }
@@ -3225,19 +3432,50 @@ $("btn-clean-cache").addEventListener("click", async () => {
     freed > 0 ? `已清理缓存，释放 ${fmtSize(freed)}` : "没有可清理的缓存";
   loadStorageStats();
 });
-$("btn-clear-history").addEventListener("click", async () => {
-  const ok = await showConfirm(
-    "确定要清空全部聊天记录吗？消息、彩签归属、收藏与置顶都会一并清除，此操作不可恢复。",
-    "清空"
-  );
-  if (!ok) return;
-  await invoke("clear_chat_history");
-  $("store-result").textContent = "聊天记录已清空";
-  state.renderedChat.clear();
-  $("messages").innerHTML = "";
-  refreshRibbon();
-  loadStorageStats();
-  showToast("聊天记录已清空");
+// #14 清空聊天记录可选范围（v2.6.5）：先选范围（近 24 小时/近 7 天/
+// 近 30 天/全部），再二次确认；后端只删范围内的消息及其彩签/收藏/
+// 置顶标记，范围外一条不动；磁盘上的文件本体不删（与旧全清口径一致）。
+const CLEAR_RANGES = {
+  "24h": "近 24 小时",
+  "7d": "近 7 天",
+  "30d": "近 30 天",
+  "all": "全部时间",
+};
+$("btn-clear-history").addEventListener("click", () => {
+  // 流式进行中不许清（第三方评审采纳）：清完重拉会把正在写的流式
+  // 气泡从文档上摘掉，后续分片写进脱离文档的节点、状态错乱
+  if (state.aiGenerating || chatAiBusy || state.streamEl) {
+    showToast("AI 正在回复中，请等回复完成后再清空");
+    return;
+  }
+  $("clear-modal").classList.remove("hidden");
+});
+$("clear-cancel").addEventListener("click", () => $("clear-modal").classList.add("hidden"));
+$("clear-modal").addEventListener("click", (e) => {
+  if (e.target === $("clear-modal")) $("clear-modal").classList.add("hidden");
+});
+document.querySelectorAll("#clear-modal .clear-range").forEach((b) => {
+  b.addEventListener("click", async () => {
+    const range = b.dataset.range;
+    $("clear-modal").classList.add("hidden");
+    const ok = await showConfirm(
+      `确定要清空${CLEAR_RANGES[range]}的聊天记录吗？范围内的消息、彩签归属、收藏与置顶都会一并清除，范围外的记录不受影响，此操作不可恢复。`,
+      "清空"
+    );
+    if (!ok) return;
+    try {
+      const n = await invoke("clear_chat_history", { range });
+      $("store-result").textContent = `已清空 ${n} 条聊天记录（${CLEAR_RANGES[range]}）`;
+      // 列表按当前会话重新拉取（范围清理后旧渲染集必然过期）
+      state.renderedChat.clear();
+      state.renderedAi.clear();
+      if (state.peerConvId) await loadChatMessages();
+      await loadAiMessages();
+      refreshRibbon();
+      loadStorageStats();
+      showToast(`已清空 ${n} 条聊天记录`);
+    } catch (e) { showToast("清空失败：" + e); }
+  });
 });
 
 // ---------- 导出 ----------
@@ -3248,7 +3486,9 @@ async function exportCurrentConv() {
   const lines = ["# BlueLink 聊天记录", "", `导出时间：${new Date().toLocaleString("zh-CN")}`, ""];
   for (const m of msgs) {
     const who = m.sender === "me" ? "我" : "对方";
-    lines.push(`- [${fmtDay(m.created_at)} ${fmtTime(m.created_at)}] ${who}：${m.body}`);
+    // #11：导出同样按类型写——图片组清单 JSON 不许原样进导出文件
+    const body = m.kind === "text" ? m.body : msgSummary(m, 200);
+    lines.push(`- [${fmtDay(m.created_at)} ${fmtTime(m.created_at)}] ${who}：${body}`);
   }
   const path = await window.__TAURI__.dialog.save({ defaultPath: "bluelink-chat.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
   if (!path) return;
@@ -3300,13 +3540,44 @@ $("palette-input").addEventListener("keydown", (e) => {
 $("palette").addEventListener("click", (e) => { if (e.target === $("palette")) closePalette(); });
 document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
+  // #16 Ctrl+A 作用域（v2.6.5）：只作用于焦点/选区所在的内容区，绝不
+  // 跨区把整个界面选蓝。输入框走原生全选（不拦）；光标在某个消息
+  // 气泡/查看器文本里 → 只选那个区；其余位置（框架区）直接拦下。
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === "TEXTAREA" || ae.tagName === "INPUT" || ae.tagName === "SELECT" || ae.isContentEditable)) return;
+    const sel = window.getSelection();
+    // 锚点节点可能是文本节点（取父元素）也可能是元素本身（直接用）
+    const anchorNode = sel && sel.anchorNode ? sel.anchorNode : null;
+    const anchor = anchorNode
+      ? (anchorNode.nodeType === 3 ? anchorNode.parentElement : anchorNode)
+      : null;
+    const zone = anchor && anchor.closest ? anchor.closest(".bubble, #viewer-lines") : null;
+    e.preventDefault();
+    if (zone) {
+      const range = document.createRange();
+      range.selectNodeContents(zone);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  }
 });
 
 // ---------- 后端事件 ----------
+// #20 「对方正在输入」自灭计时与统一清除口（断开/超时/对端停输共用）
+let peerTypingTimer = null;
+function clearPeerTyping() {
+  clearTimeout(peerTypingTimer);
+  peerTypingTimer = null;
+  const hint = $("typing-hint");
+  if (hint) hint.classList.add("hidden");
+}
 async function wireEvents() {
   await listen("bt_devices", (e) => renderBtDevices(e.payload || []));
   await listen("connection_state", async (e) => {
+    const wasConnected = state.connected;
     state.connected = e.payload.connected;
+    if (state.connected) state.linkState = "on";
     $("nav-logo").classList.toggle("linked", state.connected);
     if (!state.connected) ringClearAll();
     state.peerName = e.payload.peer_name;
@@ -3321,6 +3592,7 @@ async function wireEvents() {
       $("connected-card").classList.remove("hidden");
       $("my-card").classList.add("hidden");
       $("bt-code-card").classList.add("hidden");
+      $("connect-view").classList.remove("code-open");
     } else {
       state.connectTransport = null;
       $("connected-card").classList.add("hidden");
@@ -3343,9 +3615,22 @@ async function wireEvents() {
       if (state.view === "connect" || state.view === "chat") { switchView("chat"); loadChatMessages(); }
       syncOfflineUI();
     } else {
-      // ㉛ 断开不再把人踢出聊天页：历史留原地，只切提示带与状态
+      // 入口定版·断开落点修订（2026-11-22 用户拍板，覆盖旧
+      // 「断开不踢出聊天页」）：连接中途断开默认落连接页；断开同时
+      // 作废「切回恢复」资格（chatDetailOpen 清零）——离线看会话的
+      // 唯一路径恢复为手动展开会话列表点选。自动重连横幅本就浮在
+      // 窗口顶层、随之落在连接页上；重连成功仍走上面连接分支自动
+      // 落对端会话。#20：「对方正在输入」与连接硬绑定，断开立即清。
+      state.linkState = "off";
+      clearPeerTyping();
       loadLastPeer();
       syncOfflineUI();
+      // 落点只在「真掉线沿」执行一次：重复的未连接事件（重连停止等）
+      // 不许把用户正离线翻看的会话详情再次抢走。
+      if (wasConnected) {
+        state.chatDetailOpen = false;
+        if (state.view === "chat") switchView("connect");
+      }
     }
     updateAiState();
   });
@@ -3398,8 +3683,17 @@ async function wireEvents() {
     if (!apply()) setTimeout(apply, 400);
   });
   await listen("peer_typing", (e) => {
-    $("typing-hint").classList.toggle("hidden", !e.payload);
-    if (e.payload) ringPulse("peer");
+    // #20 双保险（v2.6.5）：提示只在已连接时显示；每次亮起都重置
+    // 4 秒自灭计时——对端输到一半断线/停手而「停止输入」事件没到时
+    // 也不会永远挂着。断开连接时由 connection_state 直接清（硬绑定）。
+    if (e.payload && state.connected) {
+      $("typing-hint").classList.remove("hidden");
+      ringPulse("peer");
+      clearTimeout(peerTypingTimer);
+      peerTypingTimer = setTimeout(clearPeerTyping, 4000);
+    } else {
+      clearPeerTyping();
+    }
   });
   await listen("clipboard_state", (e) => {
     const v = e.payload || {};
@@ -3410,12 +3704,16 @@ async function wireEvents() {
     const v = e.payload || {};
     const banner = $("reconnect-banner");
     if (v.state === "trying") {
+      state.linkState = "reconnecting"; // #17：重连中顶栏断开钮保留（可取消）
+      syncOfflineUI();
       banner.classList.remove("hidden");
       $("reconnect-text").textContent = `与 ${v.peer_name || "对方"} 的连接中断，正在自动重连（第 ${v.attempt || 1} 次）…`;
     } else if (v.state === "connected") {
       banner.classList.add("hidden");
       showToast(`已自动重连到 ${v.peer_name || "对方"}`);
     } else if (v.state === "gave_up") {
+      state.linkState = "off";
+      syncOfflineUI();
       banner.classList.add("hidden");
       showToast(`自动重连失败：未能恢复与 ${v.peer_name || "对方"} 的连接，请手动重连`);
     }
@@ -3558,11 +3856,14 @@ async function wireEvents() {
   });
   await listen("ai_chunk", (e) => {
     const container = $("ai-messages");
+    // #3：只渲染当前打开会话的流——其他会话（问AI 落 ai-default 等）
+    // 的片混进当前列表会让气泡出现在错位置。
+    if (e.payload.conversation_id && e.payload.conversation_id !== state.aiConvId) return;
     if (!state.streamEl) {
       const row = document.createElement("div");
       row.className = "msg-row";
       row.innerHTML = `<div class="msg"><div class="bubble"></div></div>`;
-      container.appendChild(row);
+      placeAiWaitingRow(container, row);
       state.streamEl = row.querySelector(".bubble");
       state.streamText = "";
     }
@@ -3596,21 +3897,30 @@ async function wireEvents() {
 }
 
 // ---------- 主题 ----------
-function applyTheme(mode) {
-  if (mode === "system") document.documentElement.removeAttribute("data-theme");
-  else document.documentElement.setAttribute("data-theme", mode);
+async function applyTheme(mode) {
   document.querySelectorAll("#theme-seg button").forEach((b) =>
     b.classList.toggle("active", b.dataset.themeSet === mode));
-  syncWindowTheme(mode);
+  // #10 时序（v2.6.5）：先等原生标题栏变色落地，再翻内容主题。旧版
+  // 内容同步翻色、标题栏走异步 IPC 慢一拍，切换瞬间上下两段色
+  // （v2.6.4 #10 实锤）。IPC 是本地毫秒级调用，等它回来再翻内容，
+  // 两者落在同一帧附近、时差不可感知；加 120ms 兜底防非 Tauri
+  // 环境里 invoke 悬挂拖住内容翻色。
+  await syncWindowTheme(mode);
+  if (mode === "system") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", mode);
 }
 // 原生窗口标题栏跟随主题（深色时不再是一条白杠）：走后端命令
 // set_window_theme（Window::set_theme）。失败静默，不阻塞主题切换；
-// 非 Tauri 环境（纯浏览器打开页面）直接跳过。
+// 非 Tauri 环境（纯浏览器打开页面）直接跳过。返回可等待的 Promise。
 function syncWindowTheme(mode) {
   try {
     const p = invoke("set_window_theme", { theme: mode });
-    if (p && p.catch) p.catch(() => {});
+    if (p && p.catch) {
+      p.catch(() => {});
+      return Promise.race([p, new Promise((r) => setTimeout(r, 120))]);
+    }
   } catch (_) { /* 忽略 */ }
+  return Promise.resolve();
 }
 // 「跟随系统」时系统深浅翻转 → 再同步一次标题栏
 try {
@@ -3639,12 +3949,22 @@ let updAbandoned = false;
 function updSetStatus(text) { $("update-status").textContent = text; }
 function friendlyUpdError(e) {
   const s = String((e && e.message) || e || "");
-  // ① 取不到 release JSON 的插件原文（Could not fetch a valid release
-  // JSON…）：当前正式版没有附 latest.json 时必现，不是故障——映射成
-  // 人话，原文由调用方记进运行日志备查。
-  if (/valid release JSON|release JSON/i.test(s)) return "暂时无法获取更新信息：可能尚无带更新文件的正式版发布，或网络不通，请稍后再试";
-  if (/404|not found/i.test(s)) return "暂无可用的更新信息";
-  if (/network|error sending request|dns|connect|timed out/i.test(s)) return "网络不可用";
+  // #15 按情况拆分（v2.6.5，用户拍板：不同情况给不同提示，不许再用
+  // 一句「或」把两种原因糊在一起）。判定顺序：签名/校验 → 无更新
+  // 文件 → 网络。原文由调用方记进运行日志备查。
+  // ③ 签名/内容校验失败：更新文件下到了但验不过——单独说清。
+  if (/signature|verify|invalid.*(sig|content)|checksum/i.test(s)) {
+    return "更新文件校验没有通过，已取消更新。请稍后再试；如果反复出现，请反馈这个问题。";
+  }
+  // ② 服务器通了但没有更新文件：当前正式版发布时还没有附带更新
+  // 文件（latest.json），检查更新暂时用不了——不是你的网络问题。
+  if (/valid release JSON|release JSON|404|not found/i.test(s)) {
+    return "当前正式版还没有包含更新文件，暂时无法通过应用内更新。等下一个正式版发布后即可使用。";
+  }
+  // ① 连不上服务器：只说网络。
+  if (/network|error sending request|dns|connect|timed out|timeout|unreachable|offline/i.test(s)) {
+    return "连不上更新服务器，请检查网络后重试。";
+  }
   return s.slice(0, 80) || "未知错误";
 }
 
@@ -3762,7 +4082,12 @@ $("update-action").addEventListener("click", async () => {
 
 // ---------- 启动 ----------
 (async function init() {
-  applyTheme(localStorage.getItem("bl-theme") || "system");
+  // 启动预置（#10 评审补强）：显式主题先同步写下属性再走 applyTheme
+  // 的窗口同步流程，避免深色偏好下首屏先亮一下浅色（窗口标题栏的
+  // 同步在 applyTheme 里紧随其后、启动有闪屏页遮挡，不可感知）
+  const bootTheme = localStorage.getItem("bl-theme") || "system";
+  if (bootTheme !== "system") document.documentElement.setAttribute("data-theme", bootTheme);
+  applyTheme(bootTheme);
   // 版本号以应用包内版本为准（tauri.conf.json），不在页面里写死，避免与安装包版本脱节
   if (window.__TAURI__.app && window.__TAURI__.app.getVersion) {
     window.__TAURI__.app.getVersion().then((v) => { $("set-version").textContent = v; }).catch(() => {});
@@ -3884,7 +4209,7 @@ function buildGroupBubble(bubble, m, row) {
         <img class="gstack-img hidden" alt="" draggable="false">
         <div class="gstack-ph">${iconUse("i-file", "ico ico-28")}<span class="gstack-ph-name"></span></div>
       </div>
-      <span class="gstack-count">共 ${items.length} 张</span>
+      <span class="gstack-count" title="共 ${items.length} 张">${items.length} 张</span>
       <button class="gstack-nav prev" title="上一张">‹</button>
       <button class="gstack-nav next" title="下一张">›</button>
     </div>
@@ -3894,6 +4219,24 @@ function buildGroupBubble(bubble, m, row) {
     <button class="transfer-retry hidden">重试</button>`;
   state.lastFileBubble = bubble;
   bubble._gidx = 0;
+  if (items.length < 2) {
+    bubble.querySelectorAll(".gstack-nav").forEach((b) => b.classList.add("hidden"));
+  }
+  // #6 封面定尺寸（v2.6.5 重做）：监听在建气泡时就绑好（先于任何 src
+  // 赋值），且每次 showCard 后若图已在缓存里（complete）立即按自然
+  // 尺寸定高——旧版把监听绑在首次 showCard 设完 src 之后、且只靠
+  // load 事件，缓存图/竞态下尺寸永远停在默认 240×180，容器高度与
+  // 封面实际渲染对不上、气泡下方留死空白（v2.6.4 #6 实锤）。
+  const coverImg = bubble.querySelector(".gstack-img");
+  const applyStackSize = () => {
+    const stack = bubble.querySelector(".gstack");
+    if (!stack || !coverImg.naturalWidth) return;
+    const nw = coverImg.naturalWidth, nh = coverImg.naturalHeight;
+    const scale = Math.min(320 / nw, 320 / nh, 1);
+    stack.style.width = Math.max(96, Math.round(nw * scale)) + "px";
+    stack.style.height = Math.max(72, Math.round(nh * scale)) + "px";
+  };
+  coverImg.addEventListener("load", applyStackSize);
   const showCard = async () => {
     const files = await groupFilesOf(m.id);
     if (!items.length) return;
@@ -3917,7 +4260,9 @@ function buildGroupBubble(bubble, m, row) {
     }
     const i = Math.max(0, Math.min(bubble._gidx, items.length - 1));
     bubble._gidx = i;
-    // 页码指示已移入图片查看器（vi-count），气泡面不再挂第二个徽标（⑰）
+    // #7 计数胶囊跟随当前位置（第几张/共几张，title 写全「共 N 张」）
+    const countEl = bubble.querySelector(".gstack-count");
+    if (countEl) countEl.textContent = `${i + 1}/${items.length}`;
     const img = bubble.querySelector(".gstack-img");
     const ph = bubble.querySelector(".gstack-ph");
     const f = files[i];
@@ -3926,18 +4271,8 @@ function buildGroupBubble(bubble, m, row) {
         img.src = await assetUrl(f.path);
         img.classList.remove("hidden");
         ph.classList.add("hidden");
-        // #1 封面定尺寸：按封面图宽高比（最大 320），与单图同口径
-        if (!img._ratioBound) {
-          img._ratioBound = true;
-          img.addEventListener("load", () => {
-            const nw = img.naturalWidth || 4, nh = img.naturalHeight || 3;
-            const scale = Math.min(320 / nw, 320 / nh, 1);
-            if (stack) {
-              stack.style.width = Math.max(96, Math.round(nw * scale)) + "px";
-              stack.style.height = Math.max(72, Math.round(nh * scale)) + "px";
-            }
-          });
-        }
+        // 缓存图可能不再触发 load：已 complete 就立即按自然尺寸定高
+        if (img.complete && img.naturalWidth) applyStackSize();
         return;
       } catch (_) { /* 落到占位 */ }
     }
@@ -4132,14 +4467,19 @@ async function attachImagePhoto(bubble, messageId) {
   bubble._imgWrap = wrap;
   wrap.querySelector(".img-fail-name").textContent = info.name || "";
   const img = wrap.querySelector(".img-photo");
-  img.addEventListener("load", () => {
+  const applyImgSize = () => {
     const nw = img.naturalWidth || 4, nh = img.naturalHeight || 3;
     const scale = Math.min(320 / nw, 320 / nh, 1);
     wrap.style.width = Math.max(72, Math.round(nw * scale)) + "px";
     wrap.style.height = Math.max(54, Math.round(nh * scale)) + "px";
-  });
+  };
+  img.addEventListener("load", applyImgSize);
   img.addEventListener("error", () => { wrap.classList.add("img-broken"); });
-  try { img.src = await assetUrl(info.path); } catch (_) { /* 保持占位 */ }
+  try {
+    img.src = await assetUrl(info.path);
+    // #6：缓存图已 complete 时 load 可能不再来，立即定尺寸防高度错位
+    if (img.complete && img.naturalWidth) applyImgSize();
+  } catch (_) { /* 保持占位 */ }
 }
 
 /** 旧名兼容：传输完成事件仍以 attachImagePreview 名义补挂图片。 */

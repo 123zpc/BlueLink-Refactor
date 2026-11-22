@@ -682,27 +682,45 @@ section { display: flex; flex-direction: column; height: 100%; }
   .connect-head { margin-bottom: 4px; }
   .connect-head h1 { font-size: 18px; }
   .capsule { padding: 4px 12px; }
-  .connect-side { gap: 6px; }
-  /* 步骤卡在矮窗下允许微缩（吃掉舍入级溢出），避免 1–2px 溢出就出滚动条 */
-  .steps-card { flex: 1 1 auto; min-height: 0; }
-  .side-card { padding: 8px 14px; }
+  .connect-side { gap: 4px; }
+  /* 步骤卡不许被压缩（#1 硬线）：只许吃剩余高度长高，绝不缩——旧版
+     flex:1 1 auto 在卡片总高超限时先把步骤卡压扁而不是让右栏滚动，
+     是「步骤卡被挤压」的成因之一。右栏真超高时由其自身滚动兜底。 */
+  .steps-card { flex: 1 0 auto; min-height: 0; }
+  .side-card { padding: 6px 14px; }
+  .step-num { width: 20px; height: 20px; font-size: 11.5px; }
   .side-card-title { margin-bottom: 4px; }
   .side-name { font-size: 15px; line-height: 1.2; }
-  .my-code-big { font-size: 22px; letter-spacing: 2px; line-height: 1.1; }
+  .my-code-big { font-size: 20px; letter-spacing: 2px; line-height: 1.1; }
   .card-btns { margin-top: 6px; }
   .side-divider { margin: 5px 0; }
-  .status-line { line-height: 1.35; padding: 0; }
+  .status-line { line-height: 1.3; padding: 0; }
   .status-note { margin: 1px 0 2px 16px; }
-  .steps-list, #steps-guide { gap: 5px; line-height: 1.35; }
+  .steps-list, #steps-guide { gap: 4px; line-height: 1.3; }
   .step-title { margin-bottom: 1px; }
   .step-row { font-size: 13px; }
   .steps-foot .side-divider { margin-bottom: 6px; }
-  #bt-peer-code { padding: 6px 12px; }
+  #bt-peer-code { padding: 5px 12px; }
+  /* #1 输码态二次收紧（v2.6.5 实测补强）：输码卡打开时右栏同屏卡片
+     最多（输码+本机+上次连接+状态+步骤），MiniBrowser 同引擎 560px
+     视口实测仍溢出约 90px。输码期间暂时收起两处次要行——本机卡的
+     说明行、上次连接卡的按钮行（关掉输码卡即恢复），其余靠密度
+     细压；浏览态不受影响。 */
+  #connect-view.code-open #my-card p.muted { display: none; }
+  #connect-view.code-open #last-peer .card-btns { display: none; }
+  #connect-view.code-open .my-code-big { font-size: 18px; }
   .device-panel { padding: 12px 16px; }
   .device-panel-head { margin-bottom: 8px; }
   .bt-device, .bt-skeleton { padding: 9px 12px; margin-bottom: 8px; }
   .bt-device-ico, .skel-ico { width: 34px; height: 34px; }
   .panel-foot { padding-top: 8px; }
+  /* 高空状态收紧（#1）：没有发现设备的大空状态是连接页的默认高个子
+     形态——图标与留白压一档，左栏在 600px 高下不溢出 */
+  #bt-empty-state { padding: 10px 0; gap: 6px; }
+  #bt-empty-state .empty-ico { width: 46px; height: 46px; border-radius: 12px; }
+  #bt-empty-state .empty-ico .ico { width: 24px; height: 24px; }
+  #bt-empty-state .empty-title { font-size: 14.5px; }
+  #bt-empty-state .btn { margin-top: 4px; }
 }
 
 /* ---------- 待发队列：图片组合并开关行（v2.6.0） ---------- */
@@ -732,6 +750,7 @@ section { display: flex; flex-direction: column; height: 100%; }
   color: #fff; font-size: 10px; line-height: 1.5; padding: 0 7px; border-radius: 999px;
   backdrop-filter: blur(2px); }
 .gstack-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 26px; height: 40px;
+  z-index: 3; }
   border: none; border-radius: 6px; background: rgba(15, 15, 16, 0.55); color: #fff;
   font-size: 18px; line-height: 1; cursor: pointer; opacity: 0; transition: opacity 0.12s; }
 .gstack:hover .gstack-nav { opacity: 1; }
@@ -855,11 +874,21 @@ section { display: flex; flex-direction: column; height: 100%; }
 #ai-conv-bar { display: flex; align-items: center; gap: 8px; padding: 8px 24px;
   border-bottom: 1px solid var(--border); background: var(--panel); }
 #ai-conv-list { display: flex; gap: 6px; overflow-x: auto; flex: 1; scrollbar-width: thin; }
-.ai-conv-chip { flex: none; max-width: 180px; padding: 4px 12px; border-radius: 999px;
+/* #5 会话条美化（v2.6.5）：胶囊从素面细边改成有层次的药丸——未选是
+   浅底+中性字，悬停微抬，选中用强调色实底白字（远看一眼能认出当前
+   会话），带小圆点标记；圆角与字阶与全应用胶囊口径一致。 */
+.ai-conv-chip { flex: none; max-width: 180px; padding: 5px 13px 5px 11px; border-radius: 999px;
   border: 1px solid var(--border); background: var(--panel-2); color: var(--text-2);
-  font-size: 12.5px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ai-conv-chip:hover { color: var(--text); }
-.ai-conv-chip.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft, var(--panel-2)); font-weight: 600; }
+  font-size: 12.5px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: inline-flex; align-items: center; gap: 7px;
+  transition: background-color 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s; }
+.ai-conv-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--border-strong); flex: none; }
+.ai-conv-chip:hover { color: var(--text); border-color: var(--border-strong);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08); }
+.ai-conv-chip.active { border-color: var(--accent); color: #fff; background: var(--accent);
+  font-weight: 600; box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35); }
+.ai-conv-chip.active::before { background: #fff; }
 .ai-conv-chip input { width: 130px; font: inherit; color: var(--text); background: var(--panel);
   border: 1px solid var(--accent); border-radius: 4px; padding: 1px 4px; }
 #btn-ai-new-conv { flex: none; }
@@ -929,7 +958,12 @@ section { display: flex; flex-direction: column; height: 100%; }
    缩略图，向右上错开约 10px 并带 -2.5°/-5° 轻微旋转（卡牌叠放感）；
    「共 N 张」深色半透明胶囊浮封面右下角；进度贴下沿细条呈现。 */
 .msg-row .bubble.group-card { background: transparent; border-color: transparent;
-  padding: 0; min-width: 0; box-shadow: none; position: relative; }
+  padding: 0; min-width: 0; box-shadow: none; position: relative;
+  /* #6 真因（v2.6.5 rig 二分定位）：.bubble 的 white-space:pre-wrap 会把
+     buildGroupBubble 模板里元素之间的换行空白文本节点渲染成空行（约
+     5 行 ≈110px），堆在封面下方形成死空白——与图片尺寸无关。图组气泡
+     不需要保留空白，改回 normal 后模板空白不再成行，高度即贴合封面。 */
+  white-space: normal; }
 .gstack { width: 240px; height: 180px; margin: 22px 24px 2px 2px; z-index: 0; }
 .gstack-card { position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: cover; border-radius: 18px; border: 1px solid var(--border);
@@ -990,13 +1024,28 @@ section { display: flex; flex-direction: column; height: 100%; }
   background: var(--warn); animation: rbPulse 1.1s ease-in-out infinite; flex: none; }
 @keyframes rbPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
-/* #12 连接步骤卡响应式：窄宽（≤1080px）时连接页改单列纵排，步骤卡
-   占满整行不再被挤在 320px 侧栏里；列内滚动兜底（老规矩：滚动条
-   只是自适应兜底）。宽屏布局不变。 */
-@media (max-width: 1080px) {
-  .connect-cols { display: flex; flex-direction: column; overflow-y: auto; padding-right: 2px; }
-  .device-panel { flex: none; max-height: 42vh; }
-  .connect-side { flex: none; overflow: visible; }
-  .steps-card { flex: none; }
-  .steps-list { gap: 8px; }
-}
+/* #12 连接步骤卡响应式（v2.6.2 旧块已撤销，v2.6.5 #1 定版）：旧版
+   ≤1080px 单列纵排让 900×600 默认窗（最小/默认尺寸）落进单列 + 整页
+   滚动，正是 v2.6.4 验后 #1 的回归源。定版：900×600 默认两栏布局下
+   整页不滚动、步骤卡不挤——单列只保留给 ≤760px 的异常窄窗兜底
+   （见上方 @media (max-width: 760px)），密度靠 @media (max-height:
+   680px) 的矮窗紧凑块压进一屏。 */
+
+/* #16 可选性（v2.6.5）：桌面应用不是网页——框架文字（导航/标题/按钮/
+   设置项/卡片说明）一律不可选，Ctrl+A 不许再把整个界面选蓝；只有
+   内容区可选：消息正文、输入框、内置查看器文本、代码块。 */
+body { user-select: none; -webkit-user-select: none; }
+.bubble, .bubble *, #viewer-lines, #viewer-lines *,
+.msg-text, .ai-collapsed-text, .file-name, pre, code,
+#update-notes, #modal-text, .gstack-ph-name
+  { user-select: text; -webkit-user-select: text; }
+input, textarea { user-select: text; -webkit-user-select: text; }
+
+/* #14 清空范围选择框 */
+#clear-modal { position: fixed; inset: 0; z-index: 200; display: flex;
+  align-items: center; justify-content: center; background: rgba(10, 10, 12, 0.35); }
+#clear-modal.hidden { display: none; }
+#clear-modal .modal-box { width: 320px; }
+#clear-modal h3 { font-size: 15px; margin-bottom: 6px; }
+.clear-range-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0 16px; }
+.clear-range-list .btn { width: 100%; }

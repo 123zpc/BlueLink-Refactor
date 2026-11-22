@@ -542,6 +542,36 @@ async fn bt_connect(
     // 流程（含可能的重试）结束才注销。
     let out_gen = state.node.begin_outbound_attempt(&name).await;
     let result = bt_connect_once(&state, gen, resolved, &device_id, &code_clean).await;
+    // SimpleBLE「bad exception」= 适配器状态损坏（v2.6.5，#18 日志定案）：
+    // 用同一坏句柄重试只会连环失败——先重初始化适配器、重新扫描捕获
+    // 目标，再重试一次。
+    let result = match result {
+        Err(e)
+            if resolved == "simpleble"
+                && state.connect_current(gen)
+                && e.to_lowercase().contains("bad exception") =>
+        {
+            bluelink_services::log_line(
+                resolved,
+                &format!(
+                    "首次连接失败（适配器状态损坏：{e}），重初始化适配器并重新捕获后自动重试一次"
+                ),
+            );
+            let mut retried = None;
+            if let Some(central) = state.sble_central.clone() {
+                central.reinit().await;
+                if let Some(fresh_id) = rescan_fresh_id(&state, resolved, &device_id, &name).await {
+                    retried =
+                        Some(bt_connect_once(&state, gen, resolved, &fresh_id, &code_clean).await);
+                }
+            }
+            match retried {
+                Some(r) => r,
+                None => Err(e),
+            }
+        }
+        other => other,
+    };
     let result = match result {
         Err(e)
             if matches!(resolved, "ble" | "simpleble")
@@ -760,34 +790,39 @@ async fn dial_reconnect_route(
         }
         "simpleble" => {
             let c = sble.clone().ok_or("SimpleBLE 不可用")?;
-            match c.connect(id).await {
+            // #19 捕获先行：先弃缓存句柄、重新扫描按名捕获新鲜条目再连，
+            // 不许拿缓存旧句柄硬连（旧顺序先连后兜底，撞坏句柄白等一轮）。
+            c.forget_device(id).await;
+            let _ = c.start_scan().await;
+            let fresh = poll_found_by_name(10, &target.name, || c.list_found()).await;
+            let first_id = fresh.as_deref().unwrap_or(id);
+            match c.connect(first_id).await {
                 Ok(conn) => Ok(conn),
-                Err(_) => {
-                    // 缓存旧端点兜底：清缓存按名重扫找回后重试一次
-                    c.forget_device(id).await;
+                Err(e) if e.to_string().to_lowercase().contains("bad exception") => {
+                    // #18：bad exception = 适配器状态损坏，先重初始化再捕获重连
+                    bluelink_services::log_line(
+                        "simpleble",
+                        "自动重连撞上 bad exception：重初始化适配器后重新捕获",
+                    );
+                    c.reinit().await;
                     let _ = c.start_scan().await;
-                    let fresh = poll_found_by_name(8, &target.name, || c.list_found()).await;
-                    match fresh {
+                    let fresh2 = poll_found_by_name(10, &target.name, || c.list_found()).await;
+                    match fresh2 {
                         Some(fid) => c.connect(&fid).await.map_err(|e| e.to_string()),
-                        None => Err("重扫未找到目标设备".to_string()),
+                        None => Err("重初始化后重扫未找到目标设备".to_string()),
                     }
                 }
+                Err(e) => Err(e.to_string()),
             }
         }
         _ => {
             let c = central.clone().ok_or("蓝牙不可用")?;
-            match c.connect(id).await {
-                Ok(conn) => Ok(conn),
-                Err(_) => {
-                    c.forget_device(id).await;
-                    let _ = c.start_scan().await;
-                    let fresh = poll_found_by_name(8, &target.name, || c.list_found()).await;
-                    match fresh {
-                        Some(fid) => c.connect(&fid).await.map_err(|e| e.to_string()),
-                        None => Err("重扫未找到目标设备".to_string()),
-                    }
-                }
-            }
+            // #19 捕获先行（同 SimpleBLE 路）：弃缓存、重扫按名捕获再连。
+            c.forget_device(id).await;
+            let _ = c.start_scan().await;
+            let fresh = poll_found_by_name(10, &target.name, || c.list_found()).await;
+            let first_id = fresh.as_deref().unwrap_or(id);
+            c.connect(first_id).await.map_err(|e| e.to_string())
         }
     }
 }
@@ -1597,8 +1632,20 @@ async fn clean_cache(state: State<'_, AppState>) -> Result<u64, String> {
 }
 
 #[tauri::command]
-fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String> {
-    state.node.clear_chat_history().map_err(|e| e.to_string())
+fn clear_chat_history(state: State<'_, AppState>, range: Option<String>) -> Result<u64, String> {
+    // #14：带范围参数走按范围清理（24h/7d/30d/all），缺省 = 全部（旧调用兼容）
+    match range {
+        Some(r) => state
+            .node
+            .clear_chat_history_range(&r)
+            .map_err(|e| e.to_string()),
+        None => state
+            .node
+            // 缺省（旧调用）也走范围口径的「全部」，如实返回删除条数
+            // （第三方评审采纳：旧实现硬编码返回 0，界面会误报）
+            .clear_chat_history_range("all")
+            .map_err(|e| e.to_string()),
+    }
 }
 
 #[derive(Serialize)]
@@ -1763,6 +1810,52 @@ fn copy_file_as(src: String, dst: String) -> Result<(), String> {
     std::fs::copy(&src, &dst)
         .map(|_| ())
         .map_err(|e| format!("复制失败：{e}"))
+}
+
+/// 把超大段文字落盘暂存为文档文件，返回路径（v2.6.5，#2）：粘贴/发送
+/// 遇到几十万行量级时，文字绝不进输入框、绝不当聊天正文发——前端在
+/// 插入前采样判量级，超限直接调这里转成文件入待发队列。文件名由前端
+/// 按采样分类给（代码后缀或 长文.txt），这里只做基本清洗。
+#[tauri::command]
+fn stage_text_document(
+    state: State<'_, AppState>,
+    name: String,
+    content: String,
+) -> Result<String, String> {
+    let name: String = name
+        .chars()
+        .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .collect();
+    // 清洗后为空、或只剩 "." / ".." 这类相对路径名时回落默认名
+    // （第三方评审采纳：dir.join(".") 会把暂存目录本身当写入目标）
+    let trimmed = name.trim();
+    let name = if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "长文.txt".to_string()
+    } else {
+        name
+    };
+    if content.len() > 64 * 1024 * 1024 {
+        return Err("内容过大，无法转为文件".into());
+    }
+    let dir = state.data_dir.join("pasted");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 文件名就用分类名（收方看到的也是这个名）；同名冲突时加序号后缀
+    let mut path = dir.join(&name);
+    if path.exists() {
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+            _ => (name.clone(), String::new()),
+        };
+        for n in 2..1000 {
+            let candidate = dir.join(format!("{stem} ({n}){ext}"));
+            if !candidate.exists() {
+                path = candidate;
+                break;
+            }
+        }
+    }
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// 把粘贴的图片落盘暂存，返回路径（前端在点发送时按文件发送；剪贴板图片只在无文字时走这里）。
@@ -2706,6 +2799,7 @@ fn main() {
             clipboard_file_list,
             file_attach_info,
             stage_pasted_image,
+            stage_text_document,
             get_gateway_settings,
             set_proxy_allow,
             set_local_api,

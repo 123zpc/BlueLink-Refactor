@@ -78,6 +78,24 @@ fn 写测试文件(dir: &Path, name: &str, size: usize) -> PathBuf {
     p
 }
 
+/// #13（v2.6.5）：接收文件按接收日期落在 downloads/<YYYY-MM-DD>/ 下，
+/// 测试按同一口径找落地文件（根目录优先，其次日期子目录）。
+fn 找落地文件(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let root = dir.join(name);
+    if root.exists() {
+        return root;
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path().join(name);
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    root
+}
+
 #[tokio::test]
 async fn 文件传输完整且哈希一致() {
     let a = Node::new(&临时目录("fa"), "甲").unwrap();
@@ -89,7 +107,7 @@ async fn 文件传输完整且哈希一致() {
     let sha = sha256_file(&file).unwrap();
     a.send_file(&file).await.unwrap();
 
-    let landed = b.download_dir().join("数据.bin");
+    let landed = 找落地文件(&b.download_dir(), "数据.bin");
     assert!(landed.exists(), "文件未落地");
     assert_eq!(sha256_file(&landed).unwrap(), sha);
 }
@@ -137,7 +155,7 @@ async fn 断点续传只补缺失部分() {
         }
     }
     assert!(saw_resume, "未观察到续传进度");
-    let landed = b.download_dir().join("大文件.dat");
+    let landed = 找落地文件(&b.download_dir(), "大文件.dat");
     assert_eq!(sha256_file(&landed).unwrap(), sha);
 }
 

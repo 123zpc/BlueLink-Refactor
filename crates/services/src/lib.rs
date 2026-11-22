@@ -447,6 +447,24 @@ pub fn derive_transfer_id(file_sha: &str, peer_id: &str) -> String {
     )
 }
 
+/// 接收文件按日分夹（v2.6.5，#13）：接收完成的日期（UTC+8，与本应用
+/// 既有日期口径一致，见 proxy_day_key）拼成 YYYY-MM-DD 子目录名。
+/// days→年月日 用 Howard Hinnant 的 civil-from-days 算法，无需引日期库。
+fn receive_date_dir_name(now: i64) -> String {
+    let days = (now + 8 * 3600 * 1000).div_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// 尝试压缩分片（zstd）：已知压缩格式或压不动时返回 None（直传）。
 fn try_compress(data: &[u8], file_name: &str) -> Option<Vec<u8>> {
     let ext = Path::new(file_name).extension()?.to_str()?.to_lowercase();
@@ -612,6 +630,80 @@ fn clip_write_with(cb: &mut arboard::Clipboard, content: &ClipContent) -> Result
     }
 }
 
+/// 远端内容写入本机剪贴板的结果（v2.6.5，#8 定案）。
+enum ClipApplyOutcome {
+    /// 已写入并回读验证生效。
+    Written,
+    /// 本机当前内容与远端相同：不重复写（重复写会在系统剪贴板历史里
+    /// 把同一内容记两遍——用户实报的「历史出现两遍」）。
+    SkippedSame,
+    /// 本机在上次轮询之后刚被用户复制了新内容（与监视记录对不上）：
+    /// 本机用户的最新复制优先，本条远端内容让行（同步绝不顶掉用户
+    /// 刚复制的东西，红线）。
+    SkippedLocalNewer,
+    /// 写入失败/未生效：已尽力还原写入前的内容，调用方进退让期。
+    Failed(String),
+}
+
+/// 把远端剪贴板内容原子地应用到本机（读→比→写→验，全程同一句柄
+/// 一次完成，关掉「比对完、写入前用户又复制了」的竞态窗口）：
+/// ① 当前内容与远端相同就不写；② 当前内容是用户刚复制的新东西
+/// 就让行；③ 写入后回读验证——Windows 上 set_image 的格式转换在
+/// EmptyClipboard 之后失败会把剪贴板留成空的（用户实报「剪贴板被
+/// 弄空、Ctrl+V 失效、须去历史里点一下才恢复」的机制定案），验证
+/// 不过立刻把写入前的快照原样写回，绝不把空剪贴板留给用户。
+fn clip_apply_atomic(
+    cb: &mut arboard::Clipboard,
+    content: &ClipContent,
+    last_seen: Option<&str>,
+) -> ClipApplyOutcome {
+    let incoming = content.hash();
+    let cur = clip_read_with(cb);
+    if cur.occupied && cur.content.is_none() {
+        return ClipApplyOutcome::Failed("剪贴板被其他程序占用".into());
+    }
+    let snapshot = cur.content;
+    if let Some(c) = &snapshot {
+        if c.hash() == incoming {
+            return ClipApplyOutcome::SkippedSame;
+        }
+        if last_seen != Some(c.hash().as_str()) {
+            return ClipApplyOutcome::SkippedLocalNewer;
+        }
+    }
+    if let Err(e) = clip_write_with(cb, content) {
+        // 写失败也可能已把剪贴板清空（先 Empty 后失败）：有快照就还原
+        if let Some(snap) = &snapshot {
+            let _ = clip_write_with(cb, snap);
+        }
+        return ClipApplyOutcome::Failed(e);
+    }
+    // 回读验证：文字比哈希；图片只比尺寸（RGBA 经系统格式往返不保证逐
+    // 字节一致，比哈希会误判）。读回空/不符 = 写入未生效 → 还原快照。
+    let back = clip_read_with(cb);
+    let verified = match (&content, &back.content) {
+        (ClipContent::Text(_), Some(ClipContent::Text(_))) => {
+            back.content.as_ref().map(|c| c.hash()) == Some(incoming.clone())
+        }
+        (
+            ClipContent::Image { width, height, .. },
+            Some(ClipContent::Image {
+                width: w2,
+                height: h2,
+                ..
+            }),
+        ) => w2 == width && h2 == height,
+        _ => false,
+    };
+    if !verified {
+        if let Some(snap) = &snapshot {
+            let _ = clip_write_with(cb, snap);
+        }
+        return ClipApplyOutcome::Failed("写入后回读验证未通过（已还原原内容）".into());
+    }
+    ClipApplyOutcome::Written
+}
+
 /// 剪贴板同步的防回环状态：last_seen 是最近见过的本机剪贴板内容哈希
 /// （自己复制后发出的、或从对方写入的都算），suppress 是最近一次从对方
 /// 写入的内容哈希——监视到它时绝不回发，避免两台机器来回震荡。
@@ -626,6 +718,13 @@ struct ClipGuard {
     write_backoff_until: Option<std::time::Instant>,
     /// 上次记录「读剪贴板被占用」的时刻（限频：每分钟至多一条）。
     last_read_fail_log: Option<std::time::Instant>,
+    /// 剪贴板图片因出站繁忙被延后的次数（v2.6.5，#18）：BLE 家族上大图
+    /// 是背景流量，出站队列有货时先让行聊天/控制帧，延后不丢、下一拍
+    /// 再试；连续延后到上限后照常发送，不许饿死。
+    clip_defer_count: u32,
+    /// 正在延后的图片哈希（v2.6.5 评审补强）：延后期间用户复制了新图
+    /// （哈希变了）要把延后计数清零重新让行，不能继承旧图的计数。
+    clip_defer_hash: Option<String>,
 }
 
 /// 接收中的文件状态。
@@ -1497,7 +1596,13 @@ impl Node {
                         return; // 会话已结束/被替换
                     }
                 }
-                let silent_ms = now_ms() - session.last_inbound_ms.load(Ordering::Relaxed) as i64;
+                // 静默判定看「成帧活动」与「字节活动」的较新者（#18）：
+                // 一张 320KB 剪贴板大图要二十多秒才成帧，只看成帧时刻
+                // 会把正在正常传输的连接误判死亡（2026-11-22 双机日志
+                // 定案：双向帧流在帧层冻结 19 秒、双边先后判死）。
+                let last_frame_ms = session.last_inbound_ms.load(Ordering::Relaxed);
+                let last_byte_ms = session.conn.last_inbound_byte_ms();
+                let silent_ms = now_ms() - last_frame_ms.max(last_byte_ms) as i64;
                 if silent_ms >= HEARTBEAT_DEAD_MS as i64 {
                     // 传输进行中不判死：发完等校验/收片未齐时，对端是
                     // 在合法地等我方（校验重算可达数秒），静默不等于
@@ -2093,13 +2198,13 @@ impl Node {
         let Some(content) = read.content else { return };
         let hash = content.hash();
         {
-            let mut g = self.clip_guard.lock().await;
+            let g = self.clip_guard.lock().await;
             if g.last_seen.as_deref() == Some(hash.as_str()) {
                 return; // 没变化
             }
-            g.last_seen = Some(hash.clone());
             if g.suppress.as_deref() == Some(hash.as_str()) {
-                // 这是刚从对方同步写入本机的内容，绝不回发（防回环）
+                // 这是刚从对方同步写入本机的内容，绝不回发（防回环）。
+                // 注意此处不更新 last_seen 也无妨：apply 写入时已登记。
                 return;
             }
         }
@@ -2112,13 +2217,25 @@ impl Node {
                     );
                     return;
                 }
+                {
+                    let mut g = self.clip_guard.lock().await;
+                    g.clip_defer_count = 0;
+                    g.clip_defer_hash = None;
+                }
                 let n = text.len();
+                // last_seen 在发送成功后才登记（第三方评审采纳）：先登记
+                // 再发送的话，发送失败这一份就永远不会重试、静默丢失。
                 if session
                     .conn
-                    .send(&Frame::Control(Control::ClipboardText { hash, text }))
+                    .send(&Frame::Control(Control::ClipboardText {
+                        hash: hash.clone(),
+                        text,
+                    }))
                     .await
                     .is_ok()
                 {
+                    let mut g = self.clip_guard.lock().await;
+                    g.last_seen = Some(hash);
                     log::log_verbose("clipboard", &format!("剪贴板同步：已发送文字（{n} 字节）"));
                 }
             }
@@ -2144,6 +2261,36 @@ impl Node {
                     );
                     return;
                 }
+                // 背景优先级（#18）：出站还有大批字节没上空（多半是文件
+                // 传输在跑）时，大图先延后，别去和聊天/控制帧抢无线电；
+                // 延后期间不登记 last_seen，下一拍内容还在就重试，用户
+                // 若已复制新内容则自然换成新内容。连续延后 15 拍（约
+                // 10 秒）后照常发送，不许饿死。
+                let lag = session.conn.outbound_lag();
+                if lag > 64 * 1024 {
+                    let mut g = self.clip_guard.lock().await;
+                    // 延后的是另一张图（用户刚复制了新图）：计数清零
+                    // 重新让行，不继承旧图的延后进度（评审采纳）
+                    if g.clip_defer_hash.as_deref() != Some(hash.as_str()) {
+                        g.clip_defer_hash = Some(hash.clone());
+                        g.clip_defer_count = 0;
+                    }
+                    if g.clip_defer_count < 15 {
+                        g.clip_defer_count += 1;
+                        if g.clip_defer_count == 1 {
+                            log::log_verbose(
+                                "clipboard",
+                                "剪贴板图片延后发送：出站队列繁忙（背景优先级）",
+                            );
+                        }
+                        return;
+                    }
+                }
+                {
+                    let mut g = self.clip_guard.lock().await;
+                    g.clip_defer_count = 0;
+                    g.clip_defer_hash = None;
+                }
                 let n = data.len();
                 let frame = Frame::ClipboardImage(ClipboardImage {
                     hash: digest,
@@ -2152,7 +2299,10 @@ impl Node {
                     compression: comp_algo,
                     data,
                 });
+                // last_seen 同样在发送成功后才登记（评审采纳，同文字路径）
                 if session.conn.send(&frame).await.is_ok() {
+                    let mut g = self.clip_guard.lock().await;
+                    g.last_seen = Some(hash);
                     log::log_line(
                         "clipboard",
                         &format!("剪贴板同步：已发送图片（{width}x{height}，{n} 字节）"),
@@ -2251,16 +2401,34 @@ impl Node {
                 return;
             }
         }
+        // 永不写空（#8）：空文字/零尺寸图片一律不应用——把空内容写进
+        // 剪贴板等于清空用户剪贴板，红线不许。
+        match &content {
+            ClipContent::Text(t) if t.is_empty() => {
+                log::log_verbose("clipboard", "收到对方空文字剪贴板内容，已忽略（永不写空）");
+                return;
+            }
+            ClipContent::Image {
+                width,
+                height,
+                rgba,
+            } if *width == 0 || *height == 0 || rgba.is_empty() => {
+                log::log_verbose("clipboard", "收到对方空图片剪贴板内容，已忽略（永不写空）");
+                return;
+            }
+            _ => {}
+        }
         let hash = content.hash();
         let kind = content.kind();
         let desc = match &content {
             ClipContent::Text(t) => format!("文字（{} 字节）", t.len()),
             ClipContent::Image { width, height, .. } => format!("图片（{width}x{height}）"),
         };
+        let last_seen_snapshot;
         {
             let g = self.clip_guard.lock().await;
-            // 本机剪贴板已经是这份内容：再写一遍纯属多余，还可能顶掉用户
-            // 此刻刚复制的新内容——跳过（同步绝不影响本机功能的第一道闸）
+            // 本机剪贴板已经是这份内容：再写一遍纯属多余，还会在系统
+            // 历史里记两遍——跳过（同步绝不影响本机功能的第一道闸）
             if g.last_seen.as_deref() == Some(hash.as_str()) {
                 log::log_verbose(
                     "clipboard",
@@ -2276,16 +2444,18 @@ impl Node {
                 log::log_verbose("clipboard", "剪贴板写入退让中，丢弃本条远端内容（不重试）");
                 return;
             }
+            last_seen_snapshot = g.last_seen.clone();
         }
+        // 读→比→写→验在同一个阻塞任务里一次完成（见 clip_apply_atomic）
         let written = content.clone();
         let node = self.clone();
         let result = tokio::task::spawn_blocking(move || {
-            node.with_clipboard(|cb| clip_write_with(cb, &written))
-                .unwrap_or_else(|| Err("系统剪贴板不可用".to_string()))
+            node.with_clipboard(|cb| clip_apply_atomic(cb, &written, last_seen_snapshot.as_deref()))
+                .unwrap_or(ClipApplyOutcome::Failed("系统剪贴板不可用".into()))
         })
         .await;
         match result {
-            Ok(Ok(())) => {
+            Ok(ClipApplyOutcome::Written) => {
                 {
                     let mut g = self.clip_guard.lock().await;
                     g.suppress = Some(hash.clone());
@@ -2296,7 +2466,25 @@ impl Node {
                     kind: kind.to_string(),
                 });
             }
-            Ok(Err(e)) => {
+            Ok(ClipApplyOutcome::SkippedSame) => {
+                // 本机已是这份内容：只更新防回环登记，不重复写
+                let mut g = self.clip_guard.lock().await;
+                g.suppress = Some(hash.clone());
+                g.last_seen = Some(hash);
+                log::log_verbose(
+                    "clipboard",
+                    "收到对方剪贴板内容，本机已是该内容，未重复写入",
+                );
+            }
+            Ok(ClipApplyOutcome::SkippedLocalNewer) => {
+                // 本机用户刚复制的新内容优先：不写、不登记 suppress——
+                // 本机监视下一拍会把用户的新内容同步给对方（最新者胜）。
+                log::log_line(
+                    "clipboard",
+                    "收到对方剪贴板内容，但本机刚被复制了新内容，本机优先、未覆盖",
+                );
+            }
+            Ok(ClipApplyOutcome::Failed(e)) => {
                 self.clip_write_failed(&e).await;
             }
             Err(e) => {
@@ -2512,18 +2700,57 @@ impl Node {
             .lock()
             .await
             .insert(transfer_id.clone(), vtx);
-        // 最后一片已发完：先切「等校验」状态，界面显示「已发送，等待
-        // 对方校验…」，别让进度条在 100% 无文案干挂到校验回来。
-        self.emit(Event::TransferState {
-            transfer_id: transfer_id.clone(),
-            state: "verifying".into(),
-        });
         session
             .conn
             .send(&Frame::Control(Control::FileDone {
                 transfer_id: transfer_id.clone(),
             }))
             .await?;
+        // #12 状态语义（v2.6.5，日志定案）：conn.send 返回只代表字节进了
+        // 出站队列，BLE 上最后一片的空中尾巴能拖二十多秒——旧版在这里
+        // 立刻报「校验中」，把整段发送尾巴记在校验名下（真机实测 277KB
+        // 文件 22.4 秒里大半是这种假校验）。从此先等出站真正排空（泵把
+        // 字节全部交给无线电，outbound_lag 归零），排空期间持续发真实
+        // 进度；排空后才许进「校验中」。
+        {
+            let wire_total = (wire_bytes + 256) as f64; // 加控制帧的大致开销
+            let drain_start = std::time::Instant::now();
+            loop {
+                let lag = session.conn.outbound_lag();
+                if lag == 0 {
+                    break;
+                }
+                // 会话已断开/被替换：别干等，交给下面的校验等待收尾报错
+                {
+                    let guard = self.peer.lock().await;
+                    let alive = matches!(&*guard, Some(cur) if Arc::ptr_eq(cur, session));
+                    if !alive {
+                        break;
+                    }
+                }
+                if drain_start.elapsed() > std::time::Duration::from_secs(120) {
+                    log::log_line(
+                        "files",
+                        &format!("发送排空等待超时（{name}，仍滞留 {lag} 字节），按现状进入等校验"),
+                    );
+                    break;
+                }
+                let frac = 1.0 - (lag as f64 / wire_total).min(1.0);
+                let aired_est = ((sent_total as f64) * frac) as u64;
+                self.emit(Event::TransferProgress {
+                    transfer_id: transfer_id.clone(),
+                    msg_id: msg_id.clone(),
+                    received: aired_est.max(covered_bytes(&received)),
+                    total: size,
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
+        }
+        // 出站已真正排空：这才轮到对方校验，状态如实切「校验中」。
+        self.emit(Event::TransferState {
+            transfer_id: transfer_id.clone(),
+            state: "verifying".into(),
+        });
         let verify_wait_t0 = std::time::Instant::now(); // ⑳ 发送端等校验计时
         let ok = tokio::time::timeout(std::time::Duration::from_secs(60), vrx)
             .await
@@ -3079,25 +3306,30 @@ impl Node {
         // 先放掉常驻 .part 句柄再 rename：Windows 上句柄开着改名靠
         // 共享标志兜底，显式释放把这条风险摘掉（flush 已在写片时完成）。
         drop(st.file.take());
+        // #13 按日分夹：落地进接收目录下以接收日期命名的子文件夹
+        // （自动创建）；半成品 .part 仍留在接收目录根下不挪窝。
+        let date_dir = self.download_dir().join(receive_date_dir_name(now_ms()));
+        let final_path = date_dir.join(&st.name);
         // rename/落库失败同判该文件失败（不冒泡挂死发送端）。
         let mut ok = ok;
         if ok {
-            let final_path = self.download_dir().join(&st.name);
-            let landed = std::fs::rename(&st.part_path, &final_path).and_then(|_| {
-                // ⑳ 三笔回写（消息状态/落地路径/传输收尾）合并成一个
-                // 事务，只剩一次提交落盘——文件菜单靠落地路径定位。
-                self.storage
-                    .finish_received_file(
-                        &st.msg_id,
-                        &st.file_id,
-                        &final_path.to_string_lossy(),
-                        &transfer_id,
-                        &session.peer.device_id,
-                        st.total,
-                        &st.ranges,
-                    )
-                    .map_err(std::io::Error::other)
-            });
+            let landed = std::fs::create_dir_all(&date_dir)
+                .and_then(|_| std::fs::rename(&st.part_path, &final_path))
+                .and_then(|_| {
+                    // ⑳ 三笔回写（消息状态/落地路径/传输收尾）合并成一个
+                    // 事务，只剩一次提交落盘——文件菜单靠落地路径定位。
+                    self.storage
+                        .finish_received_file(
+                            &st.msg_id,
+                            &st.file_id,
+                            &final_path.to_string_lossy(),
+                            &transfer_id,
+                            &session.peer.device_id,
+                            st.total,
+                            &st.ranges,
+                        )
+                        .map_err(std::io::Error::other)
+                });
             if let Err(e) = landed {
                 log::log_line(
                     "files",
@@ -3107,7 +3339,6 @@ impl Node {
             }
         }
         if ok {
-            let final_path = self.download_dir().join(&st.name);
             self.emit(Event::TransferState {
                 transfer_id: transfer_id.clone(),
                 state: "done".into(),
@@ -3168,6 +3399,19 @@ impl Node {
         if let Ok(rd) = std::fs::read_dir(self.download_dir()) {
             for e in rd.flatten() {
                 let Ok(md) = e.metadata() else { continue };
+                if md.is_dir() {
+                    // #13 按日分夹后，落地文件在日期子目录里，统计要跟下去
+                    if let Ok(sub) = std::fs::read_dir(e.path()) {
+                        for se in sub.flatten() {
+                            let Ok(smd) = se.metadata() else { continue };
+                            if smd.is_file() {
+                                files_bytes += smd.len();
+                                files_count += 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if !md.is_file() {
                     continue;
                 }
@@ -3216,6 +3460,61 @@ impl Node {
         Ok(())
     }
 
+    /// 按范围清空聊天记录（v2.6.5，#14）：range = "24h" | "7d" | "30d"
+    /// | "all"。只清范围内的消息，范围外不动；附件口径见 storage
+    /// clear_messages_range 的注释（只清记录、不删接收目录实体文件）。
+    /// 返回实际删除条数供界面如实反馈。
+    pub fn clear_chat_history_range(&self, range: &str) -> Result<u64, ServiceError> {
+        let now = now_ms();
+        let cutoff = match range {
+            "all" => None,
+            "24h" => Some(now - 24 * 3600 * 1000),
+            "7d" => Some(now - 7 * 24 * 3600 * 1000),
+            "30d" => Some(now - 30 * 24 * 3600 * 1000),
+            other => return Err(ServiceError::Other(format!("未知的清理范围：{other}"))),
+        };
+        let n = self.storage.clear_messages_range(cutoff)?;
+        log::log_line(
+            "storage",
+            &format!("已按范围清空聊天记录（范围 {range}，共删除 {n} 条消息）"),
+        );
+        Ok(n)
+    }
+
+    /// 在接收目录里定位一个已落地文件：根目录优先，其次按日分夹
+    /// （#13 的 YYYY-MM-DD 子目录）。记录路径失效时的兜底定位用。
+    fn find_received_file(&self, name: &str) -> Option<PathBuf> {
+        let root = self.download_dir();
+        let direct = root.join(name);
+        if direct.exists() {
+            return Some(direct);
+        }
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            // 日期目录按名倒序（最新日期优先）：同名文件多日各一份时
+            // 取最近的那份（第三方评审采纳：read_dir 顺序不定）
+            let mut dirs: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .filter(|p| {
+                    let dn = p.file_name().unwrap_or_default().to_string_lossy();
+                    dn.len() == 10
+                        && dn.as_bytes().get(4) == Some(&b'-')
+                        && dn.as_bytes().get(7) == Some(&b'-')
+                        && dn.chars().filter(|c| *c != '-').all(|c| c.is_ascii_digit())
+                })
+                .collect();
+            dirs.sort();
+            for p in dirs.iter().rev() {
+                let cand = p.join(name);
+                if cand.exists() {
+                    return Some(cand);
+                }
+            }
+        }
+        None
+    }
+
     /// 一条文件消息对应的本地文件信息（文件菜单用）：路径优先取记录值，
     /// 接收文件记录缺失时按下载目录 + 文件名兜底定位。
     pub fn file_info(&self, message_id: &str) -> Result<Option<MessageFileInfo>, ServiceError> {
@@ -3231,15 +3530,12 @@ impl Node {
         let recorded = PathBuf::from(&meta.path);
         let path = if !meta.path.is_empty() && recorded.exists() {
             Some(recorded)
+        } else if let Some(found) = self.find_received_file(&meta.name) {
+            Some(found)
+        } else if !meta.path.is_empty() {
+            Some(recorded)
         } else {
-            let fallback = self.download_dir().join(&meta.name);
-            if fallback.exists() {
-                Some(fallback)
-            } else if !meta.path.is_empty() {
-                Some(recorded)
-            } else {
-                None
-            }
+            None
         };
         let exists = path.as_ref().map(|p| p.exists()).unwrap_or(false);
         Ok(Some(MessageFileInfo {
@@ -3265,15 +3561,12 @@ impl Node {
             let recorded = PathBuf::from(&meta.path);
             let path = if !meta.path.is_empty() && recorded.exists() {
                 Some(recorded)
+            } else if let Some(found) = self.find_received_file(&meta.name) {
+                Some(found)
+            } else if !meta.path.is_empty() {
+                Some(recorded)
             } else {
-                let fallback = self.download_dir().join(&meta.name);
-                if fallback.exists() {
-                    Some(fallback)
-                } else if !meta.path.is_empty() {
-                    Some(recorded)
-                } else {
-                    None
-                }
+                None
             };
             let exists = path.as_ref().map(|p| p.exists()).unwrap_or(false);
             out.push(MessageFileInfo {
@@ -4600,5 +4893,33 @@ mod reconnect_tests {
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         assert!(!a.is_connected().await, "用户主动断开后不许自动重连");
         accept_alive.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod v265_tests {
+    use super::*;
+
+    /// #13 日期分夹名：UTC+8 口径下与日历一致（含跨年/闰年边界）。
+    #[test]
+    fn 接收日期目录名正确() {
+        assert_eq!(receive_date_dir_name(0), "1970-01-01");
+        // 2026-11-22 12:00 UTC = 北京时间 20:00，仍是 22 日
+        assert_eq!(receive_date_dir_name(1_795_348_800_000), "2026-11-22");
+        // 2026-11-22 17:00 UTC = 北京时间 23 日 01:00，跨日
+        assert_eq!(receive_date_dir_name(1_795_366_800_000), "2026-11-23");
+        // 2024-02-29 闰日（2024-02-29 12:00 UTC）
+        assert_eq!(receive_date_dir_name(1_709_208_000_000), "2024-02-29");
+    }
+
+    /// #12 排空语义的地基：loopback 连接 send 后 outbound_lag 必须归零
+    /// （直连流 flush 即交付），服务层据此才敢进「校验中」。
+    #[tokio::test]
+    async fn 环回连接出站滞留归零() {
+        let (a, b) = bluelink_transport::loopback_pair();
+        a.send(&Frame::Control(Control::Ping)).await.unwrap();
+        assert_eq!(a.outbound_lag(), 0);
+        assert_eq!(b.recv().await.unwrap(), Frame::Control(Control::Ping));
+        assert!(b.last_inbound_byte_ms() > 0, "入站字节活动应被记录");
     }
 }

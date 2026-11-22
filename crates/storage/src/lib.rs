@@ -609,19 +609,52 @@ impl Storage {
 
     /// 清空全部聊天记录（消息、全文索引、彩签归属、收藏/置顶一并清，会话与设置保留）。
     pub fn clear_all_messages(&self) -> Result<(), StorageError> {
+        self.clear_messages_range(None).map(|_| ())
+    }
+
+    /// 按时间范围清空聊天记录（v2.6.5，#14）：cutoff 为毫秒时间戳时只删
+    /// created_at >= cutoff 的消息（近 24 小时/7 天/30 天），None = 全部。
+    /// 删除口径与全清一致：消息本体 + 彩签归属 + 标签 + 收藏/置顶标记 +
+    /// 全文索引重建；会话与设置保留。附件口径与既有全清一致——只清消息
+    /// 记录，接收目录里的实体文件与 files 记录不动（与旧行为保持一致，
+    /// 避免范围清理误删用户已保存到接收目录的文件）。
+    pub fn clear_messages_range(&self, cutoff_ms: Option<i64>) -> Result<u64, StorageError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM message_category", [])?;
-        tx.execute("DELETE FROM message_tags", [])?;
-        tx.execute("DELETE FROM message_marks", [])?;
-        tx.execute("DELETE FROM messages", [])?;
-        // 外部内容 FTS：用 rebuild 按已清空的内容表重建索引（结果为空索引）
+        let deleted = match cutoff_ms {
+            None => {
+                tx.execute("DELETE FROM message_category", [])?;
+                tx.execute("DELETE FROM message_tags", [])?;
+                tx.execute("DELETE FROM message_marks", [])?;
+                tx.execute("DELETE FROM messages", [])? as u64
+            }
+            Some(cutoff) => {
+                let sel = "SELECT id FROM messages WHERE created_at >= ?1";
+                tx.execute(
+                    &format!("DELETE FROM message_category WHERE message_id IN ({sel})"),
+                    params![cutoff],
+                )?;
+                tx.execute(
+                    &format!("DELETE FROM message_tags WHERE message_id IN ({sel})"),
+                    params![cutoff],
+                )?;
+                tx.execute(
+                    &format!("DELETE FROM message_marks WHERE message_id IN ({sel})"),
+                    params![cutoff],
+                )?;
+                tx.execute(
+                    "DELETE FROM messages WHERE created_at >= ?1",
+                    params![cutoff],
+                )? as u64
+            }
+        };
+        // 外部内容 FTS：用 rebuild 按清理后的内容表重建索引
         tx.execute(
             "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
             [],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(deleted)
     }
 
     // 参数与 transfers 表字段一一对应，拆参数结构体反而更绕，这里豁免参数个数检查
@@ -770,6 +803,31 @@ mod tests {
             created_at: ts,
             seq: 0,
         }
+    }
+
+    /// #14 范围清理：只删 cutoff 之后的消息及其彩签/标记，范围外完好。
+    #[test]
+    fn 范围清理只删范围内() {
+        let (s, c) = 准备();
+        s.insert_message(&消息("old", &c.id, "十天前", 1_000_000))
+            .unwrap();
+        s.insert_message(&消息("new", &c.id, "刚刚", 2_000_000))
+            .unwrap();
+        s.set_message_category("new", Some((1, None))).unwrap();
+        s.toggle_mark("new", MarkKind::Pin).unwrap();
+        s.toggle_mark("old", MarkKind::Favorite).unwrap();
+        let n = s.clear_messages_range(Some(1_500_000)).unwrap();
+        assert_eq!(n, 1);
+        assert!(s.get_message("new").unwrap().is_none());
+        assert!(s.get_message("old").unwrap().is_some());
+        // 范围内的附属记录一并清，范围外的保留
+        assert!(s.list_marked(MarkKind::Pin).unwrap().is_empty());
+        assert_eq!(s.list_marked(MarkKind::Favorite).unwrap().len(), 1);
+        assert!(s.get_message_category("new").unwrap().is_none());
+        // 全部清理仍可用
+        let n = s.clear_messages_range(None).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(s.message_stats().unwrap().0, 0);
     }
 
     /// 性能基线（v1.1.0 实测用）：1 万条消息下分页/搜索/按标签列取的耗时，

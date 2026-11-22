@@ -342,6 +342,68 @@ impl AiConfig {
     }
 }
 
+/// 流式字节的增量 UTF-8 解码器（v2.6.5，#4）：网络块边界任意切分，
+/// 一个多字节汉字可能被劈成两半分落前后两块。旧实现对每块单独
+/// from_utf8_lossy——劈开的汉字两半各自变成替换符（U+FFFD），回复里
+/// 出现「一□□话」式乱码、时有时无全看切口。此解码器保留未完的尾
+/// 字节到下一块，只在完整字符边界解码；真正非法的字节（上游不是
+/// UTF-8 时）才按 lossy 语义替换单个字节，绝不连累后续字符。
+#[derive(Default)]
+pub struct Utf8StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入一块字节，返回本块能完整解出的文本（未完尾字节留待下块）。
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        // 安全：valid_up_to 之前的部分是合法 UTF-8
+                        out.push_str(unsafe {
+                            std::str::from_utf8_unchecked(&self.pending[..valid])
+                        });
+                        self.pending.drain(..valid);
+                    }
+                    match e.error_len() {
+                        // 尾部是不完整的多字节序列：留着等下一块拼齐
+                        None => break,
+                        // 中间真有非法字节：替换这一个字节后继续，不许整段变替换符
+                        Some(n) => {
+                            out.push('\u{FFFD}');
+                            self.pending.drain(..n.min(self.pending.len()));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 流结束时收尾：残留的未完字节按 lossy 语义给出（正常流不该有残留）。
+    pub fn finish(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let s = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        s
+    }
+}
+
 /// 从一行 SSE 数据中提取增量文本（纯函数，便于测试）。
 /// 返回 None 表示该行不带增量（如 [DONE] 或心跳）。
 pub fn parse_sse_delta(line: &str) -> Option<String> {
@@ -444,10 +506,11 @@ impl AiClient {
         }
         let mut full = String::new();
         let mut buffer = String::new();
+        let mut decoder = Utf8StreamDecoder::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|_| AiError::Network)?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            buffer.push_str(&decoder.push(&bytes));
             while let Some(pos) = buffer.find('\n') {
                 let line: String = buffer.drain(..=pos).collect();
                 if let Some(delta) = parse_sse_delta(line.trim()) {
@@ -455,6 +518,11 @@ impl AiClient {
                     on_delta(&delta);
                 }
             }
+        }
+        buffer.push_str(&decoder.finish());
+        if let Some(delta) = parse_sse_delta(buffer.trim()) {
+            full.push_str(&delta);
+            on_delta(&delta);
         }
         if full.is_empty() {
             return Err(AiError::BadResponse);
@@ -520,10 +588,11 @@ impl AiClient {
         }
         let mut full = String::new();
         let mut buffer = String::new();
+        let mut decoder = Utf8StreamDecoder::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|_| AiError::Network)?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            buffer.push_str(&decoder.push(&bytes));
             while let Some(pos) = buffer.find('\n') {
                 let line: String = buffer.drain(..=pos).collect();
                 if let Some(delta) = parse_sse_delta(line.trim()) {
@@ -531,6 +600,11 @@ impl AiClient {
                     on_delta(&delta);
                 }
             }
+        }
+        buffer.push_str(&decoder.finish());
+        if let Some(delta) = parse_sse_delta(buffer.trim()) {
+            full.push_str(&delta);
+            on_delta(&delta);
         }
         if full.is_empty() {
             return Err(AiError::BadResponse);
@@ -761,5 +835,38 @@ mod tests {
         }];
         let out = normalize_messages(&msgs);
         assert_eq!(out[0]["content"], "前后");
+    }
+
+    /// #4 回归：多字节汉字在任意字节切口被劈开时，增量解码必须拼回
+    /// 原文，全文不许出现替换符（旧 lossy 逐块解码在此必出 □□）。
+    #[test]
+    fn 增量解码任意切口不丢字() {
+        let text = "一句话总结：蓝牙直连，不需要网络，也能聊天传文件。";
+        let bytes = text.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut dec = Utf8StreamDecoder::new();
+            let mut out = dec.push(&bytes[..cut]);
+            out.push_str(&dec.push(&bytes[cut..]));
+            out.push_str(&dec.finish());
+            assert_eq!(out, text, "切口 {cut} 处解码不一致");
+            assert!(!out.contains('\u{FFFD}'), "切口 {cut} 出现替换符");
+        }
+        // 逐字节喂入（最坏切法）
+        let mut dec = Utf8StreamDecoder::new();
+        let mut out = String::new();
+        for b in bytes {
+            out.push_str(&dec.push(&[*b]));
+        }
+        out.push_str(&dec.finish());
+        assert_eq!(out, text);
+    }
+
+    /// 增量解码：真非法字节只替换它自己，不连累后续合法文本。
+    #[test]
+    fn 增量解码非法字节只替换自身() {
+        let mut dec = Utf8StreamDecoder::new();
+        let mut out = dec.push(&[0xE4, 0xB8, 0x80, 0xFF, 0x61]);
+        out.push_str(&dec.finish());
+        assert_eq!(out, "一\u{FFFD}a");
     }
 }

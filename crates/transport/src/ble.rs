@@ -52,6 +52,11 @@ fn ble_err<E: std::fmt::Display>(e: E) -> TransportError {
 pub struct StreamEnds {
     pub(crate) incoming_tx: mpsc::Sender<Vec<u8>>,
     pub(crate) outgoing_rx: mpsc::UnboundedReceiver<(Vec<u8>, tokio::sync::OwnedSemaphorePermit)>,
+    /// 空中字节计数（v2.6.5，#12）：泵每把一片字节真正交给无线电/套接字
+    /// 就累加一片长度。Conn 以「已写字节 − 空中字节」算出站滞留量，
+    /// 服务层据此判定发送队列是否真正排空——旧版 Conn::send 返回只代表
+    /// 字节进了 8 帧深的队列，发送端把还在空中的尾巴误报成「校验中」。
+    pub(crate) aired_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// 出站队列深度（帧数）：有界是刻意的（v2.6.2）——旧版无界队列把
@@ -100,6 +105,7 @@ pub fn channel_stream() -> (ChannelStream, StreamEnds) {
         StreamEnds {
             incoming_tx: in_tx,
             outgoing_rx: out_rx,
+            aired_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         },
     )
 }
@@ -752,6 +758,7 @@ impl BleCentral {
         let StreamEnds {
             incoming_tx,
             mut outgoing_rx,
+            aired_bytes,
         } = ends;
 
         // 入站泵：通知字节 → 切片序号验收 → 流。流结束必须落 essential——旧版静默退出，
@@ -792,19 +799,46 @@ impl BleCentral {
             WriteType::WithResponse
         };
         let peer = peripheral.clone();
+        let aired_w = aired_bytes.clone();
         tokio::spawn(async move {
             let mut slicer = SliceEncoder::new();
             while let Some((bytes, _slot)) = outgoing_rx.recv().await {
                 let mut failed = false;
                 for piece in slicer.encode(&bytes) {
-                    if let Err(e) = peer.write(&inbox, &piece, write_type).await {
-                        // 写失败是会话死因之一，落 essential 再拆链（旧版静默）
-                        crate::probe::log(
-                            "ble",
-                            &format!("客户端：写失败（{}），主动断开链路", ble_err(e)),
-                        );
-                        failed = true;
-                        break;
+                    // 写看门狗（v2.6.5，#18）：单片写超过 10 秒视为无线电
+                    // 栈楔死——旧版无超时，队列有货、帧流停滞时只能干等
+                    // 双边心跳判死（真机实证冻结 19 秒以上）。超时即按写
+                    // 失败拆链，服务层走故障断开 + 自动重连（重连会重新
+                    // 扫描捕获，不用缓存句柄硬连）。
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        peer.write(&inbox, &piece, write_type),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            aired_w.fetch_add(
+                                piece.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            // 写失败是会话死因之一，落 essential 再拆链（旧版静默）
+                            crate::probe::log(
+                                "ble",
+                                &format!("客户端：写失败（{}），主动断开链路", ble_err(e)),
+                            );
+                            failed = true;
+                            break;
+                        }
+                        Err(_) => {
+                            crate::probe::log(
+                                "ble",
+                                "客户端：写超时（单片 10 秒未完成，疑似无线电栈楔死），主动断开链路",
+                            );
+                            failed = true;
+                            break;
+                        }
                     }
                 }
                 if failed {
@@ -814,7 +848,11 @@ impl BleCentral {
             let _ = peer.disconnect().await;
         });
 
-        Ok(Conn::new(stream, format!("ble:{device_id}")))
+        Ok(Conn::new_with_air(
+            stream,
+            format!("ble:{device_id}"),
+            aired_bytes,
+        ))
     }
 }
 
@@ -961,6 +999,7 @@ pub async fn start_ble_server(
                         let StreamEnds {
                             incoming_tx,
                             mut outgoing_rx,
+                            aired_bytes,
                         } = ends;
                         link = Some((
                             request.client.clone(),
@@ -969,6 +1008,7 @@ pub async fn start_ble_server(
                         ));
                         let out_peripheral = pump_peripheral.clone();
                         let out_client = request.client.clone();
+                        let aired_s = aired_bytes.clone();
                         tokio::spawn(async move {
                             let mut sent_once = false;
                             let mut slicer = SliceEncoder::new();
@@ -985,11 +1025,16 @@ pub async fn start_ble_server(
                                     // 无声无息。从此失败/超时都在日志留痕。
                                     match tokio::time::timeout(
                                         std::time::Duration::from_secs(5),
-                                        p.update_characteristic(OUTBOX_UUID, piece),
+                                        p.update_characteristic(OUTBOX_UUID, piece.clone()),
                                     )
                                     .await
                                     {
-                                        Ok(Ok(())) => {}
+                                        Ok(Ok(())) => {
+                                            aired_s.fetch_add(
+                                                piece.len() as u64,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
                                         Ok(Err(e)) => {
                                             crate::probe::log(
                                                 "ble",
@@ -1035,7 +1080,11 @@ pub async fn start_ble_server(
                                 request.client
                             ),
                         );
-                        let conn = Conn::new(stream, format!("ble:{}", request.client));
+                        let conn = Conn::new_with_air(
+                            stream,
+                            format!("ble:{}", request.client),
+                            aired_bytes,
+                        );
                         if inbound_tx.send(conn).await.is_err() {
                             break;
                         }

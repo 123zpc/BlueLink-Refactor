@@ -101,8 +101,12 @@ mod imp {
     }
 
     /// SimpleBLE 中心端：持有一个系统蓝牙适配器与最近一次扫描命中的设备句柄。
+    /// adapter 装进 Mutex 是为了能整体换新（见 reinit）：错误原文
+    /// 「bad exception」意味着适配器/栈状态已损坏，继续用同一句柄重连
+    /// 只会连环失败（2026-11-22 真机定案：自动重连头 4 次全撞此错、
+    /// 每次白等 10 秒），必须先重初始化再连。
     pub struct SbleCentral {
-        adapter: Adapter,
+        adapter: Arc<Mutex<Adapter>>,
         found: Arc<Mutex<FoundMap>>,
     }
 
@@ -118,7 +122,7 @@ mod imp {
         .await
         .map_err(|e| TransportError::Ble(format!("蓝牙适配器初始化失败：{e}")))??;
         Ok(SbleCentral {
-            adapter,
+            adapter: Arc::new(Mutex::new(adapter)),
             found: Arc::new(Mutex::new(FoundMap {
                 order: Vec::new(),
                 map: HashMap::new(),
@@ -127,9 +131,44 @@ mod imp {
     }
 
     impl SbleCentral {
+        /// 当前适配器句柄的克隆（FFI 句柄本身是引用计数句柄，克隆廉价）。
+        fn adapter(&self) -> Adapter {
+            self.adapter.lock().unwrap().clone()
+        }
+
+        /// 适配器重初始化（v2.6.5，#18）：丢弃现有适配器句柄、重新枚举
+        /// 取得新句柄，并清空发现表（旧句柄一并作废）。连接撞上
+        /// 「bad exception」类错误后由应用层调用，再走重新扫描捕获。
+        pub async fn reinit(&self) {
+            let fresh = tokio::task::spawn_blocking(|| {
+                Adapter::get_adapters().ok().and_then(|mut v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.remove(0))
+                    }
+                })
+            })
+            .await
+            .ok()
+            .flatten();
+            match fresh {
+                Some(a) => {
+                    *self.adapter.lock().unwrap() = a;
+                    let mut found = self.found.lock().unwrap();
+                    found.order.clear();
+                    found.map.clear();
+                    crate::probe::log("simpleble", "适配器已重初始化（旧句柄与发现表已丢弃）");
+                }
+                None => {
+                    crate::probe::log("simpleble", "适配器重初始化失败：未枚举到蓝牙适配器");
+                }
+            }
+        }
+
         /// 开始扫描（SimpleBLE 扫描结果在 list_found 里按 BlueLink 服务 UUID 过滤）。
         pub async fn start_scan(&self) -> Result<(), TransportError> {
-            let adapter = self.adapter.clone();
+            let adapter = self.adapter();
             tokio::task::spawn_blocking(move || adapter.scan_start())
                 .await
                 .map_err(|e| TransportError::Ble(format!("扫描启动失败：{e}")))?
@@ -138,7 +177,7 @@ mod imp {
 
         /// 停止扫描。
         pub async fn stop_scan(&self) -> Result<(), TransportError> {
-            let adapter = self.adapter.clone();
+            let adapter = self.adapter();
             tokio::task::spawn_blocking(move || adapter.scan_stop())
                 .await
                 .map_err(|e| TransportError::Ble(format!("扫描停止失败：{e}")))?
@@ -148,7 +187,7 @@ mod imp {
         /// 当前已发现的 BlueLink 设备列表（首次发现序，同名合并）。
         /// 过滤口径与 ble 模块一致：只认广播服务里带 BlueLink 服务 UUID 的设备。
         pub async fn list_found(&self) -> Result<Vec<FoundDevice>, TransportError> {
-            let adapter = self.adapter.clone();
+            let adapter = self.adapter();
             let svc = service_uuid();
             let hits = tokio::task::spawn_blocking(move || {
                 let results = adapter.scan_get_results().map_err(sble_err)?;
@@ -406,6 +445,7 @@ mod imp {
             let StreamEnds {
                 incoming_tx,
                 outgoing_rx,
+                aired_bytes,
             } = ends;
             let session = SessionTx::new(incoming_tx);
 
@@ -431,17 +471,72 @@ mod imp {
 
             // 出站泵：流字节 → std 通道 → 专用线程按 ATT_CHUNK 切片写 INBOX
             // （simplersble 写是同步 FFI，不能堵异步运行时）。
+            // 写看门狗（v2.6.5，#18）：FFI 写楔死时线程本身掐不断——转发
+            // 任务兼任看门狗：队列里有货且写进度停滞超过 10 秒，判定无线
+            // 电栈楔死，主动断开链路让服务层走故障断开 + 自动重连（重连
+            // 会重新扫描捕获；bad exception 另有适配器重初始化兜底）。
+            // 旧版无任何看门狗：剪贴板大图同步期间双向帧流冻结、双边
+            // 只能靠心跳判死（真机实证 19 秒无入站、总中断约 90 秒）。
             let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
             let mut outgoing_rx = outgoing_rx;
-            tokio::spawn(async move {
-                while let Some((bytes, _slot)) = outgoing_rx.recv().await {
-                    if std_tx.send(bytes).is_err() {
-                        break;
+            let now_ms = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            };
+            let last_progress = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
+            let pending_msgs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            {
+                let p_disc = peripheral.clone();
+                let w_session = session.clone();
+                let last_progress_w = last_progress.clone();
+                let pending_w = pending_msgs.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            msg = outgoing_rx.recv() => {
+                                match msg {
+                                    Some((bytes, _slot)) => {
+                                        pending_w.fetch_add(1, Ordering::Relaxed);
+                                        // 入队也算活动（第三方评审采纳）：
+                                        // 看门狗的 10 秒窗口从「最后一片写完
+                                        // 与最后一条入队较晚者」起算，避免连接
+                                        // 空闲久后第一条消息被误判楔死。
+                                        last_progress_w.store(now_ms(), Ordering::Relaxed);
+                                        if std_tx.send(bytes).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
+                            _ = tick.tick() => {
+                                let stalled = pending_w.load(Ordering::Relaxed) > 0
+                                    && now_ms().saturating_sub(last_progress_w.load(Ordering::Relaxed)) > 10_000;
+                                if stalled {
+                                    crate::probe::log(
+                                        "simpleble",
+                                        "出站写进度停滞超过 10 秒（队列有货、帧流不动），判定无线电栈楔死，主动断开链路",
+                                    );
+                                    let p2 = p_disc.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = p2.disconnect();
+                                    })
+                                    .await;
+                                    w_session.close();
+                                    break;
+                                }
+                            }
+                        }
                     }
-                }
-            });
+                });
+            }
             let p_write = peripheral.clone();
             let w_session = session.clone();
+            let aired_wr = aired_bytes.clone();
             std::thread::spawn(move || {
                 let mut slicer = SliceEncoder::new();
                 while let Ok(bytes) = std_rx.recv() {
@@ -452,11 +547,21 @@ mod imp {
                         } else {
                             p_write.write_request(&svc, &inbox_s, &data)
                         };
-                        if r.is_err() {
-                            failed = true;
-                            break;
+                        match r {
+                            Ok(()) => {
+                                aired_wr.fetch_add(
+                                    data.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                last_progress.store(now_ms(), Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                failed = true;
+                                break;
+                            }
                         }
                     }
+                    pending_msgs.fetch_sub(1, Ordering::Relaxed);
                     if failed {
                         break;
                     }
@@ -465,7 +570,11 @@ mod imp {
                 w_session.close();
             });
 
-            Ok(Conn::new(stream, format!("simpleble:{device_id}")))
+            Ok(Conn::new_with_air(
+                stream,
+                format!("simpleble:{device_id}"),
+                aired_bytes,
+            ))
         }
     }
 
@@ -624,20 +733,30 @@ mod imp {
                             let StreamEnds {
                                 incoming_tx,
                                 mut outgoing_rx,
+                                aired_bytes,
                             } = ends;
                             let session = SessionTx::new(incoming_tx);
                             *link.lock().unwrap() = Some(session.clone());
                             // 出站泵：流字节 → 按 ATT_CHUNK 切片 set_value 通知对端
                             let out_char = outbox_pump.clone();
                             let w_session = session.clone();
+                            let aired_sv = aired_bytes.clone();
                             tokio::spawn(async move {
                                 let mut slicer = SliceEncoder::new();
                                 while let Some((bytes, _slot)) = outgoing_rx.recv().await {
                                     let mut failed = false;
                                     for piece in slicer.encode(&bytes) {
-                                        if out_char.set_value(&piece).is_err() {
-                                            failed = true;
-                                            break;
+                                        match out_char.set_value(&piece) {
+                                            Ok(()) => {
+                                                aired_sv.fetch_add(
+                                                    piece.len() as u64,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                            Err(_) => {
+                                                failed = true;
+                                                break;
+                                            }
                                         }
                                     }
                                     if failed {
@@ -651,7 +770,11 @@ mod imp {
                                 .unwrap()
                                 .clone()
                                 .unwrap_or_else(|| "peer".to_string());
-                            let conn = Conn::new(stream, format!("simpleble:{addr}"));
+                            let conn = Conn::new_with_air(
+                                stream,
+                                format!("simpleble:{addr}"),
+                                aired_bytes,
+                            );
                             if inbound_tx.send(conn).await.is_err() {
                                 break;
                             }
@@ -748,6 +871,8 @@ mod imp {
         }
 
         pub async fn forget_device(&self, _device_id: &str) {}
+
+        pub async fn reinit(&self) {}
     }
 
     /// SimpleBLE 服务端空壳（未编译）。

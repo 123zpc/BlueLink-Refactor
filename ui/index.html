@@ -414,7 +414,7 @@
         </div>
         <p class="muted small">在下方「关于」里连续点击版本号三次，可开启或关闭开发者模式。开启后，连接页可切换蓝牙传输方式（经典 / BLE / SimpleBLE），并多出局域网测试通道（仅供开发调试）。正式使用请用经典蓝牙。</p>
         <h3>关于</h3>
-        <p class="muted small version-line">BlueLink <span id="set-version"></span> — 离线聊天与文件传输（重构版）。</p>
+        <p class="muted small version-line">BlueLink <span id="set-version"></span>（重构版）</p>
         <div class="setting-row"><span>软件更新</span><span class="row-gap"><span id="update-status" class="muted small">仅手动检查，不会自动联网</span><button id="btn-check-update" class="btn small-btn">检查更新</button></span></div>
         <div class="setting-row"><span>作者</span><b>ZPC</b></div>
         <div class="setting-row"><span>邮箱</span><span class="muted small">privacyporton@proton.me</span></div>
@@ -484,6 +484,22 @@
       <div class="row-gap modal-btns">
         <button id="modal-cancel" class="btn">取消</button>
         <button id="modal-ok" class="btn danger-btn">确定</button>
+      </div>
+    </div>
+  </div>
+  <!-- 清空聊天记录范围选择（v2.6.5，#14）：先选范围再走通用确认框 -->
+  <div id="clear-modal" class="hidden">
+    <div class="modal-box">
+      <h3>清空聊天记录</h3>
+      <p class="muted small">只清除所选范围内的消息，范围外的记录不动。此操作不可恢复。</p>
+      <div class="clear-range-list">
+        <button class="btn clear-range" data-range="24h">近 24 小时</button>
+        <button class="btn clear-range" data-range="7d">近 7 天</button>
+        <button class="btn clear-range" data-range="30d">近 30 天</button>
+        <button class="btn clear-range danger-btn" data-range="all">全部记录</button>
+      </div>
+      <div class="row-gap modal-btns">
+        <button id="clear-cancel" class="btn">取消</button>
       </div>
     </div>
   </div>

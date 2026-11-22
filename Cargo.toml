@@ -18,7 +18,7 @@ members = [
 ble-peripheral-rust = { path = "third-party/ble-peripheral-rust" }
 
 [workspace.package]
-version = "2.6.4"
+version = "2.6.5"
 edition = "2021"
 license = "MIT"
 
