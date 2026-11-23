@@ -27,7 +27,7 @@ BlueLink is a peer-to-peer desktop messaging tool: no accounts, no cloud. Pair t
 - **Favorites and pins**: save and pin important messages, jump back to them anytime
 - **Clipboard sync**: copy on one computer, paste on the other (text and images)
 - **Built-in viewer**: open code and long text in-app, with syntax highlighting and formatting; file names can be corrected by hand
-- **AI assistant**: connect your own AI service (OpenAI-compatible API), ask via @AI in chat or send a message to AI for explanation; Q&A is stored only on your machine, never sent to the peer
+- **AI assistant**: connect your own AI service (OpenAI-compatible API), ask via `@AI` in chat or send a message to AI for explanation; Q&A is stored only on your machine, never sent to the peer
 - **Local API**: a built-in OpenAI-compatible endpoint bound to 127.0.0.1 only, so other software on your machine can use your configured AI; keys stay on your machine and never travel over Bluetooth
 - **Three transports**: Classic Bluetooth (default), BLE, and SimpleBLE — pick what fits your environment
 - **Dark / light themes**; closing the window keeps BlueLink running in the system tray
