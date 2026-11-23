@@ -754,7 +754,11 @@ mod tests {
         wire.extend_from_slice(&encode(&ping()).unwrap());
         let mut dec2 = FrameDecoder::new();
         dec2.push(&wire);
-        assert_eq!(dec2.next_frame(), Some(ping()), "未知帧丢弃后后续帧必须完好");
+        assert_eq!(
+            dec2.next_frame(),
+            Some(ping()),
+            "未知帧丢弃后后续帧必须完好"
+        );
         assert_eq!(dec2.frames_dropped, 1, "未知帧应计一次丢弃");
     }
 

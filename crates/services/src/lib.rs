@@ -672,7 +672,10 @@ fn clip_apply_atomic(
     let mut writes = 0u64;
     let cur = clip_read_with(cb);
     if cur.occupied && cur.content.is_none() {
-        return (ClipApplyOutcome::Failed("剪贴板被其他程序占用".into()), writes);
+        return (
+            ClipApplyOutcome::Failed("剪贴板被其他程序占用".into()),
+            writes,
+        );
     }
     let snapshot = cur.content;
     if let Some(c) = &snapshot {
@@ -700,9 +703,11 @@ fn clip_apply_atomic(
     // 读回空/不符 = 写入未生效 → 还原快照。
     let back = clip_read_with(cb);
     let verified = match (&content, &back.content) {
-        (ClipContent::Text(_), Some(ClipContent::Text(_))) => {
-            back.content.as_ref().map(|c| clip_equiv(c, content)).unwrap_or(false)
-        }
+        (ClipContent::Text(_), Some(ClipContent::Text(_))) => back
+            .content
+            .as_ref()
+            .map(|c| clip_equiv(c, content))
+            .unwrap_or(false),
         (
             ClipContent::Image { width, height, .. },
             Some(ClipContent::Image {
@@ -1813,8 +1818,8 @@ impl Node {
     ) {
         const DELAYS: [u64; 4] = [2, 5, 10, 30];
         // 冷静期加时不吃 180 秒重连预算（评审补强）
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(180 + extra_first_delay);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(180 + extra_first_delay);
         let mut attempt: u32 = 0;
         let gave_up = loop {
             attempt += 1;
@@ -2548,10 +2553,7 @@ impl Node {
                     // 同步写入本机的内容（含系统格式转换后的形态）：
                     // 基线已在裁决里推进，绝不回发（#16 防回环核心）
                     drop(g);
-                    log::log_verbose(
-                        "clipboard",
-                        "剪贴板监视：读到的是同步写入的内容，不回发",
-                    );
+                    log::log_verbose("clipboard", "剪贴板监视：读到的是同步写入的内容，不回发");
                     return;
                 }
                 ClipPollDecision::Send => {}
@@ -3884,22 +3886,38 @@ impl Node {
         // Windows 侧补强（评审）：`:` 可拼出 C:foo 驱动器相对路径
         // 跳出目标目录；尾随点/空格与保留名（CON/NUL/COM1…）会让
         // fs::rename 失败或行为异常，一并拒绝。
-        let stem_up = name
-            .split('.')
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
+        let stem_up = name.split('.').next().unwrap_or("").to_ascii_uppercase();
         let reserved = matches!(
             stem_up.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL"
-                | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8"
-                | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7"
-                | "LPT8" | "LPT9"
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
         );
         if name.len() > 160
             || name.contains('/')
             || name.contains('\\')
-            || name.chars().any(|c| c.is_control() || ":*?\"<>|".contains(c))
+            || name
+                .chars()
+                .any(|c| c.is_control() || ":*?\"<>|".contains(c))
             || name == "."
             || name == ".."
             || name.ends_with('.')
@@ -3979,7 +3997,10 @@ impl Node {
         }
         log::log_line(
             "files",
-            &format!("文件已改名（查看器手动定名）：{} → {}", msg.body, final_name),
+            &format!(
+                "文件已改名（查看器手动定名）：{} → {}",
+                msg.body, final_name
+            ),
         );
         Ok(final_name)
     }
@@ -4211,7 +4232,10 @@ impl Node {
             return Err(ServiceError::Other("只能清空 AI 会话的记录".into()));
         }
         let n = self.storage.clear_conversation_messages(conv_id)?;
-        log::log_line("ai", &format!("已清空 AI 会话「{}」的聊天记录 {n} 条", conv.title));
+        log::log_line(
+            "ai",
+            &format!("已清空 AI 会话「{}」的聊天记录 {n} 条", conv.title),
+        );
         Ok(n)
     }
 
@@ -5475,7 +5499,10 @@ mod clip_state_tests {
         let readback = ClipContent::Text("第一行\r\n第二行".into());
         b.note_applied(text.clone(), Some(readback.hash()));
         // B 监视读到转换形态：同步回声，不发送
-        assert!(matches!(b.poll_decide(&readback), ClipPollDecision::SyncEcho));
+        assert!(matches!(
+            b.poll_decide(&readback),
+            ClipPollDecision::SyncEcho
+        ));
         // B 监视读到原形态：同样认得出
         assert!(matches!(b.poll_decide(&text), ClipPollDecision::SyncEcho));
 
@@ -5505,7 +5532,10 @@ mod clip_state_tests {
         assert!(clip_equiv(&orig, &converted));
         let mut b = ClipGuard::default();
         b.note_applied(orig.clone(), Some(converted.hash()));
-        assert!(matches!(b.poll_decide(&converted), ClipPollDecision::SyncEcho));
+        assert!(matches!(
+            b.poll_decide(&converted),
+            ClipPollDecision::SyncEcho
+        ));
 
         // 行翻转 = 内容真变了：不许认成同步回声
         let mut flipped = img(4, 3, 7);
@@ -5546,7 +5576,10 @@ mod clip_state_tests {
         }
         assert_eq!(g.sent.len(), CLIP_SENT_CAP);
         let newest = ClipContent::Text(format!("内容{}", CLIP_SENT_CAP + 3));
-        assert!(matches!(g.apply_decide(&newest), ClipApplyDecision::EchoDrop));
+        assert!(matches!(
+            g.apply_decide(&newest),
+            ClipApplyDecision::EchoDrop
+        ));
         let fresh = ClipContent::Text("全新内容".into());
         assert!(matches!(g.poll_decide(&fresh), ClipPollDecision::Send));
         assert!(matches!(g.apply_decide(&fresh), ClipApplyDecision::Proceed));

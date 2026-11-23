@@ -309,7 +309,10 @@ impl SliceDecoder {
                 self.dups += 1;
                 crate::probe::log(
                     self.tag,
-                    &format!("切片重复（序号 {seq} 已入座），丢弃（累计 {} 次）", self.dups),
+                    &format!(
+                        "切片重复（序号 {seq} 已入座），丢弃（累计 {} 次）",
+                        self.dups
+                    ),
                 );
                 return out;
             }
@@ -323,7 +326,10 @@ impl SliceDecoder {
             if self.dups == 1 || self.dups.is_multiple_of(100) {
                 crate::probe::log(
                     self.tag,
-                    &format!("切片重复/迟到（序号 {seq}，期望 {exp}），丢弃（累计 {} 次）", self.dups),
+                    &format!(
+                        "切片重复/迟到（序号 {seq}，期望 {exp}），丢弃（累计 {} 次）",
+                        self.dups
+                    ),
                 );
             }
         }
@@ -1438,7 +1444,11 @@ mod tests {
             }
         }
         assert_eq!(dec.gaps, 0, "窗口内缺片应先等待，不许立即判定丢失");
-        assert_eq!(got, slices[0].len() - SLICE_HEADER, "只有缺片之前的载荷已交付");
+        assert_eq!(
+            got,
+            slices[0].len() - SLICE_HEADER,
+            "只有缺片之前的载荷已交付"
+        );
     }
 
     /// #19 回归（2026-11-22 真机定案复刻）：切片乱序到达（期望 232
@@ -1484,7 +1494,9 @@ mod tests {
         let mut slices: Vec<Vec<u8>> = Vec::new();
         let mut expect_data: Vec<u8> = Vec::new();
         for f in 0..4u32 {
-            let data: Vec<u8> = (0..(20_000 + f * 7_777)).map(|i| ((i + f * 31) % 251) as u8).collect();
+            let data: Vec<u8> = (0..(20_000 + f * 7_777))
+                .map(|i| ((i + f * 31) % 251) as u8)
+                .collect();
             expect_data.extend_from_slice(&data);
             slices.extend(enc.encode(&data));
         }
