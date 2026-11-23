@@ -657,6 +657,38 @@ impl Storage {
         Ok(deleted)
     }
 
+    /// 清空单个会话的全部消息（v2.6.6，#10②）：删除口径与范围清理
+    /// 一致（消息本体 + 彩签归属 + 标签 + 收藏/置顶标记 + FTS 重建），
+    /// 会话本身保留。专为默认会话「AI 助手」放行清空而设——它不可删、
+    /// 不可改名，但聊天记录可以清。
+    pub fn clear_conversation_messages(&self, conv_id: &str) -> Result<u64, StorageError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let sel = "SELECT id FROM messages WHERE conversation_id = ?1";
+        tx.execute(
+            &format!("DELETE FROM message_category WHERE message_id IN ({sel})"),
+            params![conv_id],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM message_tags WHERE message_id IN ({sel})"),
+            params![conv_id],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM message_marks WHERE message_id IN ({sel})"),
+            params![conv_id],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM messages WHERE conversation_id = ?1",
+            params![conv_id],
+        )? as u64;
+        tx.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     // 参数与 transfers 表字段一一对应，拆参数结构体反而更绕，这里豁免参数个数检查
     #[allow(clippy::too_many_arguments)]
     pub fn save_transfer(

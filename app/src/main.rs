@@ -1170,6 +1170,18 @@ fn delete_ai_conversation(
         .map_err(|e| e.to_string())
 }
 
+/// v2.6.6 #10②：清空一条 AI 会话的聊天记录（默认会话唯一放行的编辑操作）。
+#[tauri::command]
+fn clear_ai_conversation_messages(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<u64, String> {
+    state
+        .node
+        .clear_ai_conversation_messages(&conversation_id)
+        .map_err(|e| e.to_string())
+}
+
 /// 确保默认会话「AI 助手」（ai-default）的行存在（v2.6.2 补）：它原先
 /// 只在首次发 AI 消息时才落库，会话条在那之前不显它、删除回落也被
 /// 顶掉。前端加载会话条时缺了就调本命令补行（INSERT OR IGNORE 幂等）。
@@ -1671,6 +1683,20 @@ fn file_info(
             path: f.path,
             exists: f.exists,
         }))
+}
+
+/// 查看器内手动改名（v2.6.6，#8）：改名即该文件的最终身份（落库、
+/// 应用托管文件同步改磁盘名），返回最终生效的文件名。
+#[tauri::command]
+fn rename_message_file(
+    state: State<'_, AppState>,
+    message_id: String,
+    new_name: String,
+) -> Result<String, String> {
+    state
+        .node
+        .rename_message_file(&message_id, &new_name)
+        .map_err(|e| e.to_string())
 }
 
 /// 打开文件（#9 定版）：返回 "viewer" 表示应走内置查看器（文本/
@@ -2185,10 +2211,14 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
                 }) => {
                     let _ = app.emit("transfer_progress", serde_json::json!({"transfer_id": transfer_id, "msg_id": msg_id, "received": received, "total": total}));
                 }
-                Ok(Event::TransferState { transfer_id, state }) => {
+                Ok(Event::TransferState {
+                    transfer_id,
+                    state,
+                    msg_id,
+                }) => {
                     let _ = app.emit(
                         "transfer_state",
-                        serde_json::json!({"transfer_id": transfer_id, "state": state}),
+                        serde_json::json!({"transfer_id": transfer_id, "state": state, "msg_id": msg_id}),
                     );
                 }
                 Ok(Event::AiChunk {
@@ -2753,6 +2783,7 @@ fn main() {
             create_ai_conversation,
             rename_ai_conversation,
             delete_ai_conversation,
+            clear_ai_conversation_messages,
             ensure_ai_conversation,
             ai_ask_message,
             chat_ask_ai,
@@ -2788,6 +2819,7 @@ fn main() {
             clean_cache,
             clear_chat_history,
             file_info,
+            rename_message_file,
             group_files,
             save_group_images,
             read_text_file,

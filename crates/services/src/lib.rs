@@ -70,6 +70,9 @@ pub enum Event {
     TransferState {
         transfer_id: String,
         state: String,
+        /// 评审补强：状态事件自带 msg_id，前端记账不再依赖 progress
+        /// 事件先行到达才能绑气泡（无进度先行的取消/失败也能落定）。
+        msg_id: String,
     },
     AiChunk {
         conversation_id: String,
@@ -123,12 +126,15 @@ pub struct ReconnectTarget {
 /// 核对（用户中途主动断开/新连接建立都会让代号失效）。
 /// 会话结束的性质（v2.6.2）：决定断开后是否触发自动重连——
 /// 只有 Fault（链路结束/心跳判死/发送失败等意外中断）才重连；
-/// User（用户主动断开）绝不触发；Replaced（被新连接替换）也不触发。
+/// User（用户主动断开）绝不触发；Replaced（被新连接替换）也不触发；
+/// PeerGoodbye（对方发来 Goodbye 告别帧后断开，v2.6.6 #17）与 User
+/// 同规：对方是人主动断的，绝不许自动连回去打扰。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionEnd {
     User,
     Replaced,
     Fault,
+    PeerGoodbye,
 }
 
 pub type ReconnectDialer = std::sync::Arc<
@@ -238,6 +244,7 @@ pub fn classify_open(name: &str) -> OpenClass {
         "psm1",
         "vbs",
         "sql",
+        "ms",
         "json",
         "jsonl",
         "toml",
@@ -632,8 +639,10 @@ fn clip_write_with(cb: &mut arboard::Clipboard, content: &ClipContent) -> Result
 
 /// 远端内容写入本机剪贴板的结果（v2.6.5，#8 定案）。
 enum ClipApplyOutcome {
-    /// 已写入并回读验证生效。
-    Written,
+    /// 已写入并回读验证生效。readback_hash 是回读内容的哈希——
+    /// 经系统格式转换后它可能与线缆哈希不同，#16 应用登记要把它
+    /// 一并钉死，poll 才认得出「这是同步来的」。
+    Written { readback_hash: Option<String> },
     /// 本机当前内容与远端相同：不重复写（重复写会在系统剪贴板历史里
     /// 把同一内容记两遍——用户实报的「历史出现两遍」）。
     SkippedSame,
@@ -652,38 +661,47 @@ enum ClipApplyOutcome {
 /// EmptyClipboard 之后失败会把剪贴板留成空的（用户实报「剪贴板被
 /// 弄空、Ctrl+V 失效、须去历史里点一下才恢复」的机制定案），验证
 /// 不过立刻把写入前的快照原样写回，绝不把空剪贴板留给用户。
+/// 返回 (结果， 本次实际调用系统写入的次数）——#16 写入计数埋点：
+/// 调用方把次数累加进 ClipGuard.write_count 并落日志，真机对账
+/// 「剪贴板历史多一条」时能逐次定位是哪一次写入干的。
 fn clip_apply_atomic(
     cb: &mut arboard::Clipboard,
     content: &ClipContent,
     last_seen: Option<&str>,
-) -> ClipApplyOutcome {
-    let incoming = content.hash();
+) -> (ClipApplyOutcome, u64) {
+    let mut writes = 0u64;
     let cur = clip_read_with(cb);
     if cur.occupied && cur.content.is_none() {
-        return ClipApplyOutcome::Failed("剪贴板被其他程序占用".into());
+        return (ClipApplyOutcome::Failed("剪贴板被其他程序占用".into()), writes);
     }
     let snapshot = cur.content;
     if let Some(c) = &snapshot {
-        if c.hash() == incoming {
-            return ClipApplyOutcome::SkippedSame;
+        // 等价即算同（评审补强）：本机已有 \r\n 版、线上来 \n 版
+        // 时严格哈希会落进 SkippedLocalNewer 且不登记，下一拍有
+        // 被当成本机新复制回传的风险；等价判定与 poll 侧同口径。
+        if clip_equiv(c, content) {
+            return (ClipApplyOutcome::SkippedSame, writes);
         }
         if last_seen != Some(c.hash().as_str()) {
-            return ClipApplyOutcome::SkippedLocalNewer;
+            return (ClipApplyOutcome::SkippedLocalNewer, writes);
         }
     }
+    writes += 1;
     if let Err(e) = clip_write_with(cb, content) {
         // 写失败也可能已把剪贴板清空（先 Empty 后失败）：有快照就还原
         if let Some(snap) = &snapshot {
+            writes += 1;
             let _ = clip_write_with(cb, snap);
         }
-        return ClipApplyOutcome::Failed(e);
+        return (ClipApplyOutcome::Failed(e), writes);
     }
-    // 回读验证：文字比哈希；图片只比尺寸（RGBA 经系统格式往返不保证逐
-    // 字节一致，比哈希会误判）。读回空/不符 = 写入未生效 → 还原快照。
+    // 回读验证：文字比等价（行尾可能被系统改成 \r\n，哈希全等会误判，
+    // #16）；图片只比尺寸（RGBA 经系统格式往返不保证逐字节一致）。
+    // 读回空/不符 = 写入未生效 → 还原快照。
     let back = clip_read_with(cb);
     let verified = match (&content, &back.content) {
         (ClipContent::Text(_), Some(ClipContent::Text(_))) => {
-            back.content.as_ref().map(|c| c.hash()) == Some(incoming.clone())
+            back.content.as_ref().map(|c| clip_equiv(c, content)).unwrap_or(false)
         }
         (
             ClipContent::Image { width, height, .. },
@@ -697,23 +715,124 @@ fn clip_apply_atomic(
     };
     if !verified {
         if let Some(snap) = &snapshot {
+            writes += 1;
             let _ = clip_write_with(cb, snap);
         }
-        return ClipApplyOutcome::Failed("写入后回读验证未通过（已还原原内容）".into());
+        return (
+            ClipApplyOutcome::Failed("写入后回读验证未通过（已还原原内容）".into()),
+            writes,
+        );
     }
-    ClipApplyOutcome::Written
+    let readback_hash = back.content.as_ref().map(|c| c.hash());
+    (ClipApplyOutcome::Written { readback_hash }, writes)
 }
 
-/// 剪贴板同步的防回环状态：last_seen 是最近见过的本机剪贴板内容哈希
-/// （自己复制后发出的、或从对方写入的都算），suppress 是最近一次从对方
-/// 写入的内容哈希——监视到它时绝不回发，避免两台机器来回震荡。
-/// write_backoff_until / last_read_fail_log 是 v2.6.1 的退让与限频字段：
-/// 同步绝不许影响本机功能——写不进去立刻退让、不许重试风暴；读失败
-/// 要留痕但不许刷屏。
+/// 文字等价归一化：Windows 剪贴板文字在格式往返中常被改成 \r\n，
+/// 与线上原文哈希对不上——等价判定前先把行尾统一成 \n。
+fn clip_normalize_text(t: &str) -> String {
+    t.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// 两份剪贴板内容是否「同一份」（等价判定，v2.6.6 #16）：
+/// 系统剪贴板格式转换会改字节不改内容——文字可能换行尾、图片可能
+/// 动 alpha 通道或个别字节。哈希全等只是等价的特例；防回环必须按
+/// 等价认人，否则转换后的读回内容会被当成新复制、原样回传给对方
+/// （2026-11-22 双机日志定案：同步内容被原样回传 + 同内容重复发送，
+/// v2.6.5 的 suppress 按线缆哈希登记、与读回哈希对不上，未闭环）。
+fn clip_equiv(a: &ClipContent, b: &ClipContent) -> bool {
+    match (a, b) {
+        (ClipContent::Text(x), ClipContent::Text(y)) => {
+            clip_normalize_text(x) == clip_normalize_text(y)
+        }
+        (
+            ClipContent::Image {
+                width: w1,
+                height: h1,
+                rgba: r1,
+            },
+            ClipContent::Image {
+                width: w2,
+                height: h2,
+                rgba: r2,
+            },
+        ) => {
+            if w1 != w2 || h1 != h2 || r1.len() != r2.len() {
+                return false;
+            }
+            if r1 == r2 {
+                return true;
+            }
+            // 容忍：alpha 通道（每 4 字节第 4 字节）任意差异 + 其余
+            // 字节差异 ≤ 0.1%，且小图另按 5% 封顶（下限 2 字节）——
+            // 原下限 8 字节对 4x3 小图等于放行 1/6 像素改色，相近
+            // 小图标会被误判同一份、同步静默丢失（评审补强）。行
+            // 翻转/尺寸变化等真差异仍远超此界，不会误认。
+            let budget = (r1.len() / 1000).max(2).min(r1.len() / 20 + 1);
+            let mut diff = 0usize;
+            for (i, (x, y)) in r1.iter().zip(r2.iter()).enumerate() {
+                if x != y {
+                    if i % 4 == 3 {
+                        continue; // alpha 通道不计
+                    }
+                    diff += 1;
+                    if diff > budget {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 一次「从对方写入本机」的应用登记（#16）：线缆内容本体 + 线缆
+/// 哈希 + 写入后回读哈希，三样都留——poll 读到的本机内容无论与哪
+/// 一样对上（或与本体等价），都认作同步来的，绝不回发。
+struct AppliedClip {
+    content: ClipContent,
+    wire_hash: String,
+    readback_hash: Option<String>,
+}
+
+/// poll 一次读到本机内容后的裁决（#16 状态机，纯逻辑可单测）。
+enum ClipPollDecision {
+    /// 与本机基线相同：无变化。
+    Unchanged,
+    /// 是同步写入的内容（或其格式转换形态）：只更新基线，绝不发送。
+    SyncEcho,
+    /// 本机用户的新复制：发送给对方。
+    Send,
+}
+
+/// apply 收到对方内容时的裁决（#16 状态机，纯逻辑可单测）。
+enum ClipApplyDecision {
+    /// 是本机发出去过的内容被回传：回声，丢弃不写（写了会在系统
+    /// 剪贴板历史里把同一内容记第二遍）。
+    EchoDrop,
+    /// 本机已经是这份内容（或刚应用过等价内容）：不重复写。
+    AlreadyLocal,
+    /// 真新内容：走原子写入。
+    Proceed,
+}
+
+/// 剪贴板同步的防回环状态机（v2.6.6，#16 三本账重构）：
+/// - local_seen：本机基线——poll 最近在本机读到的内容哈希，只由
+///   prime/poll/apply 回读登记更新，语义是「本机剪贴板现在是什么」；
+/// - sent：发送登记（有界 FIFO）——本机发给对方过的内容哈希，
+///   apply 收到命中即判回声，永不被接收事件冲掉（旧版单槽 suppress
+///   正是被冲掉才漏）；
+/// - applied：应用登记——最近一次从对方写入的内容（本体+双哈希），
+///   poll 按等价认人，格式转换后的读回也认得出。
+///
+/// write_backoff_until / last_read_fail_log 是 v2.6.1 的退让与限频
+/// 字段：同步绝不许影响本机功能——写不进去立刻退让、不许重试风
+/// 暴；读失败要留痕但不许刷屏。
 #[derive(Default)]
 struct ClipGuard {
-    last_seen: Option<String>,
-    suppress: Option<String>,
+    local_seen: Option<String>,
+    sent: std::collections::VecDeque<String>,
+    applied: Option<AppliedClip>,
     /// 写剪贴板失败后的退让截止时刻：此前到达的远端内容直接丢弃不再尝试写。
     write_backoff_until: Option<std::time::Instant>,
     /// 上次记录「读剪贴板被占用」的时刻（限频：每分钟至多一条）。
@@ -725,6 +844,76 @@ struct ClipGuard {
     /// 正在延后的图片哈希（v2.6.5 评审补强）：延后期间用户复制了新图
     /// （哈希变了）要把延后计数清零重新让行，不能继承旧图的计数。
     clip_defer_hash: Option<String>,
+    /// 本进程经同步路径实际写入系统剪贴板的累计次数（#16 埋点）：
+    /// 真机再现「历史多一条」时，日志里第 N 次写入可逐次对账。
+    write_count: u64,
+}
+
+/// 发送登记容量：回声最迟隔一轮往返，16 条足够；超限挤掉最旧的。
+const CLIP_SENT_CAP: usize = 16;
+
+impl ClipGuard {
+    /// poll 裁决：读到的内容是没变、同步回声、还是用户新复制。
+    /// SyncEcho 时顺手把基线推进到读到的哈希（格式转换形态从此成本机基线）。
+    fn poll_decide(&mut self, content: &ClipContent) -> ClipPollDecision {
+        let hash = content.hash();
+        // 回声判定优先于基线判定：应用登记在册的内容（含格式转换
+        // 形态）无论基线在哪，都认作同步来的——基线可能已被 prime
+        // 或后续轮询推进过，不能让它把回声身份冲掉（#16 定案）。
+        if let Some(ap) = &self.applied {
+            if ap.wire_hash == hash
+                || ap.readback_hash.as_deref() == Some(hash.as_str())
+                || clip_equiv(content, &ap.content)
+            {
+                self.local_seen = Some(hash);
+                return ClipPollDecision::SyncEcho;
+            }
+        }
+        if self.local_seen.as_deref() == Some(hash.as_str()) {
+            return ClipPollDecision::Unchanged;
+        }
+        ClipPollDecision::Send
+    }
+
+    /// 发送成功后登记（基线 + 发送登记同记）。
+    fn note_sent(&mut self, hash: String) {
+        self.local_seen = Some(hash.clone());
+        if !self.sent.contains(&hash) {
+            self.sent.push_back(hash);
+            while self.sent.len() > CLIP_SENT_CAP {
+                self.sent.pop_front();
+            }
+        }
+    }
+
+    /// apply 裁决：回声/本机已有/真新内容。
+    fn apply_decide(&self, content: &ClipContent) -> ClipApplyDecision {
+        let hash = content.hash();
+        if self.sent.contains(&hash) {
+            return ClipApplyDecision::EchoDrop;
+        }
+        if self.local_seen.as_deref() == Some(hash.as_str()) {
+            return ClipApplyDecision::AlreadyLocal;
+        }
+        if let Some(ap) = &self.applied {
+            if ap.wire_hash == hash || clip_equiv(content, &ap.content) {
+                return ClipApplyDecision::AlreadyLocal;
+            }
+        }
+        ClipApplyDecision::Proceed
+    }
+
+    /// 写入成功（或本机已是该内容）后登记应用账：本体 + 线缆哈希 +
+    /// 回读哈希一并钉死；基线推进到回读哈希（poll 接下来读到的就是它）。
+    fn note_applied(&mut self, content: ClipContent, readback_hash: Option<String>) {
+        let wire_hash = content.hash();
+        self.local_seen = Some(readback_hash.clone().unwrap_or_else(|| wire_hash.clone()));
+        self.applied = Some(AppliedClip {
+            content,
+            wire_hash,
+            readback_hash,
+        });
+    }
 }
 
 /// 接收中的文件状态。
@@ -824,6 +1013,9 @@ struct PeerSession {
     /// 不会报错，只有「太久没有任何入站帧」是可靠信号（2026-11-20
     /// 双机日志实锤：一边会话已死、另一边 28 秒后才靠人工断开察觉）。
     last_inbound_ms: AtomicU64,
+    /// 对方已发来 Goodbye 告别帧（#17）：本会话无论从哪条路径收尾
+    /// （接收循环 EOF/心跳判死），都按「对方主动断开」分类、不重连。
+    peer_goodbye: AtomicBool,
 }
 
 /// 心跳节奏：每 5 秒发一帧 Ping（协议控制帧，对端现成回 Pong，任何
@@ -877,6 +1069,15 @@ pub struct Node {
     reconnect_active: AtomicBool,
     /// 应用层注册的拨号器（未注册时不自动重连，如纯服务层测试场景）。
     reconnect_dialer: Mutex<Option<ReconnectDialer>>,
+    /// #17 重连抑制窗：收到 Goodbye 的对端 peer_id → 抑制截止时刻。
+    /// 收到告别帧即登记（10 分钟），maybe_start_reconnect 命中未过期
+    /// 条目直接不启动；attach 成功（用户手动连上）即清除。兜底防线：
+    /// 即使会话分类在某条竞态路径上漏标，抑制窗也能拦下自动重连。
+    reconnect_suppress: Mutex<HashMap<String, std::time::Instant>>,
+    /// #17 冷静期兜底：peer_id → （窗口起始时刻， 120 秒窗内
+    /// 连续 Fault 次数）。告别帧没送达（旧版对端/链路已死）时，
+    /// 反复断开-重连的循环靠它逐步拉长首次重连等待，不许 2 秒一撞。
+    fault_history: Mutex<HashMap<String, (std::time::Instant, u32)>>,
 }
 
 impl Node {
@@ -1007,6 +1208,8 @@ impl Node {
             reconnect_gen: std::sync::atomic::AtomicU64::new(0),
             reconnect_active: AtomicBool::new(false),
             reconnect_dialer: Mutex::new(None),
+            reconnect_suppress: Mutex::new(HashMap::new()),
+            fault_history: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -1306,7 +1509,13 @@ impl Node {
             peer,
             conversation_id,
             last_inbound_ms: AtomicU64::new(now_ms() as u64),
+            peer_goodbye: AtomicBool::new(false),
         });
+        // #17：手动/自动连上即解除该对端的重连抑制（抑制只管自动重连）
+        self.reconnect_suppress
+            .lock()
+            .await
+            .remove(&session.peer.device_id);
         // 已有旧会话时先按「被新连接替换」收尾再换上新会话，不许无声覆盖
         let old = self.peer.lock().await.clone();
         if let Some(old) = old {
@@ -1393,7 +1602,30 @@ impl Node {
     pub async fn disconnect(self: &Arc<Self>) {
         let session = self.peer.lock().await.clone();
         match session {
-            Some(s) => self.end_session(&s, "用户主动断开", SessionEnd::User).await,
+            Some(s) => {
+                // #17 告别信号：先尽力把 Goodbye 帧发出去再关链——没有
+                // 这一步，对方只见链路结束、一律按意外中断自动重连，
+                // 用户手动断 5 次被连回 5 次（2026-11-22 真机定案）。
+                // 短超时 best-effort：链路已死时发不出去也不许拖住断开
+                // 本身，对方靠抑制窗/冷静期兜底（旧版对端解不出此帧，
+                // 按坏帧丢弃，连接照常关闭）。
+                let sent = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    s.conn.send(&Frame::Control(Control::Goodbye)),
+                )
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+                log::log_line(
+                    "conn",
+                    if sent {
+                        "已向对方发送主动断开信号（Goodbye），随后关闭连接"
+                    } else {
+                        "主动断开信号（Goodbye）未能送出（链路可能已断），直接关闭连接"
+                    },
+                );
+                self.end_session(&s, "用户主动断开", SessionEnd::User).await;
+            }
             None => {
                 // 无会话也要停掉可能在跑的自动重连（重连中点断开）
                 self.reconnect_gen
@@ -1436,6 +1668,23 @@ impl Node {
             *guard = None;
         }
         self.clip_peer_on.store(false, Ordering::Relaxed);
+        // #17 分类兜底：会话期间收到过 Goodbye 的，任何路径（接收循环
+        // EOF/心跳判死/发送失败）的 Fault 收尾一律改判「对方主动断
+        // 开」——告别帧的语义不许被收尾路径的竞态冲掉。
+        let kind = if kind == SessionEnd::Fault && session.peer_goodbye.load(Ordering::Relaxed) {
+            log::log_line(
+                "conn",
+                "本次断开改判：对方此前已发主动断开信号（Goodbye），不触发自动重连",
+            );
+            SessionEnd::PeerGoodbye
+        } else {
+            kind
+        };
+        let reason = if kind == SessionEnd::PeerGoodbye && !reason.contains("对方主动断开") {
+            "对方主动断开"
+        } else {
+            reason
+        };
         log::log_line(
             "conn",
             &format!("连接已断开（{reason}）：对方 {}", session.peer.name),
@@ -1451,12 +1700,28 @@ impl Node {
         // 自动重连分流（v2.6.2）：用户主动断开清目标、停循环，绝不
         // 重连；意外中断（Fault）且留有回拨目标时拉起重连循环。
         match kind {
-            SessionEnd::User => {
+            SessionEnd::User | SessionEnd::PeerGoodbye => {
                 self.reconnect_gen
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 *self.reconnect_target.lock().await = None;
             }
             SessionEnd::Fault => {
+                // #17 冷静期记账：120 秒窗内连续 Fault 次数供重连
+                // 首次等待递增（告别帧没送达时的断-连循环兜底）
+                {
+                    let mut hist = self.fault_history.lock().await;
+                    let now = std::time::Instant::now();
+                    let entry = hist
+                        .entry(session.peer.device_id.clone())
+                        .or_insert((now, 0));
+                    if now.duration_since(entry.0) > std::time::Duration::from_secs(120) {
+                        *entry = (now, 0);
+                    }
+                    // 注：entry.0 是窗口起始时刻，只在重置时更新——
+                    // 每拍刷新会让「120 秒窗」变成「距上次 Fault 120
+                    // 秒」，偶发 Fault 间隔 <120 秒便永不归零（评审）。
+                    entry.1 += 1;
+                }
                 self.maybe_start_reconnect().await;
             }
             SessionEnd::Replaced => {}
@@ -1491,6 +1756,32 @@ impl Node {
             self.reconnect_active.store(false, Ordering::Relaxed);
             return;
         };
+        // #17 抑制窗：对方发过 Goodbye 且未过期 → 绝不自动重连
+        {
+            let mut sup = self.reconnect_suppress.lock().await;
+            let now = std::time::Instant::now();
+            sup.retain(|_, until| *until > now);
+            if sup.contains_key(&target.peer_id) {
+                log::log_line(
+                    "conn",
+                    &format!(
+                        "自动重连被抑制：{} 此前已发主动断开信号（Goodbye），抑制窗内不许连回",
+                        target.name
+                    ),
+                );
+                self.reconnect_active.store(false, Ordering::Relaxed);
+                return;
+            }
+        }
+        // #17 冷静期：120 秒内连续 Fault ≥2 次，首次等待从 2 秒起
+        // 逐次递增（+5 秒/次、封顶 30 秒）——防告别帧丢失时的撞墙循环
+        let extra_first_delay = {
+            let hist = self.fault_history.lock().await;
+            match hist.get(&target.peer_id) {
+                Some((_, n)) if *n >= 2 => (((*n as u64) - 1) * 5).min(30),
+                _ => 0,
+            }
+        };
         let gen = self
             .reconnect_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1498,24 +1789,38 @@ impl Node {
         log::log_line(
             "conn",
             &format!(
-                "连接意外中断，已启动自动重连（目标 {}，退避 2/5/10/30 秒，总限时 180 秒）",
-                target.name
+                "连接意外中断，已启动自动重连（目标 {}，退避 2/5/10/30 秒，总限时 180 秒{}）",
+                target.name,
+                if extra_first_delay > 0 {
+                    format!("；冷静期：首次等待额外 +{extra_first_delay} 秒")
+                } else {
+                    String::new()
+                }
             ),
         );
         let node = self.clone();
-        tokio::spawn(async move { node.reconnect_loop(target, gen).await });
+        tokio::spawn(async move { node.reconnect_loop(target, gen, extra_first_delay).await });
     }
 
     /// 重连循环：退避 2→5→10→30 秒封顶，总限时 180 秒；代号失效
     /// （用户主动断开/新连接建立）立即停手；成功后发 connected 事件，
     /// 界面据 ConnectionChanged 落回该对端会话（㉛ 落点规则）。
-    async fn reconnect_loop(self: Arc<Self>, target: ReconnectTarget, gen: u64) {
+    async fn reconnect_loop(
+        self: Arc<Self>,
+        target: ReconnectTarget,
+        gen: u64,
+        extra_first_delay: u64,
+    ) {
         const DELAYS: [u64; 4] = [2, 5, 10, 30];
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        // 冷静期加时不吃 180 秒重连预算（评审补强）
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(180 + extra_first_delay);
         let mut attempt: u32 = 0;
         let gave_up = loop {
             attempt += 1;
-            let delay = DELAYS[((attempt - 1) as usize).min(3)];
+            // #17 冷静期只加在首次等待上，后续退避照旧
+            let delay = DELAYS[((attempt - 1) as usize).min(3)]
+                + if attempt == 1 { extra_first_delay } else { 0 };
             // 可中断等待：每 200ms 核对一次代号，失效立刻停手
             let until = tokio::time::Instant::now() + std::time::Duration::from_secs(delay);
             while tokio::time::Instant::now() < until {
@@ -1529,6 +1834,24 @@ impl Node {
             }
             if tokio::time::Instant::now() >= deadline {
                 break true;
+            }
+            // #17 补强：抑制窗可能在本循环启动后才登记（对方
+            // Goodbye 迟到），每次拨号前复核，命中立即停手。
+            {
+                let sup = self.reconnect_suppress.lock().await;
+                if sup
+                    .get(&target.peer_id)
+                    .is_some_and(|until| *until > std::time::Instant::now())
+                {
+                    log::log_line(
+                        "conn",
+                        &format!(
+                            "自动重连停手：{} 已发主动断开信号（Goodbye），抑制窗内不许连回",
+                            target.name
+                        ),
+                    );
+                    break false;
+                }
             }
             self.emit(Event::ReconnectState {
                 peer_name: target.name.clone(),
@@ -1667,6 +1990,22 @@ impl Node {
             Frame::Control(Control::Ping) => {
                 session.conn.send(&Frame::Control(Control::Pong)).await?;
             }
+            Frame::Control(Control::Goodbye) => {
+                // #17：对方主动断开——给会话打标（收尾时改判、不重连）
+                // 并立即登记节点级抑制窗（10 分钟），双保险防竞态漏标
+                session.peer_goodbye.store(true, Ordering::Relaxed);
+                self.reconnect_suppress.lock().await.insert(
+                    session.peer.device_id.clone(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(600),
+                );
+                log::log_line(
+                    "conn",
+                    &format!(
+                        "收到对方主动断开信号（Goodbye）：{}——本次断开后不自动重连",
+                        session.peer.name
+                    ),
+                );
+            }
             Frame::Control(Control::Pong)
             | Frame::Control(Control::Hello { .. })
             | Frame::Control(Control::HelloAck { .. }) => {}
@@ -1769,19 +2108,22 @@ impl Node {
                 // 若本机正在发送这条传输：置取消标记，发送循环下一片即停
                 self.cancelled.lock().await.insert(transfer_id.clone());
                 // 对方取消了发送：清掉接收中的半成品（.part 与内存状态）
+                let mut cancel_msg_id = String::new();
                 if let Some(st) = self.recv_files.lock().await.remove(&transfer_id) {
+                    cancel_msg_id = st.msg_id.clone();
                     let _ = std::fs::remove_file(&st.part_path);
                     let _ = self
                         .storage
                         .update_message_status(&st.msg_id, MessageStatus::Failed);
                     self.emit(Event::MessageStatus {
-                        id: st.msg_id,
+                        id: st.msg_id.clone(),
                         status: MessageStatus::Failed,
                     });
                 }
                 self.emit(Event::TransferState {
                     transfer_id,
                     state: "cancelled".into(),
+                    msg_id: cancel_msg_id,
                 });
             }
             Frame::Control(Control::AiProxyRequest {
@@ -1894,6 +2236,7 @@ impl Node {
         self.emit(Event::TransferState {
             transfer_id: transfer_id.to_string(),
             state: "cancelled".into(),
+            msg_id: msg_id.to_string(),
         });
     }
 
@@ -2161,7 +2504,7 @@ impl Node {
         }) = read
         {
             let mut g = self.clip_guard.lock().await;
-            g.last_seen = Some(content.hash());
+            g.local_seen = Some(content.hash());
         }
         log::log_verbose(
             "clipboard",
@@ -2198,14 +2541,20 @@ impl Node {
         let Some(content) = read.content else { return };
         let hash = content.hash();
         {
-            let g = self.clip_guard.lock().await;
-            if g.last_seen.as_deref() == Some(hash.as_str()) {
-                return; // 没变化
-            }
-            if g.suppress.as_deref() == Some(hash.as_str()) {
-                // 这是刚从对方同步写入本机的内容，绝不回发（防回环）。
-                // 注意此处不更新 last_seen 也无妨：apply 写入时已登记。
-                return;
+            let mut g = self.clip_guard.lock().await;
+            match g.poll_decide(&content) {
+                ClipPollDecision::Unchanged => return, // 没变化
+                ClipPollDecision::SyncEcho => {
+                    // 同步写入本机的内容（含系统格式转换后的形态）：
+                    // 基线已在裁决里推进，绝不回发（#16 防回环核心）
+                    drop(g);
+                    log::log_verbose(
+                        "clipboard",
+                        "剪贴板监视：读到的是同步写入的内容，不回发",
+                    );
+                    return;
+                }
+                ClipPollDecision::Send => {}
             }
         }
         match content {
@@ -2223,7 +2572,7 @@ impl Node {
                     g.clip_defer_hash = None;
                 }
                 let n = text.len();
-                // last_seen 在发送成功后才登记（第三方评审采纳）：先登记
+                // 发送登记在发送成功后才记（第三方评审采纳）：先登记
                 // 再发送的话，发送失败这一份就永远不会重试、静默丢失。
                 if session
                     .conn
@@ -2235,7 +2584,7 @@ impl Node {
                     .is_ok()
                 {
                     let mut g = self.clip_guard.lock().await;
-                    g.last_seen = Some(hash);
+                    g.note_sent(hash);
                     log::log_verbose("clipboard", &format!("剪贴板同步：已发送文字（{n} 字节）"));
                 }
             }
@@ -2299,10 +2648,10 @@ impl Node {
                     compression: comp_algo,
                     data,
                 });
-                // last_seen 同样在发送成功后才登记（评审采纳，同文字路径）
+                // 发送登记同样在发送成功后才记（评审采纳，同文字路径）
                 if session.conn.send(&frame).await.is_ok() {
                     let mut g = self.clip_guard.lock().await;
-                    g.last_seen = Some(hash);
+                    g.note_sent(hash);
                     log::log_line(
                         "clipboard",
                         &format!("剪贴板同步：已发送图片（{width}x{height}，{n} 字节）"),
@@ -2426,15 +2775,27 @@ impl Node {
         };
         let last_seen_snapshot;
         {
-            let g = self.clip_guard.lock().await;
-            // 本机剪贴板已经是这份内容：再写一遍纯属多余，还会在系统
-            // 历史里记两遍——跳过（同步绝不影响本机功能的第一道闸）
-            if g.last_seen.as_deref() == Some(hash.as_str()) {
-                log::log_verbose(
-                    "clipboard",
-                    "收到对方剪贴板内容，与本机当前内容相同，跳过写入",
-                );
-                return;
+            let mut g = self.clip_guard.lock().await;
+            // #16 状态机裁决：回声（本机发出去过的）直接丢弃不写——
+            // 写了会在系统剪贴板历史里把同一内容记第二遍；本机已是
+            // 这份内容（或刚应用过等价内容）同样不重复写。
+            match g.apply_decide(&content) {
+                ClipApplyDecision::EchoDrop => {
+                    log::log_line(
+                        "clipboard",
+                        "收到对方回传的本机内容（回声），已丢弃、不写入本机剪贴板",
+                    );
+                    return;
+                }
+                ClipApplyDecision::AlreadyLocal => {
+                    g.note_applied(content.clone(), Some(hash.clone()));
+                    log::log_verbose(
+                        "clipboard",
+                        "收到对方剪贴板内容，与本机当前内容相同，跳过写入",
+                    );
+                    return;
+                }
+                ClipApplyDecision::Proceed => {}
             }
             // 上次写入失败后的退让期内：直接丢弃，绝不重试硬抢系统剪贴板
             if g.write_backoff_until
@@ -2444,47 +2805,54 @@ impl Node {
                 log::log_verbose("clipboard", "剪贴板写入退让中，丢弃本条远端内容（不重试）");
                 return;
             }
-            last_seen_snapshot = g.last_seen.clone();
+            last_seen_snapshot = g.local_seen.clone();
         }
         // 读→比→写→验在同一个阻塞任务里一次完成（见 clip_apply_atomic）
         let written = content.clone();
         let node = self.clone();
         let result = tokio::task::spawn_blocking(move || {
             node.with_clipboard(|cb| clip_apply_atomic(cb, &written, last_seen_snapshot.as_deref()))
-                .unwrap_or(ClipApplyOutcome::Failed("系统剪贴板不可用".into()))
+                .unwrap_or((ClipApplyOutcome::Failed("系统剪贴板不可用".into()), 0))
         })
         .await;
         match result {
-            Ok(ClipApplyOutcome::Written) => {
-                {
+            Ok((ClipApplyOutcome::Written { readback_hash }, writes)) => {
+                let n = {
                     let mut g = self.clip_guard.lock().await;
-                    g.suppress = Some(hash.clone());
-                    g.last_seen = Some(hash);
-                }
-                log::log_verbose("clipboard", &format!("剪贴板同步：已写入对方{desc}"));
+                    g.write_count += writes;
+                    // 应用登记：本体 + 线缆哈希 + 回读哈希一并钉死
+                    g.note_applied(content, readback_hash);
+                    g.write_count
+                };
+                log::log_line(
+                    "clipboard",
+                    &format!("剪贴板同步：已写入对方{desc}（本进程第 {n} 次剪贴板写入）"),
+                );
                 self.emit(Event::ClipboardSynced {
                     kind: kind.to_string(),
                 });
             }
-            Ok(ClipApplyOutcome::SkippedSame) => {
-                // 本机已是这份内容：只更新防回环登记，不重复写
+            Ok((ClipApplyOutcome::SkippedSame, _)) => {
+                // 本机已是这份内容：只更新应用登记，不重复写
                 let mut g = self.clip_guard.lock().await;
-                g.suppress = Some(hash.clone());
-                g.last_seen = Some(hash);
+                g.note_applied(content, Some(hash));
                 log::log_verbose(
                     "clipboard",
                     "收到对方剪贴板内容，本机已是该内容，未重复写入",
                 );
             }
-            Ok(ClipApplyOutcome::SkippedLocalNewer) => {
-                // 本机用户刚复制的新内容优先：不写、不登记 suppress——
+            Ok((ClipApplyOutcome::SkippedLocalNewer, _)) => {
+                // 本机用户刚复制的新内容优先：不写、不登记应用账——
                 // 本机监视下一拍会把用户的新内容同步给对方（最新者胜）。
                 log::log_line(
                     "clipboard",
                     "收到对方剪贴板内容，但本机刚被复制了新内容，本机优先、未覆盖",
                 );
             }
-            Ok(ClipApplyOutcome::Failed(e)) => {
+            Ok((ClipApplyOutcome::Failed(e), writes)) => {
+                let mut g = self.clip_guard.lock().await;
+                g.write_count += writes;
+                drop(g);
                 self.clip_write_failed(&e).await;
             }
             Err(e) => {
@@ -2584,6 +2952,7 @@ impl Node {
                     self.emit(Event::TransferState {
                         transfer_id: transfer_id.clone(),
                         state: "done".into(),
+                        msg_id: msg.id.clone(),
                     });
                 } else {
                     self.storage
@@ -2595,6 +2964,7 @@ impl Node {
                     self.emit(Event::TransferState {
                         transfer_id: transfer_id.clone(),
                         state: "verify_failed".into(),
+                        msg_id: msg.id.clone(),
                     });
                 }
                 Ok(transfer_id)
@@ -2750,6 +3120,7 @@ impl Node {
         self.emit(Event::TransferState {
             transfer_id: transfer_id.clone(),
             state: "verifying".into(),
+            msg_id: msg_id.clone(),
         });
         let verify_wait_t0 = std::time::Instant::now(); // ⑳ 发送端等校验计时
         let ok = tokio::time::timeout(std::time::Duration::from_secs(60), vrx)
@@ -3073,6 +3444,7 @@ impl Node {
                         self.emit(Event::TransferState {
                             transfer_id: tid.clone(),
                             state: "verify_failed".into(),
+                            msg_id: bad.msg_id.clone(),
                         });
                         log::log_line(
                             "files",
@@ -3113,6 +3485,7 @@ impl Node {
                         self.emit(Event::TransferState {
                             transfer_id: tid.clone(),
                             state: "verify_failed".into(),
+                            msg_id: bad.msg_id.clone(),
                         });
                         log::log_line(
                             "files",
@@ -3146,6 +3519,7 @@ impl Node {
                 self.emit(Event::TransferState {
                     transfer_id: tid.clone(),
                     state: "verify_failed".into(),
+                    msg_id: bad.msg_id.clone(),
                 });
                 log::log_line(
                     "files",
@@ -3244,9 +3618,17 @@ impl Node {
     ) -> Result<(), ServiceError> {
         let done_t0 = std::time::Instant::now(); // ⑳ 「收完→发出确认」计时
                                                  // 先给本方界面一个「校验中」状态，别让进度条在 100% 干挂着
+        let mid = self
+            .recv_files
+            .lock()
+            .await
+            .get(&transfer_id)
+            .map(|st| st.msg_id.clone())
+            .unwrap_or_default();
         self.emit(Event::TransferState {
             transfer_id: transfer_id.clone(),
             state: "verifying".into(),
+            msg_id: mid,
         });
         let mut st = self
             .recv_files
@@ -3283,6 +3665,7 @@ impl Node {
                 self.emit(Event::TransferState {
                     transfer_id: transfer_id.clone(),
                     state: "verify_failed".into(),
+                    msg_id: st.msg_id.clone(),
                 });
                 log::log_line(
                     "files",
@@ -3342,6 +3725,7 @@ impl Node {
             self.emit(Event::TransferState {
                 transfer_id: transfer_id.clone(),
                 state: "done".into(),
+                msg_id: st.msg_id.clone(),
             });
             log::log_line(
                 "files",
@@ -3358,6 +3742,7 @@ impl Node {
             self.emit(Event::TransferState {
                 transfer_id: transfer_id.clone(),
                 state: "verify_failed".into(),
+                msg_id: st.msg_id.clone(),
             });
             log::log_line("files", &format!("接收校验失败，已删除半成品：{}", st.name));
         }
@@ -3479,6 +3864,124 @@ impl Node {
             &format!("已按范围清空聊天记录（范围 {range}，共删除 {n} 条消息）"),
         );
         Ok(n)
+    }
+
+    /// #8（v2.6.6）：查看器内手动改名——用户给出的文件名+后缀即该
+    /// 文件的最终身份：落库（消息正文与文件记录同步改），之后不再
+    /// 被自动识别重猜。磁盘实体只对应用托管文件真改名（位于本机
+    /// 数据目录内：接收文件在 downloads、暂存文档在 outbox；冲突
+    /// 自动加 (n) 去重）；用户自有原文件（发送时引用、路径在数据
+    /// 目录外）绝不碰磁盘、只改应用内身份。返回最终生效的文件名。
+    pub fn rename_message_file(
+        &self,
+        message_id: &str,
+        new_name: &str,
+    ) -> Result<String, ServiceError> {
+        let name = new_name.trim();
+        if name.is_empty() {
+            return Err(ServiceError::Other("文件名不能为空".into()));
+        }
+        // Windows 侧补强（评审）：`:` 可拼出 C:foo 驱动器相对路径
+        // 跳出目标目录；尾随点/空格与保留名（CON/NUL/COM1…）会让
+        // fs::rename 失败或行为异常，一并拒绝。
+        let stem_up = name
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let reserved = matches!(
+            stem_up.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL"
+                | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8"
+                | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7"
+                | "LPT8" | "LPT9"
+        );
+        if name.len() > 160
+            || name.contains('/')
+            || name.contains('\\')
+            || name.chars().any(|c| c.is_control() || ":*?\"<>|".contains(c))
+            || name == "."
+            || name == ".."
+            || name.ends_with('.')
+            || name.ends_with(' ')
+            || reserved
+        {
+            return Err(ServiceError::Other("文件名不合法".into()));
+        }
+        let msg = self
+            .storage
+            .get_message(message_id)?
+            .ok_or_else(|| ServiceError::Other("消息不存在".into()))?;
+        let file_id = msg
+            .file_id
+            .clone()
+            .ok_or_else(|| ServiceError::Other("该消息没有关联文件".into()))?;
+        let mut meta = self
+            .storage
+            .get_file(&file_id)?
+            .ok_or_else(|| ServiceError::Other("文件记录不存在".into()))?;
+        let mut final_name = name.to_string();
+        let mut renamed_from: Option<PathBuf> = None;
+        let old_path = PathBuf::from(&meta.path);
+        // 应用托管判定：路径在本机数据目录内（downloads/outbox 等）
+        let data_root = self
+            .default_download_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.download_dir());
+        if !meta.path.is_empty() && old_path.starts_with(&data_root) && old_path.is_file() {
+            if let Some(dir) = old_path.parent() {
+                let mut target = dir.join(name);
+                if target != old_path && target.exists() {
+                    // 冲突去重：stem (n).ext
+                    let (stem, ext) = match name.rfind('.') {
+                        Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
+                        _ => (name, ""),
+                    };
+                    let mut n = 1u32;
+                    loop {
+                        let cand = if ext.is_empty() {
+                            format!("{stem} ({n})")
+                        } else {
+                            format!("{stem} ({n}).{ext}")
+                        };
+                        target = dir.join(&cand);
+                        if !target.exists() {
+                            final_name = cand;
+                            break;
+                        }
+                        n += 1;
+                        if n > 999 {
+                            return Err(ServiceError::Other("同名文件过多，改名失败".into()));
+                        }
+                    }
+                }
+                if target != old_path {
+                    std::fs::rename(&old_path, &target)?;
+                    renamed_from = Some(old_path.clone());
+                    meta.path = target.to_string_lossy().to_string();
+                }
+            }
+        }
+        meta.name = final_name.clone();
+        // 落库与磁盘改名尽量原子（评审补强）：任一落库失败就把
+        // 磁盘名改回去，不许留下「磁盘新名、记录旧名」的孤儿。
+        let db = (|| -> Result<(), ServiceError> {
+            self.storage.save_file(&meta)?;
+            self.storage.update_message_body(message_id, &final_name)?;
+            Ok(())
+        })();
+        if let Err(e) = db {
+            if let Some(from) = &renamed_from {
+                let _ = std::fs::rename(&meta.path, from);
+            }
+            return Err(e);
+        }
+        log::log_line(
+            "files",
+            &format!("文件已改名（查看器手动定名）：{} → {}", msg.body, final_name),
+        );
+        Ok(final_name)
     }
 
     /// 在接收目录里定位一个已落地文件：根目录优先，其次按日分夹
@@ -3648,6 +4151,11 @@ impl Node {
     /// ㉕ AI 会话改名并持久化：只许改 Ai 类会话（设备会话名是对方设备名，
     /// 不归用户改）。
     pub fn rename_ai_conversation(&self, conv_id: &str, title: &str) -> Result<(), ServiceError> {
+        // v2.6.6 #10② 双保险：默认会话「AI 助手」不可改名（前端已禁用
+        // 入口，这里再拦一道，报错文案与前端提示同口径）
+        if conv_id == "ai-default" {
+            return Err(ServiceError::Other("默认会话「AI 助手」不能改名".into()));
+        }
         let title = title.trim();
         if title.is_empty() {
             return Err(ServiceError::Other("会话名不能为空".into()));
@@ -3687,6 +4195,24 @@ impl Node {
             &format!("已删除 AI 会话「{}」（含全部消息）", conv.title),
         );
         Ok(())
+    }
+
+    /// 清空一条 AI 会话的全部聊天记录（v2.6.6，#10②）：会话保留、
+    /// 只清消息。默认会话「AI 助手」**放行**——这是它唯一允许的编辑
+    /// 操作（不可删/不可改名/不可移动，记录可清）。
+    pub fn clear_ai_conversation_messages(&self, conv_id: &str) -> Result<u64, ServiceError> {
+        let conv = self
+            .storage
+            .list_conversations()?
+            .into_iter()
+            .find(|c| c.id == conv_id)
+            .ok_or_else(|| ServiceError::Other("会话不存在".into()))?;
+        if conv.kind != ConversationKind::Ai {
+            return Err(ServiceError::Other("只能清空 AI 会话的记录".into()));
+        }
+        let n = self.storage.clear_conversation_messages(conv_id)?;
+        log::log_line("ai", &format!("已清空 AI 会话「{}」的聊天记录 {n} 条", conv.title));
+        Ok(n)
     }
 
     /// ㉕ 解析 AI 页当前打开的会话：前端传了就校验必须是已存在的 Ai
@@ -4861,8 +5387,14 @@ mod reconnect_tests {
         a.attach(conn, false, &code).await.unwrap();
         assert!(a.is_connected().await);
         a.send_text("断前消息", None).await.unwrap();
-        // B 侧杀掉会话：A 收到 EOF = 意外中断，应触发自动重连
-        b.disconnect().await;
+        // B 侧杀掉会话（走 Fault 收尾、不发 Goodbye，模拟进程被杀/
+        // 链路被拔）：A 收到 EOF = 意外中断，应触发自动重连。
+        // 注：v2.6.6 起不能再用 b.disconnect() 模拟意外——那是用户
+        // 主动断开、会先发 Goodbye，A 按 #17 本就不许重连（见下方
+        // 双向验证段）。
+        let b_session = b.peer.lock().await.clone().expect("B 应有会话");
+        b.end_session(&b_session, "测试模拟意外中断", SessionEnd::Fault)
+            .await;
         // 退避首拍 2 秒 + 拨号，给足 20 秒观察窗
         let mut reconnected = false;
         for _ in 0..40 {
@@ -4892,7 +5424,132 @@ mod reconnect_tests {
         a.disconnect().await;
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         assert!(!a.is_connected().await, "用户主动断开后不许自动重连");
+        // #17 双向验证（v2.6.6，上轮盲区补验）：重新连上后改由 B
+        // 用户主动断开——B 的 disconnect 会先发 Goodbye，A 收到后
+        // 本次断开必须按「对方主动断开」分类、绝不自动连回。
+        a.set_pending_route(format!("tcp:{addr}")).await;
+        let conn = bluelink_transport::connect_tcp(&addr).await.unwrap();
+        a.attach(conn, false, &code).await.unwrap();
+        assert!(a.is_connected().await && b.is_connected().await);
+        b.disconnect().await;
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert!(
+            !a.is_connected().await,
+            "对方主动断开（Goodbye）后不许自动重连（#17）"
+        );
+        assert!(!b.is_connected().await);
         accept_alive.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod clip_state_tests {
+    use super::*;
+
+    fn img(w: u32, h: u32, fill: u8) -> ClipContent {
+        ClipContent::Image {
+            width: w,
+            height: h,
+            rgba: vec![fill; (w * h * 4) as usize],
+        }
+    }
+
+    /// #16 核心回归（2026-11-22 双机日志复刻）：A 复制 → 发送；
+    /// B 应用后，本机读回的内容经系统格式转换（文字 \n→\r\n、
+    /// 图片 alpha 通道翻转）字节已变——B 的监视必须认出这是同步
+    /// 来的（SyncEcho、绝不回发）；万一回声仍漏到 A，A 的 apply
+    /// 必须按发送登记丢弃（EchoDrop、绝不写入）。
+    #[test]
+    fn 格式转换回声被状态机拦截() {
+        // A：用户复制文字 → 裁决发送 → 登记
+        let mut a = ClipGuard::default();
+        let text = ClipContent::Text("第一行\n第二行".into());
+        assert!(matches!(a.poll_decide(&text), ClipPollDecision::Send));
+        a.note_sent(text.hash());
+        // A 再读到同一内容：无变化
+        assert!(matches!(a.poll_decide(&text), ClipPollDecision::Unchanged));
+
+        // B：收到 → 裁决写入 → 登记（回读哈希 = 转换形态的哈希）
+        let mut b = ClipGuard::default();
+        assert!(matches!(b.apply_decide(&text), ClipApplyDecision::Proceed));
+        let readback = ClipContent::Text("第一行\r\n第二行".into());
+        b.note_applied(text.clone(), Some(readback.hash()));
+        // B 监视读到转换形态：同步回声，不发送
+        assert!(matches!(b.poll_decide(&readback), ClipPollDecision::SyncEcho));
+        // B 监视读到原形态：同样认得出
+        assert!(matches!(b.poll_decide(&text), ClipPollDecision::SyncEcho));
+
+        // 假设回声仍漏回 A：A 按发送登记丢弃，绝不写入（历史不重复）
+        assert!(matches!(a.apply_decide(&text), ClipApplyDecision::EchoDrop));
+        // A 收到 B 的等价转换形态（线缆哈希不同）：靠基线/应用账判本机已有
+        let mut a2 = ClipGuard::default();
+        a2.note_applied(text.clone(), Some(text.hash()));
+        assert!(matches!(
+            a2.apply_decide(&readback),
+            ClipApplyDecision::AlreadyLocal
+        ));
+    }
+
+    /// #16 图片路径：alpha 通道被系统翻转（0↔255）+ 个别字节微差，
+    /// 仍判等价；整图行翻转（真差异）不许误认。
+    #[test]
+    fn 图片格式转换等价判定() {
+        let orig = img(4, 3, 7);
+        let mut converted = img(4, 3, 7);
+        if let ClipContent::Image { rgba, .. } = &mut converted {
+            for i in (3..rgba.len()).step_by(4) {
+                rgba[i] = 255; // alpha 全翻转
+            }
+            rgba[0] = 9; // 个别字节微差（预算内）
+        }
+        assert!(clip_equiv(&orig, &converted));
+        let mut b = ClipGuard::default();
+        b.note_applied(orig.clone(), Some(converted.hash()));
+        assert!(matches!(b.poll_decide(&converted), ClipPollDecision::SyncEcho));
+
+        // 行翻转 = 内容真变了：不许认成同步回声
+        let mut flipped = img(4, 3, 7);
+        if let ClipContent::Image { rgba, .. } = &mut flipped {
+            let row = 4 * 4usize;
+            let mut rows: Vec<Vec<u8>> = rgba.chunks(row).map(|c| c.to_vec()).collect();
+            rows.reverse();
+            *rgba = rows.concat();
+            // 填充值全同翻转看不出，改成行间不同填充再翻
+            for (ri, r) in rgba.chunks_mut(row).enumerate() {
+                for byte in r.iter_mut() {
+                    *byte = (ri * 40) as u8;
+                }
+            }
+        }
+        let mut orig2 = img(4, 3, 0);
+        if let ClipContent::Image { rgba, .. } = &mut orig2 {
+            let row = 4 * 4usize;
+            for (ri, r) in rgba.chunks_mut(row).enumerate() {
+                for byte in r.iter_mut() {
+                    *byte = ((2 - ri) * 40) as u8;
+                }
+            }
+        }
+        assert!(!clip_equiv(&orig2, &flipped), "行序不同的图片不许判等价");
+    }
+
+    /// #16 发送登记有界：挤掉最旧的后，老回声不再拦截（可接受的
+    /// 边界），新登记始终有效；用户真新复制永远判 Send。
+    #[test]
+    fn 发送登记有界且新内容放行() {
+        let mut g = ClipGuard::default();
+        let mut hashes = Vec::new();
+        for i in 0..(CLIP_SENT_CAP + 4) {
+            let c = ClipContent::Text(format!("内容{i}"));
+            hashes.push(c.hash());
+            g.note_sent(c.hash());
+        }
+        assert_eq!(g.sent.len(), CLIP_SENT_CAP);
+        let newest = ClipContent::Text(format!("内容{}", CLIP_SENT_CAP + 3));
+        assert!(matches!(g.apply_decide(&newest), ClipApplyDecision::EchoDrop));
+        let fresh = ClipContent::Text("全新内容".into());
+        assert!(matches!(g.poll_decide(&fresh), ClipPollDecision::Send));
+        assert!(matches!(g.apply_decide(&fresh), ClipApplyDecision::Proceed));
     }
 }
 

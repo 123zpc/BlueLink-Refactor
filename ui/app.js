@@ -31,6 +31,13 @@ const state = {
   catEditId: null,
   pendingFiles: [],
   transferMap: {},
+  // #2 传输权威记账（v2.6.6）：transfer_id → { msgId, received,
+  // total, state }。事件先记账再上屏；气泡迟建（分页补页/重渲染）
+  // 时按账回放进度与终态。旧版只有 transferMap 单向映射 + 事件
+  // 到达时现查气泡 + lastFileBubble 单例兜底：连珠速发时事件先于
+  // 气泡到达、或重渲染把单例换掉，进度就冻在半路（v2.6.5 验后
+  // #2 真机实锤：文件 130ms 已达，前端双双冻在 66%）。
+  transfers: {},
   // 滚动定版（v2.6.2，用户亲自收口）：每容器一个跟随开关——贴底时
   // 为 true；用户手势（滚轮/触摸/拖滚动条/键盘）一出立即置 false，
   // 不靠位置猜；恢复只由自滚回底/点回到最新/本人发送触发。
@@ -40,7 +47,6 @@ const state = {
   favIds: new Set(),
   pins: [],
   pinIds: new Set(),
-  lastFileBubble: null,
   btDevice: null,
   btDeviceName: null,
   connectTransport: null, // 本次连接用的传输（自发起时记下，已连接卡副行用；被动连入时为 null）
@@ -228,6 +234,8 @@ function autoGrow(el) {
     const row = el.closest(".composer-row");
     if (row) row.classList.toggle("grown", el.scrollHeight > COMPOSER_MIN_H + 4 || el.value.length > 3000);
   }
+  // #21：输入框长高/缩回时，可见中的 toast 锚定其当前上沿实时跟随
+  if (typeof toastVisible === "function" && toastVisible()) positionToast();
 }
 function wireAutoGrow(id) {
   const el = $(id);
@@ -239,6 +247,162 @@ wireAutoGrow("input");
 wireAutoGrow("ai-input");
 window.addEventListener("resize", () => { autoGrow($("input")); autoGrow($("ai-input")); });
 /** 构建一条消息的 DOM（无头像，靠左右对齐与底色区分双方）。opts.ai 表示 AI 会话样式。 */
+// ---------- #2 传输记账与气泡绘制（v2.6.6） ----------
+/** 进度事件记账：先落账，再由调用方决定画到哪个气泡（账是唯一
+ * 权威，气泡在不在场不影响记录完整性）。 */
+function noteTransferProgress(transfer_id, msg_id, received, total) {
+  let rec = state.transfers[transfer_id];
+  if (!rec) rec = state.transfers[transfer_id] = { msgId: null, received: 0, total: 0, state: null };
+  if (msg_id) { rec.msgId = msg_id; state.transferMap[msg_id] = transfer_id; }
+  rec.received = received;
+  rec.total = total;
+  return rec;
+}
+/** 状态事件记账（终态以最后到达的为准）。 */
+function noteTransferState(transfer_id, tstate, msgId) {
+  let rec = state.transfers[transfer_id];
+  if (!rec) rec = state.transfers[transfer_id] = { msgId: null, received: 0, total: 0, state: null };
+  // 后端状态事件自带 msg_id（评审补强）：直接绑账，不再依赖
+  // progress 事件先行到达——无进度先行的取消/失败也能落定气泡
+  if (msgId && !rec.msgId) { rec.msgId = msgId; state.transferMap[msgId] = transfer_id; }
+  if (!rec.msgId) {
+    const mid = Object.keys(state.transferMap).find((k) => state.transferMap[k] === transfer_id);
+    if (mid) rec.msgId = mid;
+  }
+  rec.state = tstate;
+  return rec;
+}
+function transferRecordOf(msgId) {
+  const tid = state.transferMap[msgId];
+  return tid ? state.transfers[tid] : null;
+}
+function bubbleOfMsg(mid) {
+  if (!mid) return null;
+  const row = document.querySelector(`[data-mid="${mid}"]`);
+  return row ? row.querySelector(".bubble") : null;
+}
+const TRANSFER_TERMINAL = ["done", "cancelled", "verify_failed"];
+
+/** 把一条传输记录的进度画到气泡上（事件实时绘制与气泡迟建回放共用）。 */
+function paintTransferProgress(b, rec) {
+  const { received, total } = rec;
+  const bar = b.querySelector(".progress");
+  const fill = b.querySelector(".progress > div");
+  // #18 图片气泡：进度走贴底细条 + 胶囊明示「发送中/接收中」，
+  // 与「校验中」严格分开（校验是传输完成后的独立状态）。
+  if (b.classList.contains("img-bubble") && b._imgWrap) {
+    const strip = b._imgWrap.querySelector(".img-strip");
+    const sfill = b._imgWrap.querySelector(".img-strip > div");
+    const cap = b._imgWrap.querySelector(".img-cap");
+    const pct = total ? Math.floor((received / total) * 100) : 0;
+    if (strip && sfill) {
+      strip.classList.remove("hidden");
+      sfill.style.width = pct + "%";
+    }
+    if (cap) {
+      cap.classList.remove("hidden");
+      const mine = b.closest(".msg-row")?.dataset.sender === "me";
+      cap.textContent = mine ? `发送中 ${pct}%` : `接收中 ${pct}%`;
+    }
+    if (received < total && !b.dataset.flowing) {
+      const side = b.closest(".msg-row")?.dataset.sender === "me" ? "me" : "peer";
+      b.dataset.flowing = side;
+      ringSet(side, true);
+    }
+    return;
+  }
+  if (bar && fill) {
+    bar.classList.remove("hidden");
+    const pct = total ? Math.floor((received / total) * 100) : 0;
+    fill.style.width = pct + "%";
+    const meta = b.querySelector(".progress-meta");
+    if (meta) {
+      meta.classList.remove("hidden");
+      meta.textContent = `${pct}% · ${fmtSize(received)} / ${fmtSize(total)}`;
+    }
+    const cancel = b.querySelector(".progress-cancel");
+    if (cancel && received < total) cancel.classList.remove("hidden");
+    if (received < total && !b.dataset.flowing) {
+      const side = b.closest(".msg-row")?.dataset.sender === "me" ? "me" : "peer";
+      b.dataset.flowing = side;
+      ringSet(side, true);
+    }
+  }
+}
+
+/** 把一条传输记录的状态画到气泡上（事件实时绘制与迟建回放共用；
+ * 对已终态的传输再调用一次即「就地落定」，取消按钮处理用）。 */
+function paintTransferState(b, rec, replay) {
+  const tstate = rec.state;
+  const mid = rec.msgId;
+  if (!tstate) return;
+  const bar = b.querySelector(".progress");
+  const meta = b.querySelector(".progress-meta");
+  const cancel = b.querySelector(".progress-cancel");
+  const retry = b.querySelector(".transfer-retry");
+  if (cancel) cancel.classList.add("hidden");
+  if (b.dataset.flowing) { ringSet(b.dataset.flowing, false); delete b.dataset.flowing; }
+  // #1/#18 图片气泡的状态机：细条与胶囊承载全部状态，失败换失败卡
+  if (b.classList.contains("img-bubble") && b._imgWrap) {
+    const wrap = b._imgWrap;
+    const strip = wrap.querySelector(".img-strip");
+    const sfill = wrap.querySelector(".img-strip > div");
+    const cap = wrap.querySelector(".img-cap");
+    const fail = wrap.querySelector(".img-fail");
+    const photo = wrap.querySelector(".img-photo");
+    if (tstate === "verifying") {
+      if (strip && sfill) { strip.classList.remove("hidden"); sfill.style.width = "100%"; }
+      if (cap) { cap.classList.remove("hidden"); cap.textContent = "校验中"; }
+    } else if (tstate === "done") {
+      if (mid) attachImagePhoto(b, mid);
+      setTimeout(() => {
+        if (strip) strip.classList.add("hidden");
+        if (cap) cap.classList.add("hidden");
+      }, 400);
+    } else if (tstate === "verify_failed") {
+      if (strip) strip.classList.add("hidden");
+      if (cap) cap.classList.add("hidden");
+      if (photo) photo.classList.add("hidden");
+      if (fail) fail.classList.remove("hidden");
+      if (retry) retry.classList.remove("hidden");
+    } else if (tstate === "cancelled") {
+      if (strip) strip.classList.add("hidden");
+      if (cap) { cap.classList.remove("hidden"); cap.textContent = "已取消"; }
+      if (retry) retry.classList.remove("hidden");
+    }
+    return;
+  }
+  if (tstate === "done") {
+    // 「已完成」只在气泡正显示着进度时闪现一下（实时事件路径）；
+    // 迟建回放时进度本就没露面，不许凭空闪一行字再消失。注意
+    // 回放顺序是先画进度（条会变可见）再画状态，必须靠 replay
+    // 标记区分，不能只看 bar 可见性（评审补强）。
+    if (!replay && meta && bar && !bar.classList.contains("hidden")) {
+      meta.classList.remove("hidden");
+      meta.textContent = "已完成";
+    }
+    const fname = b.querySelector(".file-name");
+    if (mid && fname && isImageExt(fileExt(fname.textContent || ""))) attachImagePreview(b, mid);
+    setTimeout(() => {
+      if (bar) bar.classList.add("hidden");
+      if (meta) meta.classList.add("hidden");
+    }, 400);
+  } else if (tstate === "verifying") {
+    if (bar) bar.classList.remove("hidden");
+    if (meta) {
+      meta.classList.remove("hidden");
+      const mine = b.closest(".msg-row")?.dataset.sender === "me";
+      meta.textContent = mine ? "已发送，等待对方校验…" : "已收完，正在校验…";
+    }
+  } else if (tstate === "cancelled") {
+    if (meta) { meta.classList.remove("hidden"); meta.textContent = "已取消"; }
+    if (retry) retry.classList.remove("hidden");
+  } else if (tstate === "verify_failed") {
+    if (meta) { meta.classList.remove("hidden"); meta.textContent = "校验失败，文件不完整"; }
+    if (retry) retry.classList.remove("hidden");
+  }
+}
+
 function buildMessageEl(m, opts = {}) {
   const row = document.createElement("div");
   row.className = "msg-row" + (m.sender === "me" ? " me" : "");
@@ -262,7 +426,6 @@ function buildMessageEl(m, opts = {}) {
     buildGroupBubble(bubble, m, row);
   } else if (m.kind === "file") {
     bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div><div class="progress hidden"><div></div></div><div class="progress-meta hidden"></div><button class="progress-cancel hidden">取消</button><button class="transfer-retry hidden">重试</button>`;
-    state.lastFileBubble = bubble;
     // ㉑ 单张图片在气泡里直接出预览（详见 attachImagePreview）
     if (isImageExt(fileExt(m.body))) attachImagePhoto(bubble, m.id);
     bubble.addEventListener("click", (e) => {
@@ -270,9 +433,20 @@ function buildMessageEl(m, opts = {}) {
       openFileSmart(m, e.clientX, e.clientY);
     });
     bubble.querySelector(".progress-cancel").addEventListener("click", async () => {
+      // #2：对已终态的传输点取消 = 就地落定气泡（旧版把取消发给
+      // 早已结束的传输、界面纹丝不动，用户以为取消失效）
+      const rec = transferRecordOf(m.id);
+      if (rec && TRANSFER_TERMINAL.includes(rec.state)) { paintTransferState(bubble, rec); return; }
       const tid = state.transferMap[m.id];
       if (tid) await invoke("cancel_transfer", { transferId: tid });
     });
+    // #2 回放：气泡迟建（分页补页/整页重渲染）时按权威账补画
+    // 进度与终态——事件比气泡先到也不丢、全部落定
+    const trec = transferRecordOf(m.id);
+    if (trec) {
+      if (trec.total) paintTransferProgress(bubble, trec);
+      if (trec.state) paintTransferState(bubble, trec, true);
+    }
     bubble.querySelector(".transfer-retry").addEventListener("click", async () => {
       try {
         await invoke("resend_message", { messageId: m.id });
@@ -327,10 +501,10 @@ function buildMessageEl(m, opts = {}) {
   const btns = [["彩签", (e) => openCatPop(m.id, e.currentTarget)], ["收藏", () => toggleMark(m.id, "favorite")], ["置顶", () => toggleMark(m.id, "pin")]];
   // 图片组的正文是清单 JSON，引用/问AI 对它无意义，不给这两个入口
   if (!opts.ai && m.kind !== "imagegroup") btns.push(["引用", () => setReply(m)], ["问AI", () => askAiAbout(m)]);
-  if (opts.ai && m.sender === "ai") btns.push(["复制", () => navigator.clipboard.writeText(m.body)], ["重新生成", () => regenerateAi()]);
+  if (opts.ai && m.sender === "ai") btns.push(["复制", () => copyText(m.body)], ["重新生成", () => regenerateAi()]);
   // 聊天里的 @AI 回答同样给复制/重新生成（v2.6.1 ⑭：此前只有 AI 页有，
   // 聊天侧点了没反应/没入口）；重新生成走 chat_regenerate_ai 按原问题重答
-  if (!opts.ai && m.sender === "ai") btns.push(["复制", () => navigator.clipboard.writeText(m.body)], ["重新生成", () => chatRegenerateAi(m)]);
+  if (!opts.ai && m.sender === "ai") btns.push(["复制", () => copyText(m.body)], ["重新生成", () => chatRegenerateAi(m)]);
   // #10 AI 回复收起（v2.6.2）：长回复看过一遍可折成收缩条，状态按
   // 消息 id 持久化（localStorage，重启不丢），两处（AI 页/聊天）同效。
   if (m.sender === "ai") btns.push([aiCollapsed(m.id) ? "展开" : "收起", (e) => toggleAiCollapse(m, bubble, e.currentTarget)]);
@@ -354,7 +528,7 @@ function buildMessageEl(m, opts = {}) {
   }
   wrap.appendChild(bubble); wrap.appendChild(meta);
   row.appendChild(wrap);
-  row.addEventListener("contextmenu", (e) => { e.preventDefault(); openMsgMenu(m, e.clientX, e.clientY); });
+  row.addEventListener("contextmenu", (e) => { e.preventDefault(); openMsgMenu(m, e.clientX, e.clientY, !!opts.ai); });
   refreshMessageCategory(m.id, tagsSpan);
   return row;
 }
@@ -678,6 +852,8 @@ function switchView(view) {
   if (view === "settings") loadSettings();
   // 置顶栏按视图各一份（⑲）：进聊天/AI 页时都刷新到本会话的置顶
   if (view === "ai" || view === "chat") refreshPinBar();
+  // #21：切页后可见中的 toast 按新页面的输入框重新锚定
+  if (typeof toastVisible === "function" && toastVisible()) positionToast();
 }
 
 document.querySelectorAll(".nav-item").forEach((b) =>
@@ -692,8 +868,19 @@ document.querySelectorAll(".nav-item").forEach((b) =>
  * ① 恢复优先：已打开过会话详情 → 回到刚才那个详情（切去别页再切回不丢）；
  * ② 已连接 → 当前连接对端的会话（「有连接了，那么就是这个会话」）；
  * ③ 未连接 → 一律落连接页（不分有无会话），不许落到「进聊天页但没选
- * 会话」的空态。进详情的手动路径唯一：展开会话列表点某个具体会话。 */
+ * 会话」的空态。进详情的手动路径唯一：展开会话列表点某个具体会话。
+ * QA161 裁定（v2.6.6）：①只在已连接时成立——未连接（含刚断开、含
+ * 刚手动看过离线详情）点「聊天」永远落连接页，恢复资格进未连接即清。 */
 async function goChat() {
+  // QA161 语义裁定（v2.6.6，用户 2026-11-22 拍板）：「切回恢复」只在
+  // 已连接 regime 成立——未连接时点「聊天」一律落连接页，哪怕刚手动
+  // 打开过离线详情（离线详情不进恢复资格）；顺手清掉恢复资格，进
+  // 未连接状态即作废（断开事件处亦有清零，双保险）。
+  if (!state.connected) {
+    state.chatDetailOpen = false;
+    switchView("connect");
+    return;
+  }
   if (state.chatDetailOpen && state.peerConvId) { switchView("chat"); return; }
   if (state.connected) {
     if (state.connectedConvId) {
@@ -1043,17 +1230,13 @@ function setReply(m) {
 let docSuggestion = null; // {name, kind: "code" | "long"}
 let docDismissed = false; // 用户对当前内容选择了「仍按文本发送」
 
-const FENCE_EXT = { rust: "rs", rs: "rs", python: "py", py: "py", javascript: "js", js: "js", typescript: "ts", ts: "ts", go: "go", java: "java", c: "c", cpp: "cpp", "c++": "cpp", json: "json", html: "html", css: "css", markdown: "md", md: "md", shell: "sh", bash: "sh", sh: "sh", text: "txt", txt: "txt" };
-const CODE_SIGNALS = [
-  { re: /^\s*(pub\s+)?(async\s+)?fn\s+\w+\s*\(|^\s*use\s+[\w:]+;|\w+\s*->\s*[\w&]+\s*\{?\s*$/, name: "代码片段.rs" },
-  { re: /^\s*def\s+\w+\s*\(|^\s*(import|from)\s+[\w.]+|^\s*class\s+\w+.*:\s*$/, name: "代码片段.py" },
-  { re: /^\s*(function|const|let|var)\s+\w+|=>\s*\{|console\.log\(/, name: "代码片段.js" },
-  { re: /^\s*package\s+[\w.]+;|^\s*public\s+(final\s+)?(class|static)/, name: "代码片段.java" },
-  { re: /^#include\s*[<"]|^\s*int\s+main\s*\(/, name: "代码片段.c" },
-  { re: /^\s*package\s+main\b|^\s*func\s+\w+\s*\(/, name: "代码片段.go" },
-];
+const FENCE_EXT = { rust: "rs", rs: "rs", python: "py", py: "py", javascript: "js", js: "js", typescript: "ts", ts: "ts", go: "go", java: "java", c: "c", cpp: "cpp", "c++": "cpp", json: "json", html: "html", css: "css", markdown: "md", md: "md", shell: "sh", bash: "sh", sh: "sh", text: "txt", txt: "txt", sql: "sql", magicapi: "ms", magic: "ms", magicscript: "ms", ms: "ms", csharp: "cs", "c#": "cs", cs: "cs" };
 
-/** 识别输入内容是否应转文档：围栏代码块 / 代码特征 / 超长纯文本。返回 {name, kind} 或 null。 */
+/** 识别输入内容是否应转文档：围栏代码块 / 全文强特征打分 / 超长
+ * 纯文本。返回 {name, kind} 或 null。
+ * 语言判定自 v2.6.6（#5）起走 classify.js 的全文权重打分（旧版只
+ * 看头几行的特征表把 Java 判成 Python，用户实报）：打分有置信
+ * 门槛，判不准就退纯文本——长文走长文.txt，短的按普通文字发。 */
 function detectDocument(text) {
   const t = text.trim();
   if (t.length < 60) return null;
@@ -1062,21 +1245,12 @@ function detectDocument(text) {
     const ext = FENCE_EXT[(fence[1] || "txt").toLowerCase()] || "txt";
     return { name: "代码片段." + ext, kind: "code" };
   }
-  // #8 万行粘贴防冻（v2.6.2）：代码信号只扫前 300 行——判定结论与
-  // 全扫一致（前 300 行足够定性），万行文本不再整篇逐行跑正则。
-  const lines = t.split("\n", 300);
-  if (lines.length >= 4) {
-    let codeLines = 0;
-    let firstName = null;
-    for (const line of lines) {
-      for (const s of CODE_SIGNALS) {
-        if (s.re.test(line)) { codeLines++; if (!firstName) firstName = s.name; break; }
-      }
-    }
-    const braceLines = lines.filter((l) => /[{};]\s*$/.test(l.trim())).length;
-    if (codeLines >= 2 || (codeLines >= 1 && braceLines >= 3)) {
-      return { name: firstName || "代码片段.txt", kind: "code" };
-    }
+  if (window.Classify) {
+    const r = Classify.classifyText(text);
+    if (r.confident) return { name: "代码片段." + r.ext, kind: "code" };
+  } else if (!window.__classifyWarned) {
+    window.__classifyWarned = 1;
+    console.warn("classify.js 未加载，语言识别降级为长文.txt");
   }
   if (t.length > 1000) return { name: "长文.txt", kind: "long" };
   return null;
@@ -1216,12 +1390,15 @@ function insertTextAtCursor(text) {
   ta.dispatchEvent(new Event("input", { bubbles: true }));
   autoGrow(ta);
 }
-/** #2 超大粘贴闸值：超过这个字数的内容不再进输入框（30 万行级粘贴
- * 实测把主线程冻死几十秒）。分类只采样、转文件走后端落盘。 */
+/** 草稿总量闸值：点发送时草稿超过这个字数，整体转成一个文件
+ * 发送（文字路径要全文落库 + 渲染巨气泡，两头都是冻死源）。
+ * 注意只是「发送瞬间」的闸——输入过程中不做任何转换（#4 定版，
+ * 见下方粘贴处理）。 */
 const PASTE_FILE_THRESHOLD = 100000;
 
-/** #2 超大粘贴转文件：采样分类 → 后端落盘 → 进待发队列，全程不碰
- * 输入框的全文布局。 */
+/** 发送瞬间把整份草稿转成一个文件入队：采样分类 → 后端落盘 →
+ * 进待发队列。只在 sendCurrent 里调用（#4 定版：转换时机=点击
+ * 发送那一刻，按草稿总量整体判定，分批输入的内容合并成一份）。 */
 async function stageHugeTextAsFile(text) {
   const det = detectDocument(text.slice(0, 20000));
   const name = det ? det.name : "长文.txt";
@@ -1229,7 +1406,7 @@ async function stageHugeTextAsFile(text) {
     const path = await invoke("stage_text_document", { name, content: text });
     const added = await stageFilePaths([path]);
     if (!added) throw new Error("文件入队失败");
-    showToast(`粘贴内容过大（${text.length.toLocaleString()} 字），已转成文件「${name}」，点发送即可发出`);
+    showToast(`内容过大（${text.length.toLocaleString()} 字），已整体转成文件「${name}」发送`);
     return true;
   } catch (err) {
     showToast("内容过大，转文件失败：" + err);
@@ -1241,13 +1418,12 @@ $("input").addEventListener("paste", async (e) => {
   const cd = e.clipboardData;
   if (!cd) return;
   const text = cd.getData("text/plain") || "";
-  // #2 超大粘贴必须在插入输入框之前拦下：全文插入 + 布局测量就是
-  // 冻死源。超限直接转文件，交互保持响应。
-  if (text.length > PASTE_FILE_THRESHOLD) {
-    e.preventDefault();
-    await stageHugeTextAsFile(text);
-    return;
-  }
+  // #4 草稿整体化（v2.6.6，用户定版）：粘贴一律以文字形态进输入
+  // 框累积——不管分几批、每批多大，输入过程中绝不做任何转文件
+  // 动作（旧版单批超限即单独转文件，把一份草稿拆成两半，用户实
+  // 报）。是否转文件、何种后缀，只在点发送的那一刻按草稿总量
+  // 整体判定（sendCurrent 的闸）。防冻靠既有机制兜底：autoGrow
+  // 对长内容跳过测量、识别打分有采样上限、草稿不存超限内容。
   const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   const pathListOnly = lines.length > 0
     && lines.every((l) => /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(l));
@@ -2269,19 +2445,42 @@ async function copyText(text) {
  * 都是落盘文件）复用文件菜单，「打开文件位置」「复制文件」都在里面；
  * 其余项与悬停动作一致（收藏/置顶/引用/问AI）。菜单容器与文件菜单共用
  * #file-menu（点外关闭逻辑现成）。 */
-function openMsgMenu(m, x, y) {
+function openMsgMenu(m, x, y, ai = false) {
   if (m.kind === "file") { openFileMenu(m.id, x, y); return; }
   if (m.kind === "imagegroup") { openGroupMenu(m, x, y); return; }
   if (m.kind === "system") return;
   const menu = $("file-menu");
   menu.innerHTML = "";
-  const items = [
-    ["复制", () => copyText(m.body)],
-    ["收藏", () => toggleMark(m.id, "favorite")],
-    [state.pinIds.has(m.id) ? "取消置顶" : "置顶", () => toggleMark(m.id, "pin")],
-    ["引用", () => setReply(m)],
-    ["问AI", () => askAiAbout(m)],
-  ];
+  // v2.6.6 #13/#14：菜单按区域生成、文案随状态——AI 区引用走 AI 引用条
+  // （原实现复用聊天引用、点了没反应且语义错位），不出现「问AI」；
+  // 收藏/置顶文案按当前状态出（取消收藏/取消置顶），与气泡动作列同源。
+  const favLabel = state.favIds.has(m.id) ? "取消收藏" : "收藏";
+  const pinLabel = state.pinIds.has(m.id) ? "取消置顶" : "置顶";
+  let items;
+  if (ai) {
+    items = [
+      ["复制", () => copyText(m.body)],
+      [favLabel, () => toggleMark(m.id, "favorite")],
+      [pinLabel, () => toggleMark(m.id, "pin")],
+      ["引用", () => showAiQuoteBar(m)],
+    ];
+    if (m.sender === "ai") items.push(["重新生成", () => regenerateAi(m)]);
+    const rowEl = document.querySelector(`#ai-messages [data-mid="${m.id}"]`);
+    if (rowEl && rowEl.querySelector(".msg-toggle")) {
+      items.push([state.collapsedIds.has(m.id) ? "展开" : "收起", () => {
+        const t = rowEl.querySelector(".msg-toggle");
+        if (t) t.click();
+      }]);
+    }
+  } else {
+    items = [
+      ["复制", () => copyText(m.body)],
+      [favLabel, () => toggleMark(m.id, "favorite")],
+      [pinLabel, () => toggleMark(m.id, "pin")],
+      ["引用", () => setReply(m)],
+      ["问AI", () => askAiAbout(m)],
+    ];
+  }
   for (const [label, fn] of items) {
     const b = document.createElement("button");
     b.textContent = label;
@@ -2308,7 +2507,7 @@ async function openFileMenu(mid, x, y) {
       // #9：后端按扩展名分类——文本/脚本回 "viewer" 走内置查看器，
       // 可执行类后端只做文件夹定位、其余系统打开，都不会执行脚本。
       const r = await invoke("open_file", { path: info.path });
-      if (r === "viewer") openTextViewer(info);
+      if (r === "viewer") openTextViewer(info, mid);
     }, ""],
     ["打开文件位置", exists, async () => { await invoke("reveal_file", { path: info.path }); }, ""],
     ["复制文件", exists, async () => {
@@ -2348,7 +2547,8 @@ async function openFileMenu(mid, x, y) {
       }
     }, ""],
     // ㉖ 补齐：文件气泡右键菜单此前没有收藏/置顶，与文本气泡口径对齐
-    ["收藏", true, async () => { await toggleMark(mid, "favorite"); }, ""],
+    // v2.6.6 #14：收藏文案随状态（取消收藏），与其它菜单同源
+    [state.favIds.has(mid) ? "取消收藏" : "收藏", true, async () => { await toggleMark(mid, "favorite"); }, ""],
     [state.pinIds.has(mid) ? "取消置顶" : "置顶", true, async () => { await toggleMark(mid, "pin"); }, ""],
     ["删除记录", true, async () => {
       await invoke("delete_message", { messageId: mid });
@@ -2606,6 +2806,10 @@ async function loadAiConversationsInner() {
     return i < 0 ? Number.MAX_SAFE_INTEGER : i;
   };
   aiConvs.sort((a, b) => rank(a.id) - rank(b.id));
+  // v2.6.6 #10②：「AI 助手」强制永远排第 1——存储顺序里就算被写到
+  // 别处，恢复时也先把它摘出来钉回首位，其余按存储顺序。
+  const di = aiConvs.findIndex((c) => c.id === "ai-default");
+  if (di > 0) { const [d] = aiConvs.splice(di, 1); aiConvs.unshift(d); }
   if (!aiConvs.some((c) => c.id === state.aiConvId)) {
     state.aiConvId = aiConvs.length ? aiConvs[0].id : "ai-default";
   }
@@ -2615,14 +2819,23 @@ async function loadAiConversationsInner() {
     const chip = document.createElement("button");
     chip.className = "ai-conv-chip" + (c.id === state.aiConvId ? " active" : "");
     chip.textContent = c.title || "AI 会话";
-    chip.title = "点击打开；右键改名/删除；拖拽排序";
+    // v2.6.6 #10②：默认会话「AI 助手」全套保护——不可改名/删除/移动、
+    // 永远第 1、唯一放行清空记录；禁用操作被触发时给 toast 不静默。
+    const isDefault = c.id === "ai-default";
+    chip.title = isDefault
+      ? "「AI 助手」是默认会话，不能改名、删除或移动；右键可清空聊天记录"
+      : "点击打开；右键改名/删除；拖拽排序";
     chip.dataset.cid = c.id;
     // 已打开的会话点它不做任何事：重渲染会把紧接着的双击（改名）打断
     chip.addEventListener("click", () => {
       if (chip._dragged) { chip._dragged = false; return; }
       if (c.id !== state.aiConvId) openAiConversation(c.id);
     });
-    chip.addEventListener("dblclick", (ev) => { ev.stopPropagation(); renameAiChip(chip, c); });
+    chip.addEventListener("dblclick", (ev) => {
+      ev.stopPropagation();
+      if (isDefault) { showToast("「AI 助手」是默认会话，不能改名"); return; }
+      renameAiChip(chip, c);
+    });
     // #3 右键菜单：明确有「重命名」「删除」，不再只靠双击的隐形入口
     chip.addEventListener("contextmenu", (ev) => {
       ev.preventDefault();
@@ -2630,11 +2843,21 @@ async function loadAiConversationsInner() {
       openAiChipMenu(chip, c, ev.clientX, ev.clientY);
     });
     // #3 拖拽排序：按下移动超过 6px 才算拖拽（不干扰点击/双击）
+    // v2.6.6 #10②：默认会话本身不可拖（拖动尝试给 toast、不静默）；
+    // 拖别人时落点钳制在它之后——越不过第 1 位（尝试越位同样提示）。
     chip.addEventListener("pointerdown", (ev) => {
       if (ev.button !== 0) return;
       const startX = ev.clientX;
       let dragging = false;
+      let hintShown = false;
       const move = (mv) => {
+        if (isDefault) {
+          if (!hintShown && Math.abs(mv.clientX - startX) > 6) {
+            hintShown = true;
+            showToast("「AI 助手」是默认会话，不能移动");
+          }
+          return;
+        }
         if (!dragging && Math.abs(mv.clientX - startX) > 6) {
           dragging = true;
           chip.classList.add("dragging");
@@ -2646,7 +2869,15 @@ async function loadAiConversationsInner() {
           && mv.clientX <= el.getBoundingClientRect().right);
         if (target) {
           const rect = target.getBoundingClientRect();
-          if (mv.clientX < rect.left + rect.width / 2) list.insertBefore(chip, target);
+          if (target.dataset.cid === "ai-default") {
+            // 只能落到默认会话之后；往它前面挤时提示一次
+            if (mv.clientX < rect.left + rect.width / 2 && !hintShown) {
+              hintShown = true;
+              showToast("「AI 助手」固定在第一位，不能移到它前面");
+            }
+            list.insertBefore(chip, target.nextSibling);
+          }
+          else if (mv.clientX < rect.left + rect.width / 2) list.insertBefore(chip, target);
           else list.insertBefore(chip, target.nextSibling);
         }
       };
@@ -2671,14 +2902,17 @@ async function loadAiConversationsInner() {
 
 /** #3 AI 会话胶囊右键菜单（与文件菜单共用 #file-menu 容器）：
  * 重命名（走既有 renameAiChip，菜单关闭不重渲染、输入框不被打断）、
- * 删除（两步确认；默认会话「AI 助手」不可删，菜单里直接不给）。 */
+ * 删除（两步确认；默认会话「AI 助手」不可删，菜单里直接不给）。
+ * v2.6.6 #10②：默认会话菜单只剩唯一放行的「清空聊天记录」（两步
+ * 确认）；普通会话同样给清空入口（会话保留、只清消息）。 */
 function openAiChipMenu(chip, conv, x, y) {
   const menu = $("file-menu");
   menu.innerHTML = "";
-  const entries = [
-    ["重命名", () => renameAiChip(chip, conv), ""],
-  ];
-  if (conv.id !== "ai-default") {
+  const isDefault = conv.id === "ai-default";
+  const entries = [];
+  if (!isDefault) entries.push(["重命名", () => renameAiChip(chip, conv), ""]);
+  entries.push(["清空聊天记录", null, ""]);
+  if (!isDefault) {
     entries.push(["删除会话", null, "fm-danger"]);
   }
   for (const [label, fn, cls] of entries) {
@@ -2686,6 +2920,33 @@ function openAiChipMenu(chip, conv, x, y) {
     b.textContent = label;
     if (cls) b.className = cls;
     b.addEventListener("click", async () => {
+      if (label === "清空聊天记录") {
+        if (state.aiGenerating) {
+          // 被生成状态打断时撤销已武装的确认（评审补强）：否则生成
+          // 结束后的下一次点击会跳过两步确认直接清空
+          delete b.dataset.armed;
+          b.textContent = label;
+          showToast("AI 正在生成中，请稍候");
+          return;
+        }
+        // 两步确认（同删除口径）：第一下变确认文案，第二下才真清
+        if (!b.dataset.armed) {
+          b.dataset.armed = "1";
+          b.textContent = "确认清空？（会话保留）";
+          return;
+        }
+        menu.classList.add("hidden");
+        try {
+          const n = await invoke("clear_ai_conversation_messages", { conversationId: conv.id });
+          if (state.aiConvId === conv.id) {
+            state.renderedAi.clear();
+            await loadAiMessages();
+            refreshPinBar();
+          }
+          showToast(`已清空 ${n} 条聊天记录`);
+        } catch (e) { showToast("清空失败：" + e); }
+        return;
+      }
       if (label === "删除会话") {
         // 两步确认：第一下把按钮变成确认文案，第二下才真删
         if (!b.dataset.armed) {
@@ -2724,6 +2985,8 @@ function openAiConversation(id) {
 }
 
 function renameAiChip(chip, conv) {
+  // v2.6.6 #10② 纵深防御：默认会话任何路径都不进改名（后端亦有守卫）
+  if (conv.id === "ai-default") { showToast("「AI 助手」是默认会话，不能改名"); return; }
   const input = document.createElement("input");
   input.value = conv.title || "";
   chip.textContent = "";
@@ -2751,6 +3014,16 @@ function renameAiChip(chip, conv) {
   input.addEventListener("click", (e) => e.stopPropagation());
   input.addEventListener("dblclick", (e) => e.stopPropagation());
 }
+
+// v2.6.6 #6：AI 会话条滚轮横滚——纵向滚轮转横向滚动，溢出胶囊可达
+$("ai-conv-list").addEventListener("wheel", (e) => {
+  const el = $("ai-conv-list");
+  if (el.scrollWidth <= el.clientWidth) return;
+  const d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  if (!d) return;
+  e.preventDefault();
+  el.scrollLeft += d;
+}, { passive: false });
 
 $("btn-ai-new-conv").addEventListener("click", async () => {
   if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
@@ -2820,17 +3093,21 @@ function aiRouteIsPeer() {
 function aiWaitingText(peer) {
   return peer ? "正在等待对方 AI 回复…" : "正在等待 AI 回复…";
 }
-function showAiWaiting() {
+function showAiWaiting(opts = {}) {
   clearAiWaiting();
   const container = $("ai-messages");
   const row = document.createElement("div");
   row.className = "msg-row";
   row.id = "ai-waiting-row";
   row.innerHTML = `<div class="msg"><div class="bubble ai-waiting"><span class="wait-dots"><i></i><i></i><i></i></span>${aiWaitingText(aiRouteIsPeer())}</div></div>`;
-  // #3：不再无条件挂末尾——问题行随后经事件到达时由 appendMessage
-  // 锚定到问题正下方；重新生成时问题已在列表里、placeAiWaitingRow
-  // 直接把它放到最后一条问题之后。
-  placeAiWaitingRow(container, row);
+  // 锚定纪律（#1，v2.6.6 修正）：新提问必须走 bindNext——问题行还
+  // 没落库渲染，先挂末尾不绑任何旧消息，问题行到达时 appendMessage
+  // 把等待行绑到它正下方。只有重新生成（问题已在列表里）才走默认
+  // 分支锚到最后一条问题之后。旧版新提问也走默认分支：等待行被插
+  // 到「上一问」之后、锚点错绑上一问 id，新问题到达时归位永不
+  // 触发——等待与流式气泡（同一行原地转的）全程卡在上一条 AI
+  // 回复上方，落库重载才恢复（v2.6.5 验后 #1 真机实锤）。
+  placeAiWaitingRow(container, row, opts);
   container.scrollTop = container.scrollHeight;
   syncAiBottomBtn();
   state.streamEl = row.querySelector(".bubble");
@@ -2899,7 +3176,7 @@ async function sendAi() {
   $("ai-input").value = ""; autoGrow($("ai-input"));
   state.aiGenerating = true;
   $("btn-ai-stop").classList.remove("hidden");
-  showAiWaiting();
+  showAiWaiting({ bindNext: true }); // 新提问：锚点绑随后到达的问题行（#1）
   try {
     if (ref) {
       // ㉒ 引用模式：引用消息作上下文 + 用户文字作问题一起发出；
@@ -2929,7 +3206,7 @@ async function regenerateAi() {
   if (state.aiGenerating) return;
   state.aiGenerating = true;
   $("btn-ai-stop").classList.remove("hidden");
-  showAiWaiting();
+  showAiWaiting(); // 重新生成：问题已在列表，默认分支锚到它之后（#1）
   try {
     await invoke("ai_regenerate", { thinking: currentThinking(), conversationId: state.aiConvId });
     await loadAiMessages();
@@ -3121,6 +3398,17 @@ $("input").addEventListener("keydown", (e) => {
 // ㉒ 问AI：点完不直接发——切到 AI 页把消息挂为引用上下文条，
 // 用户在输入框补自己的问题后发送才真正发出；不输文字直接发送 =
 // 按引用原文问（旧行为兜底）。× 可取消引用，取消后发送不带上下文。
+/** 把消息挂为 AI 输入框上方的引用上下文条（问AI 与 AI 区右键「引用」共用）。 */
+function showAiQuoteBar(m) {
+  // 与 askAiAbout 同口径（评审补强）：生成中不挂引用条，免得两个
+  // 入口保护不一致、生成结束后误以为引用已随上一问发出
+  if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
+  state.pendingAskRef = { convId: m.conversation_id, msgId: m.id };
+  const who = m.sender === "me" ? "我" : m.sender === "ai" ? "AI" : "对方";
+  $("ai-quote-text").textContent = `引用${who}的消息：${(m.body || "").slice(0, 80)}`;
+  $("ai-quote-bar").classList.remove("hidden");
+  $("ai-input").focus();
+}
 function askAiAbout(m) {
   if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
   aiReadyOrRemind().then((ok) => {
@@ -3133,11 +3421,7 @@ function askAiAbout(m) {
       loadAiConversations();
       loadAiMessages();
     }
-    state.pendingAskRef = { convId: m.conversation_id, msgId: m.id };
-    const who = m.sender === "me" ? "我" : m.sender === "ai" ? "AI" : "对方";
-    $("ai-quote-text").textContent = `引用${who}的消息：${(m.body || "").slice(0, 80)}`;
-    $("ai-quote-bar").classList.remove("hidden");
-    $("ai-input").focus();
+    showAiQuoteBar(m);
   });
 }
 function clearAskRef() {
@@ -3187,30 +3471,55 @@ function showConfirm(text, okLabel = "确定") {
     $("modal-cancel").onclick = () => done(false);
   });
 }
+/* v2.6.6 toast 收编 + #21 锚定：全应用操作提示只有这一套实现——
+ * 统一样式（style.css #toast）、统一进出动画、统一停留时长（普通
+ * 2600ms；带动作按钮的 4500ms，留足点击时间，同为本实现的标准档）。
+ * 位置口径：锚定当前可见输入框（#composer / #ai-composer）的**当前
+ * 上沿** + 12px 间距——输入框自适应长高（上限 168px）时由 autoGrow
+ * 钩子实时跟随上移，绝不按固定值写死压框；无输入框的页面（连接/
+ * 设置/彩签/收藏等）回落距窗口底 28px。 */
 let toastTimer = null;
-function showToast(text) {
+const TOAST_GAP = 12, TOAST_FALLBACK_BOTTOM = 28;
+function positionToast() {
   const t = $("toast");
-  t.textContent = text;
-  t.classList.remove("hidden");
+  if (!t) return;
+  let bottom = TOAST_FALLBACK_BOTTOM;
+  for (const id of ["composer", "ai-composer"]) {
+    const c = $(id);
+    if (c && c.offsetParent !== null) {
+      const r = c.getBoundingClientRect();
+      if (r.height > 0) { bottom = Math.round(window.innerHeight - r.top + TOAST_GAP); break; }
+    }
+  }
+  t.style.bottom = bottom + "px";
+}
+function toastVisible() { return !$("toast").classList.contains("toast-off"); }
+function presentToast(dwellMs, fill) {
+  const t = $("toast");
+  t.innerHTML = "";
+  fill(t);
+  positionToast();
+  t.classList.remove("toast-off");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.add("hidden"), 2600);
+  toastTimer = setTimeout(() => t.classList.add("toast-off"), dwellMs);
+}
+function showToast(text) {
+  presentToast(2600, (t) => { t.textContent = text; });
 }
 /** 带一个动作按钮的 toast（如未配置 AI 时的「去配置」直达设置页）。 */
 function showToastAction(text, label, fn) {
-  const t = $("toast");
-  t.innerHTML = "";
-  const span = document.createElement("span");
-  span.textContent = text;
-  const b = document.createElement("button");
-  b.className = "toast-action";
-  b.textContent = label;
-  b.addEventListener("click", () => { t.classList.add("hidden"); fn(); });
-  t.appendChild(span);
-  t.appendChild(b);
-  t.classList.remove("hidden");
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.add("hidden"), 4500);
+  presentToast(4500, (t) => {
+    const span = document.createElement("span");
+    span.textContent = text;
+    const b = document.createElement("button");
+    b.className = "toast-action";
+    b.textContent = label;
+    b.addEventListener("click", () => { t.classList.add("toast-off"); fn(); });
+    t.appendChild(span);
+    t.appendChild(b);
+  });
 }
+window.addEventListener("resize", () => { if (toastVisible()) positionToast(); });
 
 /** AI 未配置拦截（v2.5.1）：点任一 AI 入口先判定，不许静默、不许发出去再失败。
  * - 默认来源 = 对方设备：走对方配置，本机未配置不拦；
@@ -3722,137 +4031,29 @@ async function wireEvents() {
     const kind = e.payload && e.payload.kind === "image" ? "图片" : "文字";
     $("clip-sync-status").textContent = `已同步（刚刚收到${kind}）`;
   });
+  // #2（v2.6.6）：传输事件一律先记账（state.transfers 权威账）再
+  // 按账绘制；气泡不在场（还没渲染/已重渲染）不丢事件，气泡迟建
+  // 时在 buildMessageEl 里按账回放。旧版「事件到达时现查气泡 +
+  // lastFileBubble 单例兜底」在连珠速发下必冻（见 state.transfers
+  // 字段注释的真机定案）。
   await listen("transfer_progress", (e) => {
     const { transfer_id, msg_id, received, total } = e.payload;
-    if (msg_id && transfer_id) state.transferMap[msg_id] = transfer_id;
+    const rec = noteTransferProgress(transfer_id, msg_id, received, total);
     // 图片组成员的进度按组聚合显示在组气泡上（成员 msg_id → 组 id）
     const gid = msg_id ? (state.groupMemberOf || {})[msg_id] : null;
     if (gid) { updateGroupProgress(gid, msg_id, received, total); return; }
-    let b = null;
-    if (msg_id) {
-      const row = document.querySelector(`[data-mid="${msg_id}"]`);
-      if (row) b = row.querySelector(".bubble");
-    }
-    if (!b) b = state.lastFileBubble;
-    if (!b) return;
-    const bar = b.querySelector(".progress");
-    const fill = b.querySelector(".progress > div");
-    // #18 图片气泡：进度走贴底细条 + 胶囊明示「发送中/接收中」，
-    // 与「校验中」严格分开（校验是传输完成后的独立状态）。
-    if (b.classList.contains("img-bubble") && b._imgWrap) {
-      const strip = b._imgWrap.querySelector(".img-strip");
-      const sfill = b._imgWrap.querySelector(".img-strip > div");
-      const cap = b._imgWrap.querySelector(".img-cap");
-      const pct = total ? Math.floor((received / total) * 100) : 0;
-      if (strip && sfill) {
-        strip.classList.remove("hidden");
-        sfill.style.width = pct + "%";
-      }
-      if (cap) {
-        cap.classList.remove("hidden");
-        const mine = b.closest(".msg-row")?.dataset.sender === "me";
-        cap.textContent = mine ? `发送中 ${pct}%` : `接收中 ${pct}%`;
-      }
-      if (received < total && !b.dataset.flowing) {
-        const side = b.closest(".msg-row")?.dataset.sender === "me" ? "me" : "peer";
-        b.dataset.flowing = side;
-        ringSet(side, true);
-      }
-      return;
-    }
-    if (bar && fill) {
-      bar.classList.remove("hidden");
-      const pct = total ? Math.floor((received / total) * 100) : 0;
-      fill.style.width = pct + "%";
-      const meta = b.querySelector(".progress-meta");
-      if (meta) {
-        meta.classList.remove("hidden");
-        meta.textContent = `${pct}% · ${fmtSize(received)} / ${fmtSize(total)}`;
-      }
-      const cancel = b.querySelector(".progress-cancel");
-      if (cancel && received < total) cancel.classList.remove("hidden");
-      // 传输进行中：对应环持续特效（我发出的看左环，对方发来的看右环），一个气泡只计一次
-      if (received < total && !b.dataset.flowing) {
-        const side = b.closest(".msg-row")?.dataset.sender === "me" ? "me" : "peer";
-        b.dataset.flowing = side;
-        ringSet(side, true);
-      }
-    }
+    const b = bubbleOfMsg(msg_id);
+    if (b) paintTransferProgress(b, rec);
   });
   await listen("transfer_state", (e) => {
-    const { transfer_id, state: tstate } = e.payload;
-    const mid = Object.keys(state.transferMap).find((k) => state.transferMap[k] === transfer_id);
+    const { transfer_id, state: tstate, msg_id } = e.payload;
+    const rec = noteTransferState(transfer_id, tstate, msg_id);
+    const mid = rec.msgId;
     // 图片组成员的状态同样按组聚合（完成时顺带刷新组气泡缩略图）
     const gid = mid ? (state.groupMemberOf || {})[mid] : null;
     if (gid) { updateGroupTransferState(gid, mid, tstate); return; }
-    let b = null;
-    if (mid) {
-      const row = document.querySelector(`[data-mid="${mid}"]`);
-      if (row) b = row.querySelector(".bubble");
-    }
-    if (!b) b = state.lastFileBubble;
-    if (!b) return;
-    const bar = b.querySelector(".progress");
-    const meta = b.querySelector(".progress-meta");
-    const cancel = b.querySelector(".progress-cancel");
-    const retry = b.querySelector(".transfer-retry");
-    if (cancel) cancel.classList.add("hidden");
-    // 传输结束（完成/取消/校验失败）：停掉对应环的持续特效
-    if (b.dataset.flowing) { ringSet(b.dataset.flowing, false); delete b.dataset.flowing; }
-    // #1/#18 图片气泡的状态机：细条与胶囊承载全部状态，失败换失败卡
-    if (b.classList.contains("img-bubble") && b._imgWrap) {
-      const wrap = b._imgWrap;
-      const strip = wrap.querySelector(".img-strip");
-      const sfill = wrap.querySelector(".img-strip > div");
-      const cap = wrap.querySelector(".img-cap");
-      const fail = wrap.querySelector(".img-fail");
-      const photo = wrap.querySelector(".img-photo");
-      if (tstate === "verifying") {
-        if (strip && sfill) { strip.classList.remove("hidden"); sfill.style.width = "100%"; }
-        if (cap) { cap.classList.remove("hidden"); cap.textContent = "校验中"; }
-      } else if (tstate === "done") {
-        if (mid) attachImagePhoto(b, mid);
-        setTimeout(() => {
-          if (strip) strip.classList.add("hidden");
-          if (cap) cap.classList.add("hidden");
-        }, 400);
-      } else if (tstate === "verify_failed") {
-        if (strip) strip.classList.add("hidden");
-        if (cap) cap.classList.add("hidden");
-        if (photo) photo.classList.add("hidden");
-        if (fail) fail.classList.remove("hidden");
-        if (retry) retry.classList.remove("hidden");
-      } else if (tstate === "cancelled") {
-        if (strip) strip.classList.add("hidden");
-        if (cap) { cap.classList.remove("hidden"); cap.textContent = "已取消"; }
-        if (retry) retry.classList.remove("hidden");
-      }
-      return;
-    }
-    if (tstate === "done") {
-      if (meta) meta.textContent = "已完成";
-      // ㉑ 接收完成补挂图片预览（气泡渲染时文件还没落盘的情况）
-      const fname = b.querySelector(".file-name");
-      if (mid && fname && isImageExt(fileExt(fname.textContent || ""))) attachImagePreview(b, mid);
-      setTimeout(() => {
-        if (bar) bar.classList.add("hidden");
-        if (meta) meta.classList.add("hidden");
-      }, 400);
-    } else if (tstate === "verifying") {
-      // 片已发完/收完、等校验结果：明说在等什么，不在 100% 干挂着
-      if (bar) bar.classList.remove("hidden");
-      if (meta) {
-        meta.classList.remove("hidden");
-        const mine = b.closest(".msg-row")?.dataset.sender === "me";
-        meta.textContent = mine ? "已发送，等待对方校验…" : "已收完，正在校验…";
-      }
-    } else if (tstate === "cancelled") {
-      if (meta) { meta.classList.remove("hidden"); meta.textContent = "已取消"; }
-      if (retry) retry.classList.remove("hidden");
-    } else if (tstate === "verify_failed") {
-      if (meta) { meta.classList.remove("hidden"); meta.textContent = "校验失败，文件不完整"; }
-      if (retry) retry.classList.remove("hidden");
-    }
+    const b = bubbleOfMsg(mid);
+    if (b) paintTransferState(b, rec);
   });
   await listen("ai_chunk", (e) => {
     const container = $("ai-messages");
@@ -3863,7 +4064,9 @@ async function wireEvents() {
       const row = document.createElement("div");
       row.className = "msg-row";
       row.innerHTML = `<div class="msg"><div class="bubble"></div></div>`;
-      placeAiWaitingRow(container, row);
+      // 兜底建行同守锚定纪律（#1）：bindNext——问题已渲染时它就是
+      // 末行、挂末尾即其正下方；未渲染时等 appendMessage 绑定归位
+      placeAiWaitingRow(container, row, { bindNext: true });
       state.streamEl = row.querySelector(".bubble");
       state.streamText = "";
     }
@@ -4149,7 +4352,7 @@ $("update-action").addEventListener("click", async () => {
 
 // ---------- 文件类型口径（查看器分流/图片组共用） ----------
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "ico"];
-const TEXT_EXTS = new Set(["txt", "md", "log", "json", "xml", "csv", "tsv", "ini", "cfg", "conf", "yaml", "yml", "toml", "properties", "env", "java", "js", "mjs", "ts", "jsx", "tsx", "rs", "py", "go", "c", "h", "cpp", "hpp", "cc", "cs", "php", "rb", "sh", "bash", "zsh", "bat", "cmd", "ps1", "psm1", "vbs", "sql", "html", "htm", "css", "scss", "vue", "kt", "swift", "pl", "r", "lua", "diff", "patch", "dockerfile", "gitignore", "gradle", "cmake"]);
+const TEXT_EXTS = new Set(["txt", "md", "log", "json", "xml", "csv", "tsv", "ini", "cfg", "conf", "yaml", "yml", "toml", "properties", "env", "java", "js", "mjs", "ts", "jsx", "tsx", "rs", "py", "go", "c", "h", "cpp", "hpp", "cc", "cs", "php", "rb", "sh", "bash", "zsh", "bat", "cmd", "ps1", "psm1", "vbs", "sql", "html", "htm", "css", "scss", "vue", "kt", "swift", "pl", "r", "lua", "diff", "patch", "dockerfile", "gitignore", "gradle", "cmake", "ms"]);
 const VIDEO_EXTS = ["mp4", "webm", "mkv", "mov", "m4v", "avi"];
 const AUDIO_EXTS = ["mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"];
 const OFFICE_EXTS = ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf"];
@@ -4198,6 +4401,9 @@ async function groupFilesOf(gid) {
 /** 组气泡：堆叠卡片（仿 iOS 短信图片组）——主图 + 露边的底层卡 +
  * 「共 N 张」角标 + 气泡上左右翻卡；点主图进查看器大图翻看。 */
 function buildGroupBubble(bubble, m, row) {
+  // v2.6.6 #18③：图组行间距与普通消息拉齐（.img-row 的 6px 是给
+  // 连续单图收紧用的，图组是独立消息、不跟着收）
+  if (row) row.classList.add("group-row");
   const items = parseManifest(m.body);
   registerGroupMembers(m);
   bubble._gcount = items.length;
@@ -4217,7 +4423,6 @@ function buildGroupBubble(bubble, m, row) {
     <div class="progress-meta hidden"></div>
     <button class="progress-cancel hidden">取消</button>
     <button class="transfer-retry hidden">重试</button>`;
-  state.lastFileBubble = bubble;
   bubble._gidx = 0;
   if (items.length < 2) {
     bubble.querySelectorAll(".gstack-nav").forEach((b) => b.classList.add("hidden"));
@@ -4227,16 +4432,32 @@ function buildGroupBubble(bubble, m, row) {
   // 尺寸定高——旧版把监听绑在首次 showCard 设完 src 之后、且只靠
   // load 事件，缓存图/竞态下尺寸永远停在默认 240×180，容器高度与
   // 封面实际渲染对不上、气泡下方留死空白（v2.6.4 #6 实锤）。
+  // v2.6.6 #18② 定框：框按组内**最大成员**一次定死——各成员按同一
+  // 320 上限缩放后取宽/高最大值；成员尺寸靠预加载逐个收集（全员到齐
+  // 前框只增不减、到齐即定死），切换只换图、绝不改框。
   const coverImg = bubble.querySelector(".gstack-img");
+  const memberSize = new Map();
   const applyStackSize = () => {
     const stack = bubble.querySelector(".gstack");
-    if (!stack || !coverImg.naturalWidth) return;
-    const nw = coverImg.naturalWidth, nh = coverImg.naturalHeight;
-    const scale = Math.min(320 / nw, 320 / nh, 1);
-    stack.style.width = Math.max(96, Math.round(nw * scale)) + "px";
-    stack.style.height = Math.max(72, Math.round(nh * scale)) + "px";
+    if (!stack || !memberSize.size) return;
+    let w = 96, h = 72;
+    for (const [nw, nh] of memberSize.values()) {
+      const scale = Math.min(320 / nw, 320 / nh, 1);
+      w = Math.max(w, Math.round(nw * scale));
+      h = Math.max(h, Math.round(nh * scale));
+    }
+    stack.style.width = w + "px";
+    stack.style.height = h + "px";
   };
-  coverImg.addEventListener("load", applyStackSize);
+  const noteMemberSize = (idx, nw, nh) => {
+    if (!nw || !nh) return;
+    const prev = memberSize.get(idx);
+    if (prev && prev[0] === nw && prev[1] === nh) return;
+    memberSize.set(idx, [nw, nh]);
+    applyStackSize();
+  };
+  coverImg.addEventListener("load", () =>
+    noteMemberSize(bubble._gidx, coverImg.naturalWidth, coverImg.naturalHeight));
   const showCard = async () => {
     const files = await groupFilesOf(m.id);
     if (!items.length) return;
@@ -4258,6 +4479,17 @@ function buildGroupBubble(bubble, m, row) {
         }
       }
     }
+    // #18② 预加载全员尺寸定框（只按文件清单签名跑一次）
+    if (bubble._gsizeSig !== sig) {
+      bubble._gsizeSig = sig;
+      files.forEach((f, idx) => {
+        if (!f || !f.exists || !f.path) return;
+        const probe = new Image();
+        probe.addEventListener("load", () =>
+          noteMemberSize(idx, probe.naturalWidth, probe.naturalHeight));
+        assetUrl(f.path).then((u) => { probe.src = u; }).catch(() => {});
+      });
+    }
     const i = Math.max(0, Math.min(bubble._gidx, items.length - 1));
     bubble._gidx = i;
     // #7 计数胶囊跟随当前位置（第几张/共几张，title 写全「共 N 张」）
@@ -4271,8 +4503,8 @@ function buildGroupBubble(bubble, m, row) {
         img.src = await assetUrl(f.path);
         img.classList.remove("hidden");
         ph.classList.add("hidden");
-        // 缓存图可能不再触发 load：已 complete 就立即按自然尺寸定高
-        if (img.complete && img.naturalWidth) applyStackSize();
+        // 缓存图可能不再触发 load：已 complete 就立即登记尺寸定框
+        if (img.complete && img.naturalWidth) noteMemberSize(i, img.naturalWidth, img.naturalHeight);
         return;
       } catch (_) { /* 落到占位 */ }
     }
@@ -4299,11 +4531,27 @@ function buildGroupBubble(bubble, m, row) {
     openImageViewer(view, bubble._gidx);
   });
   bubble.querySelector(".progress-cancel").addEventListener("click", async () => {
+    // #2：全员已终态时点取消 = 就地落定，不再对结束的传输发取消
+    const gp = state.groupProgress[m.id];
+    if (items.length && items.every((it) => {
+      const s = gp && gp.states.get(it.msg_id);
+      return s && TRANSFER_TERMINAL.includes(s);
+    })) {
+      const last = items[items.length - 1];
+      updateGroupTransferState(m.id, last.msg_id, gp.states.get(last.msg_id), bubble);
+      return;
+    }
     for (const it of items) {
       const tid = state.transferMap[it.msg_id];
       if (tid) { await invoke("cancel_transfer", { transferId: tid }); return; }
     }
   });
+  // #2 回放：组气泡迟建时按 groupProgress 记账补画聚合进度与终态
+  const gp0 = state.groupProgress[m.id];
+  if (gp0) {
+    for (const [mid2, v] of gp0.members) updateGroupProgress(m.id, mid2, v.received, v.total, bubble);
+    for (const [mid2, st] of gp0.states) updateGroupTransferState(m.id, mid2, st, bubble);
+  }
   bubble.querySelector(".transfer-retry").addEventListener("click", async () => {
     try {
       await invoke("resend_message", { messageId: m.id });
@@ -4321,11 +4569,12 @@ function groupBubbleOf(gid) {
   const row = document.querySelector(`[data-mid="${gid}"]`);
   return row ? row.querySelector(".bubble") : null;
 }
-/** 组进度聚合：成员各自的已传字节汇总成一条组进度。 */
-function updateGroupProgress(gid, memberMsgId, received, total) {
+/** 组进度聚合：成员各自的已传字节汇总成一条组进度。
+ * bEl 可选：气泡尚在构建（未进文档）时由回放路径直接传入。 */
+function updateGroupProgress(gid, memberMsgId, received, total, bEl) {
   const gp = groupProg(gid);
   gp.members.set(memberMsgId, { received, total });
-  const b = groupBubbleOf(gid);
+  const b = bEl || groupBubbleOf(gid);
   if (!b) return;
   let r = 0, t = 0;
   for (const v of gp.members.values()) { r += v.received; t += v.total; }
@@ -4344,10 +4593,10 @@ function updateGroupProgress(gid, memberMsgId, received, total) {
   const cancel = b.querySelector(".progress-cancel");
   if (cancel && r < t) cancel.classList.remove("hidden");
 }
-function updateGroupTransferState(gid, memberMsgId, tstate) {
+function updateGroupTransferState(gid, memberMsgId, tstate, bEl) {
   const gp = groupProg(gid);
   gp.states.set(memberMsgId, tstate);
-  const b = groupBubbleOf(gid);
+  const b = bEl || groupBubbleOf(gid);
   if (!b) return;
   const meta = b.querySelector(".progress-meta");
   const bar = b.querySelector(".progress");
@@ -4400,7 +4649,7 @@ function openGroupMenu(m, x, y) {
       const [ok, total] = await invoke("save_group_images", { messageId: m.id, dir });
       showToast(`已保存 ${ok} / ${total} 张图片到所选文件夹`);
     }],
-    ["收藏", () => toggleMark(m.id, "favorite")],
+    [state.favIds.has(m.id) ? "取消收藏" : "收藏", () => toggleMark(m.id, "favorite")],
     [state.pinIds.has(m.id) ? "取消置顶" : "置顶", () => toggleMark(m.id, "pin")],
     ["删除记录", async () => {
       await invoke("delete_message", { messageId: m.id });
@@ -4492,7 +4741,7 @@ async function openFileSmart(m, x, y) {
   try { info = await invoke("file_info", { messageId: m.id }); } catch (_) { /* 忽略 */ }
   if (!info || !info.exists || !info.path) { openFileMenu(m.id, x, y); return; }
   const ext = fileExt(info.name || m.body);
-  if (TEXT_EXTS.has(ext)) { openTextViewer(info); return; }
+  if (TEXT_EXTS.has(ext)) { openTextViewer(info, m.id); return; }
   if (isImageExt(ext)) { openImageViewer([{ name: info.name, path: info.path }], 0); return; }
   if (VIDEO_EXTS.includes(ext) || AUDIO_EXTS.includes(ext)) { openMediaViewer(info, ext); return; }
   if (ext === "pdf" || OFFICE_EXTS.includes(ext)) {
@@ -4769,10 +5018,15 @@ function utf8DamageCount(bytes) {
   return dmg;
 }
 
-async function openTextViewer(info) {
+async function openTextViewer(info, msgId) {
   showViewer("text", info.name, "加载中…");
   tvReset();
   TV.name = info.name;
+  // #8：记住来源消息 id——查看器改名要落到这条消息的文件身份上；
+  // 没有来源消息（理论上不存在此路径）时不给改名入口
+  TV.msgId = msgId || null;
+  $("viewer-rename-btn").classList.toggle("hidden", !TV.msgId);
+  $("viewer-rename-wrap").classList.add("hidden");
   let data;
   try {
     data = await invoke("read_text_file", { path: info.path });
@@ -4820,6 +5074,7 @@ function langOfFence(name) {
     c: "c", cpp: "c", "c++": "c", java: "c", cs: "c", php: "c", kt: "c",
     go: "go", golang: "go",
     json: "json",
+    sql: "sql", magicapi: "ms", magic: "ms", magicscript: "ms", ms: "ms",
     html: "markup", xml: "markup", svg: "markup", vue: "markup",
     css: "css", scss: "css",
     sh: "shell", bash: "shell", shell: "shell", zsh: "shell",
@@ -4961,11 +5216,15 @@ const TV_KW = {
   py: "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield True False None print",
   c: "auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while bool true false null nullptr namespace public private protected class template typename virtual friend this new delete try catch throw final extends implements interface package void",
   go: "break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var true false nil",
+  sql: "select from where group by order having limit offset join left right inner outer full on union all insert into update delete create table alter drop values set and or not null as in is like between exists case when then else end distinct primary key foreign references index view trigger",
+  ms: "import var let const return if else for while do break continue function true false null undefined exit try catch throw new in of this async await",
 };
 function langOfExt(ext) {
   if (["js", "mjs", "jsx", "ts", "tsx"].includes(ext)) return "js";
   if (ext === "rs") return "rust";
   if (ext === "py") return "py";
+  if (ext === "sql") return "sql";
+  if (ext === "ms") return "ms";
   if (["java", "c", "h", "cpp", "hpp", "cc", "cs", "kt", "swift", "scala", "php"].includes(ext)) return "c";
   if (ext === "go") return "go";
   if (ext === "json") return "json";
@@ -4979,7 +5238,7 @@ function tvTokenizeLine(line, lang, st) {
   if (lang === "text") return { html: esc(line), st };
   if (lang === "json") return { html: tvTokenizeJson(line), st };
   if (lang === "markup") return { html: tvTokenizeMarkup(line), st };
-  const lineComment = lang === "py" || lang === "shell" ? "#" : "//";
+  const lineComment = lang === "py" || lang === "shell" ? "#" : lang === "sql" ? "--" : "//";
   const kw = TV_KW[lang] ? new Set(TV_KW[lang].split(" ")) : null;
   let out = "", i = 0;
   const n = line.length;
@@ -5059,7 +5318,8 @@ function tvTokenizeLine(line, lang, st) {
       while (j < n && /[\p{L}\p{N}_$]/u.test(line[j])) j++;
       if (j === i) j = i + 1;
       const word = line.slice(i, j);
-      if (kw && kw.has(word)) push(word, "tk-kw");
+      // SQL 关键字大小写不敏感（表里存小写）；其余语言按原样比
+      if (kw && kw.has(lang === "sql" ? word.toLowerCase() : word)) push(word, "tk-kw");
       else plain += word;
       i = j;
       continue;
@@ -5309,6 +5569,156 @@ $("viewer-banner-origin").addEventListener("click", () => {
 $("viewer-banner-close").addEventListener("click", () => {
   $("viewer-banner").classList.add("hidden");
 });
+
+// ---------- #8 查看器内改名（v2.6.6）：改名即最终身份 ----------
+$("viewer-rename-btn").addEventListener("click", () => {
+  if (!TV.msgId) return;
+  const wrap = $("viewer-rename-wrap");
+  const input = $("viewer-rename-input");
+  wrap.classList.remove("hidden");
+  input.value = TV.name || "";
+  input.focus();
+  // 默认选中主名部分（后缀留给用户顺手改，改后缀正是本功能的一半）
+  const dot = input.value.lastIndexOf(".");
+  input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+});
+$("viewer-rename-cancel").addEventListener("click", () => {
+  $("viewer-rename-wrap").classList.add("hidden");
+});
+$("viewer-rename-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("viewer-rename-ok").click(); }
+  if (e.key === "Escape") { e.stopPropagation(); $("viewer-rename-wrap").classList.add("hidden"); }
+});
+$("viewer-rename-ok").addEventListener("click", async () => {
+  const newName = $("viewer-rename-input").value.trim();
+  if (!newName || !TV.msgId) return;
+  if (newName === TV.name) { $("viewer-rename-wrap").classList.add("hidden"); return; }
+  try {
+    const finalName = await invoke("rename_message_file", { messageId: TV.msgId, newName });
+    TV.name = finalName;
+    TV.ext = fileExt(finalName);
+    TV.lang = langOfExt(TV.ext);
+    $("viewer-title").textContent = finalName;
+    $("viewer-rename-wrap").classList.add("hidden");
+    // 若正看着显示层变换结果，先回原文再按新语言重排高亮
+    if (TV.transformed) {
+      TV.transformed = null;
+      $("viewer-banner").classList.add("hidden");
+      tvSetText(TV.origText);
+    } else {
+      tvSetText(TV.text);
+    }
+    // 聊天气泡上的文件名同步（同一条消息可能同时在列表里）
+    const fn = document.querySelector(`[data-mid="${TV.msgId}"] .file-name`);
+    if (fn) fn.textContent = finalName;
+    showToast(`已改名为「${finalName}」`);
+  } catch (e) {
+    showToast("改名失败：" + e);
+  }
+});
+
+// ---------- #7 按语言格式化（v2.6.6，全轻量自研、只改显示） ----------
+$("viewer-format-btn").addEventListener("click", () => {
+  if (!TV.origText && !TV.text) return;
+  tvFormatByLang();
+});
+const TV_LANG_LABEL = { py: "Python", js: "JavaScript", c: "Java/C 家族", sql: "SQL", ms: "MagicAPI", json: "JSON" };
+function tvFormatByLang() {
+  const src = TV.origText;
+  const lang = TV.lang;
+  try {
+    let out;
+    if (lang === "json") {
+      try { out = JSON.stringify(JSON.parse(src), null, 2); }
+      catch (_) { out = reindentCode(src, lang); } // 坏 JSON 回退括号重排
+    } else if (lang === "sql") {
+      out = sqlFormat(src);
+    } else if (lang === "py") {
+      // Python 红线：缩进即语法，只清行尾空白与空行，绝不动行首
+      out = tidyText(src, false);
+    } else if (lang === "js" || lang === "c" || lang === "ms" || lang === "rust" || lang === "go") {
+      out = reindentCode(tidyText(src, true), lang);
+    } else {
+      out = tidyText(src, true);
+    }
+    TV.transformed = "format";
+    tvSetText(out);
+    $("viewer-banner-text").textContent =
+      `已应用「格式化（${TV_LANG_LABEL[lang] || "通用整理"}）」——显示层处理，原文未修改`;
+    $("viewer-banner").classList.remove("hidden");
+    $("viewer-banner-copy").onclick = () => copyText(TV.text);
+  } catch (e) {
+    showToast(`格式化失败：${String((e && e.message) || e).slice(0, 80)}`);
+  }
+}
+/** 轻量整理：去行尾空白、连续空行压到至多 1 行、去首尾空行。
+ * keepIndent=false（Python）时行首原样保留；true 时顺手把行首
+ * 制表符统一成 2 空格（仅限花括号语言的显示整理）。 */
+function tidyText(src, keepIndent) {
+  const lines = src.split("\n").map((l) => {
+    let s = l.replace(/[ \t]+$/g, "");
+    if (keepIndent) s = s.replace(/^\t+/, (m) => "  ".repeat(m.length));
+    return s;
+  });
+  const out = [];
+  let blank = 0;
+  for (const l of lines) {
+    if (l.trim() === "") { blank++; if (blank > 1) continue; out.push(""); }
+    else { blank = 0; out.push(l); }
+  }
+  while (out.length && out[0] === "") out.shift();
+  while (out.length && out[out.length - 1] === "") out.pop();
+  return out.join("\n");
+}
+/** SQL 轻量格式化：子句关键字断行 + 主要关键字大写；引号内不动。 */
+function sqlFormat(src) {
+  // 先按引号切段，只在引号外做变换
+  const segs = [];
+  let cur = "", q = null;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (q) {
+      cur += ch;
+      if (ch === q) {
+        // SQL 用双写引号转义（'it''s'）：下一个还是同引号则仍在串内
+        if (src[i + 1] === q) { cur += q; i++; continue; }
+        segs.push({ q: true, s: cur }); cur = ""; q = null;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      if (cur) { segs.push({ q: false, s: cur }); cur = ""; }
+      q = ch; cur = ch;
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) segs.push({ q: !!q, s: cur });
+  const CLAUSES = ["FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "OFFSET",
+    "LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "OUTER JOIN", "FULL JOIN", "JOIN",
+    "UNION ALL", "UNION", "VALUES", "SET", "ON"];
+  const KEYWORDS = ["SELECT", "INSERT INTO", "UPDATE", "DELETE FROM", "CREATE TABLE",
+    "ALTER TABLE", "DROP TABLE", "AND", "OR", "NOT", "NULL", "AS", "IN", "IS", "LIKE",
+    "BETWEEN", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END", "DISTINCT", "INTO"];
+  let out = "";
+  for (const seg of segs) {
+    if (seg.q) { out += seg.s; continue; }
+    let s = seg.s.replace(/\s+/g, " ");
+    for (const c of CLAUSES) {
+      // 复合 JOIN（LEFT JOIN 等）先替换成占位符，免得随后的裸
+      // JOIN 正则把已断好的 LEFT JOIN 再断一次（评审补强）
+      const isCompoundJoin = c.includes(" ") && c.endsWith("JOIN");
+      s = s.replace(new RegExp("\\s*\\b" + c.replace(/ /g, "\\s+") + "\\b", "gi"),
+        isCompoundJoin ? "\n\u0001" + c + "\u0001" : "\n" + c);
+    }
+    s = s.replace(/\u0001/g, "");
+    for (const k of KEYWORDS) {
+      s = s.replace(new RegExp("\\b" + k.replace(/ /g, "\\s+") + "\\b", "gi"), k);
+    }
+    out += s;
+  }
+  return tidyText(out, true);
+}
 function fmtDateTime(d) {
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
@@ -5371,18 +5781,35 @@ function xmlPretty(src) {
   }
   return out.join("\n");
 }
-/** 通用大括号缩进整理（近似：不解析字符串里的括号，显示层处理，
- * 原文不动，看不顺眼点「查看原文」即可）。 */
-function reindentCode(src) {
+/** 通用大括号缩进整理（v2.6.6 升级：计括号时跳过字符串与注释内
+ * 的括号——旧版把字符串里的 } 也计数，缩进会越理越歪。仍是显示
+ * 层近似处理，原文不动，看不顺眼点「查看原文」即可）。 */
+function reindentCode(src, lang) {
   let depth = 0;
+  let blockComment = false;
   const out = [];
   for (const raw of src.split("\n")) {
     const line = raw.trim();
     if (!line) { out.push(""); continue; }
     const lead = /^[})\]]/.test(line) ? 1 : 0;
     out.push("  ".repeat(Math.max(0, depth - lead)) + line);
-    let delta = 0;
-    for (const ch of line) {
+    // 净括号增量：逐字扫，字符串/行注释/块注释内的括号不算
+    let delta = 0, q = null;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i], nx = line[i + 1] || "";
+      if (blockComment) {
+        if (ch === "*" && nx === "/") { blockComment = false; i++; }
+        continue;
+      }
+      if (q) {
+        if (ch === "\\") { i++; continue; }
+        if (ch === q) q = null;
+        continue;
+      }
+      if (ch === "/" && nx === "/") break;
+      if (ch === "#" && (lang === "py" || lang === "ms")) break; // # 只在 Python/MagicScript 是行注释；JS/C 等语言里 # 是私有字段/颜色值，误断会让后续括号不计数（评审补强）
+      if (ch === "/" && nx === "*") { blockComment = true; i++; continue; }
+      if (ch === '"' || ch === "'" || ch === "`") { q = ch; continue; }
       if (ch === "{" || ch === "[" || ch === "(") delta++;
       else if (ch === "}" || ch === "]" || ch === ")") delta--;
     }

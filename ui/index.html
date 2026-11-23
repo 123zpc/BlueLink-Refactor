@@ -52,6 +52,7 @@
     <symbol id="i-quote" viewBox="0 0 24 24"><path d="M3 21c3 0 7-1 7-8V5c0-1.25-.756-2.017-2-2H4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2 1 0 1 0 1 1v1c0 1-1 2-2 2s-1 .008-1 1.031V20c0 1 0 1 1 1z"/><path d="M15 21c3 0 7-1 7-8V5c0-1.25-.757-2.017-2-2h-4c-1.25 0-2 .75-2 1.972V11c0 1.25.75 2 2 2h.75c0 2.25.25 4-2.75 4v3c0 1 0 1 1 1z"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></symbol>
     <symbol id="i-chevrons-left" viewBox="0 0 24 24"><path d="m11 17-5-5 5-5"/><path d="m18 17-5-5 5-5"/></symbol>
     <symbol id="i-chevrons-right" viewBox="0 0 24 24"><path d="m6 17 5-5-5-5"/><path d="m13 17 5-5-5-5"/></symbol>
   </defs>
@@ -352,7 +353,7 @@
           <span>温度 <b id="ai-temp-val">0.7</b></span>
           <input id="ai-temp" type="range" min="0" max="2" step="0.1" value="0.7" class="range-input">
         </div>
-        <label class="field">最大回复长度（tokens，留空不限）<input id="ai-max-tokens" type="number" min="1" placeholder="不限"></label>
+        <label class="field">最大回复长度（tokens，留空不限）<input id="ai-max-tokens" type="text" inputmode="numeric" placeholder="不限"></label>
         <label class="field">系统提示词<textarea id="ai-prompt" rows="2" placeholder="如：你是一个简洁的助手，回答尽量短"></textarea></label>
         <div class="setting-row">
           <span>流式输出</span>
@@ -532,8 +533,15 @@
     <div class="viewer-top">
       <span id="viewer-title">文件</span>
       <span id="viewer-sub" class="muted small"></span>
+      <button id="viewer-rename-btn" class="icon-btn hidden" title="改名：修改文件名与后缀（改后即为最终身份）"><svg class="ico ico-16"><use href="#i-edit"/></svg></button>
+      <span id="viewer-rename-wrap" class="hidden">
+        <input id="viewer-rename-input" type="text" maxlength="160" spellcheck="false">
+        <button id="viewer-rename-ok" class="btn small-btn">保存</button>
+        <button id="viewer-rename-cancel" class="btn small-btn">取消</button>
+      </span>
       <span class="flex-spacer"></span>
       <span id="viewer-tools" class="hidden">
+        <button id="viewer-format-btn" class="btn small-btn" title="按当前文件语言做轻量格式化（只改显示，原文不动）">格式化</button>
         <select id="viewer-fmt" title="格式化快捷处理（只改显示，原文不动）">
           <option value="">格式化处理…</option>
           <option value="jsonPretty">JSON 美化</option>
@@ -601,9 +609,10 @@
       <p id="viewer-media-err" class="hidden">此格式内置播放不了。<button id="viewer-media-open" class="btn small-btn">用系统程序打开</button></p>
     </div>
   </div>
-  <div id="toast" class="hidden"></div>
+  <div id="toast" class="toast-off"></div>
 </div>
 <div id="drop-overlay" class="hidden"><div class="drop-inner">释放鼠标，把文件发给对方</div></div>
+<script src="classify.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

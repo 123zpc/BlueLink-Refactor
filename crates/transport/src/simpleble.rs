@@ -73,16 +73,22 @@ mod imp {
         }
 
         async fn send(&self, data: Vec<u8>) {
-            let bytes = {
+            // 重组解码器一次可带出 0..n 个按序载荷（乱序片入座等待时为 0，
+            // 绝不按到达顺序喂流——v2.6.6 #19）
+            let payloads = {
                 let mut dec = self.slicer.lock().unwrap();
                 dec.decode(&data)
             };
-            let Some(bytes) = bytes else {
-                return; // 重复/损坏片已在解码器里计数落日志
-            };
+            if payloads.is_empty() {
+                return;
+            }
             let tx = self.tx.lock().unwrap().clone();
             if let Some(tx) = tx {
-                let _ = tx.send(bytes).await;
+                for bytes in payloads {
+                    if tx.send(bytes).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
 

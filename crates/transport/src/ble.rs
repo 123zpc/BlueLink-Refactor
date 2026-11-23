@@ -231,34 +231,60 @@ impl SliceEncoder {
     }
 }
 
-/// 切片解码器：按序号验收每一片。
-/// - 重复片（序号 = 上一片）：丢弃并计数——重复字节进流必然错位。
-/// - 序号跳跃（丢片）：计数并落 essential 日志，载荷照常交付——帧层
-///   解码器会丢掉受损帧并重新对齐，在这一层把后续好片全扔掉只会
-///   扩大损失。
+/// 乱序重组窗口（片数）：窗口内的迟到片先入座等待，凑齐即按序交付；
+/// 只有缺片迟迟不来、窗口被后续片占满时，才判定缺片真丢——跳过
+/// 计数并推进。窗口 64 片 × 197 字节 ≈ 12.6KB，足够吸收蓝牙栈的
+/// 通知/写请求乱序（真机实测乱序幅度只有个位数片）。
+pub(crate) const SLICE_WINDOW: usize = 64;
+
+/// 切片解码器：按序号重组（v2.6.6，#19 重写）。
+/// 旧版「先到先喂」：乱序片一到就按到达顺序塞进字节流，字节当场
+/// 错位，受损帧被帧层丢弃时连带跳过在飞文件的有效载荷——2026-11-22
+/// 真机实锤：SimpleBLE 图组 4 张首发 2 张校验失败，日志里期望 232
+/// 收到 233、随后 234 与 232 互跳。新版语义：
+/// - 正序片：立即交付，并把已入座的连续片一并按序带出。
+/// - 乱序片（序号在期望之后、窗口之内）：入座等待，不交付、不丢弃。
+/// - 重复片（已交付/已入座）：丢弃并计数——重复字节进流必然错位。
+/// - 缺片真丢（窗口占满仍等不到）：跳过缺片计数推进，受损的至多是
+///   缺片所在的那一帧，帧层重对齐兜底；其余载荷一片不丢。
 /// - 头魔数不对：整片丢弃并计数（不是本协议的片或已污染）。
 #[derive(Debug)]
 pub(crate) struct SliceDecoder {
-    expect: Option<u16>,
+    /// 下一个期望序号。编码器每条链路从 0 起（SliceEncoder::new），
+    /// 解码器同为每链路一个，故起点锚定 0——旧版「第一片到什么就从
+    /// 什么起」在乱序时会把第 2/3 片误认成流首、整条流当场错位
+    /// （v2.6.6 乱序回归测试实锤）。
+    expect: u16,
+    /// 入座等待的乱序片：序号 → 载荷（≤ SLICE_WINDOW 条）。
+    pending: std::collections::HashMap<u16, Vec<u8>>,
     tag: &'static str,
+    /// 被判定真丢、跳过的缺片总数。
     pub gaps: u64,
+    /// 发生缺片跳过的事件数。
+    pub gap_events: u64,
     pub dups: u64,
     pub corrupt: u64,
+    /// 入座等待后按序交付的片数（乱序被成功吸收的证据）。
+    pub reordered: u64,
 }
 
 impl SliceDecoder {
     pub fn new(tag: &'static str) -> Self {
         Self {
-            expect: None,
+            expect: 0,
+            pending: std::collections::HashMap::new(),
             tag,
             gaps: 0,
+            gap_events: 0,
             dups: 0,
             corrupt: 0,
+            reordered: 0,
         }
     }
 
-    /// 验收一片：返回应喂入字节流的载荷；None 表示该片应丢弃。
-    pub fn decode(&mut self, slice: &[u8]) -> Option<Vec<u8>> {
+    /// 验收一片：返回本次应按序喂入字节流的 0..n 个载荷。
+    pub fn decode(&mut self, slice: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
         if slice.len() < SLICE_HEADER || slice[0] != SLICE_MAGIC {
             self.corrupt += 1;
             if self.corrupt == 1 || self.corrupt.is_multiple_of(100) {
@@ -267,33 +293,86 @@ impl SliceDecoder {
                     &format!("切片头无效，整片丢弃（累计 {} 次）", self.corrupt),
                 );
             }
-            return None;
+            return out;
         }
         let seq = u16::from_le_bytes([slice[1], slice[2]]);
-        match self.expect {
-            None => self.expect = Some(seq.wrapping_add(1)),
-            Some(exp) if seq == exp => self.expect = Some(exp.wrapping_add(1)),
-            Some(exp) if seq == exp.wrapping_sub(1) => {
+        let payload = slice[SLICE_HEADER..].to_vec();
+        let exp = self.expect;
+        // 带回绕的有符号距离：>0 在期望之后（乱序先到），<0 已交付过。
+        let dist = seq.wrapping_sub(exp) as i16;
+        if dist == 0 {
+            out.push(payload);
+            self.expect = exp.wrapping_add(1);
+            self.drain(&mut out);
+        } else if dist > 0 {
+            if self.pending.contains_key(&seq) {
                 self.dups += 1;
                 crate::probe::log(
                     self.tag,
-                    &format!("切片重复（序号 {seq}），丢弃（累计 {} 次）", self.dups),
+                    &format!("切片重复（序号 {seq} 已入座），丢弃（累计 {} 次）", self.dups),
                 );
-                return None;
+                return out;
             }
-            Some(exp) => {
-                self.gaps += 1;
+            self.pending.insert(seq, payload);
+            if self.pending.len() >= SLICE_WINDOW {
+                // 窗口占满缺片仍未到：判定真丢，跳到最近的入座片推进。
+                self.skip_missing(&mut out);
+            }
+        } else {
+            self.dups += 1;
+            if self.dups == 1 || self.dups.is_multiple_of(100) {
                 crate::probe::log(
                     self.tag,
-                    &format!(
-                        "切片序号跳跃：期望 {exp} 收到 {seq}（累计丢片事件 {} 次），帧层将重新对齐",
-                        self.gaps
-                    ),
+                    &format!("切片重复/迟到（序号 {seq}，期望 {exp}），丢弃（累计 {} 次）", self.dups),
                 );
-                self.expect = Some(seq.wrapping_add(1));
             }
         }
-        Some(slice[SLICE_HEADER..].to_vec())
+        out
+    }
+
+    /// 把入座片中从 expect 起连续的一串按序带出。
+    fn drain(&mut self, out: &mut Vec<Vec<u8>>) {
+        loop {
+            let exp = self.expect;
+            match self.pending.remove(&exp) {
+                Some(p) => {
+                    self.reordered += 1;
+                    out.push(p);
+                    self.expect = exp.wrapping_add(1);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 缺片真丢：跳过 expect 起连续缺失的片，落到最近的入座片并带出
+    /// 其后连续段。跳过的片数计入 gaps（帧层会对受损帧重对齐）。
+    fn skip_missing(&mut self, out: &mut Vec<Vec<u8>>) {
+        let exp = self.expect;
+        let Some(min_dist) = self
+            .pending
+            .keys()
+            .map(|s| s.wrapping_sub(exp) as i16)
+            .filter(|d| *d > 0)
+            .min()
+        else {
+            return;
+        };
+        // 顺带清掉序号已过期的残留片（评审补强）：回绕/迟到片若
+        // 一直留在 pending 里，窗口会被僵尸片占着、反复触发跳过。
+        self.pending
+            .retain(|seq, _| seq.wrapping_sub(exp) as i16 >= min_dist);
+        self.gaps += min_dist as u64;
+        self.gap_events += 1;
+        crate::probe::log(
+            self.tag,
+            &format!(
+                "切片缺片真丢：期望 {exp} 起跳过 {min_dist} 片（累计跳过 {} 片 / {} 次），后续载荷按序继续交付",
+                self.gaps, self.gap_events
+            ),
+        );
+        self.expect = exp.wrapping_add(min_dist as u16);
+        self.drain(out);
     }
 }
 
@@ -773,11 +852,16 @@ impl BleCentral {
                 if n.uuid != OUTBOX_UUID {
                     continue;
                 }
-                let Some(bytes) = slicer.decode(&n.value) else {
-                    continue; // 重复/损坏片已在解码器里计数落日志
-                };
-                if in_tx.send(bytes).await.is_err() {
-                    local_close = true; // 本机流已关（会话收尾中），不是对端断链
+                // 重组解码器一次可带出 0..n 个按序载荷（乱序片入座时为 0）
+                let mut dead = false;
+                for bytes in slicer.decode(&n.value) {
+                    if in_tx.send(bytes).await.is_err() {
+                        local_close = true; // 本机流已关（会话收尾中），不是对端断链
+                        dead = true;
+                        break;
+                    }
+                }
+                if dead {
                     break;
                 }
             }
@@ -1112,7 +1196,7 @@ pub async fn start_ble_server(
                     // 旧版 try_send 满即丢片是字节流失步的实锤来源之一。
                     // 事件循环在此短暂等待只是把背压传给对端的写请求，
                     // 读端排空很快，不会久堵；通道已关（会话收尾）才放弃。
-                    let mut deliver: Option<Vec<u8>> = None;
+                    let mut deliver: Vec<Vec<u8>> = Vec::new();
                     let mut target_tx: Option<mpsc::Sender<Vec<u8>>> = None;
                     if let Some((client, tx, slicer)) = link.as_mut() {
                         if request.characteristic == INBOX_UUID && client == &request.client {
@@ -1120,12 +1204,15 @@ pub async fn start_ble_server(
                             target_tx = Some(tx.clone());
                         }
                     }
-                    if let (Some(bytes), Some(tx)) = (deliver, target_tx) {
-                        if tx.send(bytes).await.is_err() {
-                            crate::probe::log(
-                                "ble",
-                                "服务端：入站通道已关闭，丢弃一帧入站数据（会话收尾中）",
-                            );
+                    if let Some(tx) = target_tx {
+                        for bytes in deliver {
+                            if tx.send(bytes).await.is_err() {
+                                crate::probe::log(
+                                    "ble",
+                                    "服务端：入站通道已关闭，丢弃一帧入站数据（会话收尾中）",
+                                );
+                                break;
+                            }
                         }
                     }
                     let _ = responder.send(WriteRequestResponse {
@@ -1277,7 +1364,7 @@ mod tests {
             let mut dec = SliceDecoder::new("test");
             while let Some((bytes, _slot)) = a_out.recv().await {
                 for piece in enc.encode(&bytes) {
-                    if let Some(frame_bytes) = dec.decode(&piece) {
+                    for frame_bytes in dec.decode(&piece) {
                         if b_in.send(frame_bytes).await.is_err() {
                             return;
                         }
@@ -1308,8 +1395,9 @@ mod tests {
         }
     }
 
-    /// 切片序号验收（v2.6.2）：重复片被丢弃计数、丢片被计数且不
-    /// 连累后续片、正常流逐字节无损。
+    /// 切片序号验收（v2.6.2 立、v2.6.6 #19 按重组语义改）：重复片被
+    /// 丢弃计数、正常流逐字节无损；缺片在窗口内先挂起等待（不交付
+    /// 也不误判），窗口占满才判定真丢并计数跳过。
     #[test]
     fn 切片序号异常被检出() {
         let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
@@ -1320,34 +1408,169 @@ mod tests {
         let mut dec = SliceDecoder::new("t");
         let mut out = Vec::new();
         for s in &slices {
-            out.extend(dec.decode(s).unwrap());
+            for b in dec.decode(s) {
+                out.extend(b);
+            }
         }
         assert_eq!(out, data);
         // 重复片：丢弃计数，内容仍无损
         let mut dec = SliceDecoder::new("t");
         let mut out = Vec::new();
         for (i, s) in slices.iter().enumerate() {
-            if let Some(b) = dec.decode(s) {
+            for b in dec.decode(s) {
                 out.extend(b);
             }
             if i == 2 {
-                assert!(dec.decode(s).is_none(), "重复片应被丢弃");
+                assert!(dec.decode(s).is_empty(), "重复片应被丢弃");
             }
         }
         assert_eq!(out, data);
         assert_eq!(dec.dups, 1);
-        // 丢片：缺口计数，剩余载荷仍交付（受损帧由帧层 CRC 兜底）
+        // 丢片（窗口未满）：后续片入座等待、暂不交付、不误报缺片
         let mut dec = SliceDecoder::new("t");
         let mut got = 0usize;
         for (i, s) in slices.iter().enumerate() {
             if i == 1 {
                 continue;
             }
-            if let Some(b) = dec.decode(s) {
+            for b in dec.decode(s) {
                 got += b.len();
             }
         }
+        assert_eq!(dec.gaps, 0, "窗口内缺片应先等待，不许立即判定丢失");
+        assert_eq!(got, slices[0].len() - SLICE_HEADER, "只有缺片之前的载荷已交付");
+    }
+
+    /// #19 回归（2026-11-22 真机定案复刻）：切片乱序到达（期望 232
+    /// 收到 233、234 与 232 互跳的模式）必须被重组吸收——整段数据
+    /// 逐字节无损、顺序正确、零缺片判定。
+    #[test]
+    fn 切片乱序被重组吸收() {
+        // 约 40 片
+        let data: Vec<u8> = (0..8000u32).map(|i| (i % 253) as u8).collect();
+        let mut enc = SliceEncoder::new();
+        let slices = enc.encode(&data);
+        assert!(slices.len() > 30);
+        // 乱序模式：每 3 片一组内逆序投递（模拟真机日志的互跳），
+        // 再叠加一处跨组交换（第 10 片与第 14 片对调）
+        let mut order: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < slices.len() {
+            let end = (i + 3).min(slices.len());
+            for j in (i..end).rev() {
+                order.push(j);
+            }
+            i = end;
+        }
+        order.swap(10, 14);
+        let mut dec = SliceDecoder::new("t");
+        let mut out = Vec::new();
+        for idx in order {
+            for b in dec.decode(&slices[idx]) {
+                out.extend(b);
+            }
+        }
+        assert_eq!(out, data, "乱序重组后必须逐字节一致");
+        assert_eq!(dec.gaps, 0, "乱序不许被误判为丢片");
+        assert!(dec.reordered > 0, "应有入座后按序交付的片");
+    }
+
+    /// #19 回归二：多文件连发（图组场景）——4 份数据首尾相接、全体
+    /// 切片做确定性洗牌（窗口内乱序），重组后逐字节无损、零校验
+    /// 失败的前提（字节流不错位）成立。
+    #[test]
+    fn 多文件连发乱序零错位() {
+        let mut enc = SliceEncoder::new();
+        let mut slices: Vec<Vec<u8>> = Vec::new();
+        let mut expect_data: Vec<u8> = Vec::new();
+        for f in 0..4u32 {
+            let data: Vec<u8> = (0..(20_000 + f * 7_777)).map(|i| ((i + f * 31) % 251) as u8).collect();
+            expect_data.extend_from_slice(&data);
+            slices.extend(enc.encode(&data));
+        }
+        // 窗口内洗牌：按 16 片一组组内 LCG 洗牌（乱序幅度 < 窗口 64）
+        let mut seed: u32 = 0x99;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            (seed >> 16) as usize
+        };
+        let mut shuffled: Vec<Vec<u8>> = Vec::new();
+        for chunk in slices.chunks(16) {
+            let mut v: Vec<Vec<u8>> = chunk.to_vec();
+            for i in (1..v.len()).rev() {
+                let j = rnd() % (i + 1);
+                v.swap(i, j);
+            }
+            shuffled.extend(v);
+        }
+        let mut dec = SliceDecoder::new("t");
+        let mut out = Vec::new();
+        for s in &shuffled {
+            for b in dec.decode(s) {
+                out.extend(b);
+            }
+        }
+        assert_eq!(out, expect_data, "多文件连发乱序后字节流必须逐字节一致");
+        assert_eq!(dec.gaps, 0);
+    }
+
+    /// #19 回归三：缺片真丢——某片永不到达，后续片把窗口占满后应
+    /// 跳过缺片继续按序交付（只损失缺片所在帧，帧层重对齐兜底），
+    /// 且跳过计数准确；迟到的缺片事后到达按重复丢弃。
+    #[test]
+    fn 切片真丢窗口满后跳过() {
+        let n = SLICE_WINDOW + 30;
+        let data: Vec<u8> = (0..(n * SLICE_DATA)).map(|i| (i % 251) as u8).collect();
+        let mut enc = SliceEncoder::new();
+        let slices = enc.encode(&data);
+        assert_eq!(slices.len(), n);
+        let mut dec = SliceDecoder::new("t");
+        let mut out = Vec::new();
+        for (i, s) in slices.iter().enumerate() {
+            if i == 1 {
+                continue; // 第 2 片永不到达
+            }
+            for b in dec.decode(s) {
+                out.extend(b);
+            }
+        }
+        // 期望：除缺片外全部按序交付
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(&data[..SLICE_DATA]);
+        expected.extend_from_slice(&data[2 * SLICE_DATA..]);
+        assert_eq!(out, expected);
         assert_eq!(dec.gaps, 1);
-        assert!(got < data.len());
+        assert_eq!(dec.gap_events, 1);
+        // 迟到的缺片：按重复/迟到丢弃，不许再进流
+        assert!(dec.decode(&slices[1]).is_empty());
+    }
+
+    /// #19 回归四：序号回绕（u16 65535 → 0）附近乱序同样正确重组。
+    /// 编码器/解码器都从 0 起（生产语义），先顺序喂到回绕前夕，
+    /// 再乱序投递跨回绕的尾段 8 片。
+    #[test]
+    fn 切片序号回绕乱序() {
+        let total = 65536 + 4;
+        let data: Vec<u8> = (0..(total * SLICE_DATA)).map(|i| (i % 251) as u8).collect();
+        let mut enc = SliceEncoder::new();
+        let slices = enc.encode(&data);
+        assert_eq!(slices.len(), total);
+        let mut dec = SliceDecoder::new("t");
+        let mut out = Vec::new();
+        for s in &slices[..total - 8] {
+            for b in dec.decode(s) {
+                out.extend(b);
+            }
+        }
+        // 尾段（序号 65532,65533,65534,65535,0,1,2,3）两两交换投递
+        for pair in (total - 8..total).collect::<Vec<_>>().chunks(2) {
+            for idx in pair.iter().rev() {
+                for b in dec.decode(&slices[*idx]) {
+                    out.extend(b);
+                }
+            }
+        }
+        assert_eq!(out, data);
+        assert_eq!(dec.gaps, 0);
     }
 }

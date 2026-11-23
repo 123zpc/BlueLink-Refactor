@@ -2,7 +2,7 @@
 //! 用法：
 //!   bluelink-node host    --dir <数据目录> --name <名字> --addr 127.0.0.1:7800
 //!   bluelink-node connect --dir <数据目录> --name <名字> --addr 127.0.0.1:7800 --code 123456
-//! 连接后从标准输入读命令：send <文本> | file <路径> | group <图1,图2,…> | ai <问题> | code | quit
+//! 连接后从标准输入读命令：send <文本> | file <路径> | group <图1,图2,…> | ai <问题> | code | bye（礼貌断开） | quit（拔线退出）
 //! 可选环境变量：BLUELINK_AI_BASE / BLUELINK_AI_KEY / BLUELINK_AI_MODEL 配置本机 AI。
 
 use bluelink_services::{Event, Node};
@@ -106,6 +106,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(line) = rx_cmd.recv().await {
         let line = line.trim().to_string();
         if line == "quit" {
+            break;
+        }
+        if line == "bye" {
+            // 礼貌断开（v2.6.6 联调）：走 Node::disconnect 发告别帧再退出，
+            // 与 quit 的拔线式退出区分——专验对方收到 Goodbye 不重连。
+            node2.disconnect().await;
+            println!("[已礼貌断开（告别帧已发）]");
             break;
         }
         if line == "code" {

@@ -301,7 +301,9 @@ section { display: flex; flex-direction: column; height: 100%; }
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236B7280' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat; background-position: right 8px center; }
 #ai-source:hover { border-color: var(--border-strong); background-color: var(--panel-2); }
-#ai-source:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* v2.6.6 #12/#20 口径统一：下拉聚焦改柔影环，与查看器改名框同口径，
+   不再用 2px 硬 outline（与边框叠成双层粗框） */
+#ai-source:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 :root[data-theme="dark"] #ai-source { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239BA1A6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) #ai-source { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239BA1A6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); } }
 .chat-title { font-size: 15.5px; font-weight: 600; line-height: 1.3; }
@@ -337,6 +339,10 @@ section { display: flex; flex-direction: column; height: 100%; }
 .msg:hover .msg-actions { visibility: visible; }
 .msg-actions button { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 11px; padding: 1px 6px; border-radius: 4px; }
 .msg-actions button:hover { color: var(--accent); background: var(--hover); }
+/* v2.6.6 #3：收藏/置顶按钮定宽——状态文案「收藏↔已收藏」相差一字，
+   不定宽时 meta 行（与气泡同列、列宽取大）被撑宽、气泡跟着变尺寸；
+   定宽 48px 后切换只换字与颜色，整行与气泡尺寸纹丝不动。 */
+.msg-actions button.fav-btn, .msg-actions button.pin-btn { min-width: 48px; text-align: center; }
 /* 已收藏态：收藏钮当场变样（v2.5.1 补反馈——旧版点了毫无反应像没生效） */
 .msg-actions button.marked { color: var(--accent); font-weight: 600; }
 #pin-bar, #ai-pin-bar { cursor: pointer; }
@@ -369,6 +375,13 @@ section { display: flex; flex-direction: column; height: 100%; }
   display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 #ai-quote-bar.hidden { display: none; }
 #ai-quote-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* v2.6.6 #12：.ghost 此前只有用处没有定义——按钮落回系统默认浅底，
+   深色模式下就是一块白色方块（用户截图的引用条 × 即此）。补齐为
+   幽灵按钮口径：透明底、主题字色、悬停才有底色，两主题通用。 */
+.ghost { border: none; background: transparent; color: var(--text-2); border-radius: 6px;
+  width: 24px; height: 24px; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 15px; line-height: 1; cursor: pointer; padding: 0; }
+.ghost:hover { background: var(--hover); color: var(--text); }
 #ai-quote-x { font-size: 14px; line-height: 1; padding: 2px 6px; flex: none; }
 /* @AI 路由条与选项面板（聊天框输入 @ 后选 AI） */
 #ai-route-bar { font-size: 12px; color: var(--text-2); padding: 6px 10px; margin-bottom: 8px;
@@ -471,6 +484,31 @@ section { display: flex; flex-direction: column; height: 100%; }
 #tag-list::-webkit-scrollbar-thumb, #fav-list::-webkit-scrollbar-thumb, #drawer-list::-webkit-scrollbar-thumb,
 #palette-list::-webkit-scrollbar-thumb, .settings-body::-webkit-scrollbar-thumb {
   background: var(--border-strong); border-radius: 4px; }
+/* v2.6.6 #9 滚动条全应用统一补全：此前漏网的可滚动区域一并收编——
+   查看器、搜索结果、彩签/置顶浮层列表、更新说明、整页列表、设置页
+   文本域（「系统提示词」的原生粗条即 .field textarea），不许任何一处
+   再露原生样式（带箭头/宽滑块）；气泡内代码块为横向 6px 细条。 */
+#viewer-scroll::-webkit-scrollbar, #search-results::-webkit-scrollbar,
+#ribbon-list::-webkit-scrollbar, #pin-list::-webkit-scrollbar, #ai-pin-list::-webkit-scrollbar,
+#update-notes::-webkit-scrollbar, .page-list::-webkit-scrollbar,
+.field textarea::-webkit-scrollbar, #connect-view::-webkit-scrollbar { width: 8px; }
+#viewer-scroll::-webkit-scrollbar-thumb, #search-results::-webkit-scrollbar-thumb,
+#ribbon-list::-webkit-scrollbar-thumb, #pin-list::-webkit-scrollbar-thumb, #ai-pin-list::-webkit-scrollbar-thumb,
+#update-notes::-webkit-scrollbar-thumb, .page-list::-webkit-scrollbar-thumb,
+.field textarea::-webkit-scrollbar-thumb, #connect-view::-webkit-scrollbar-thumb {
+  background: var(--border-strong); border-radius: 4px; }
+#viewer-scroll::-webkit-scrollbar-track, #search-results::-webkit-scrollbar-track,
+#ribbon-list::-webkit-scrollbar-track, #pin-list::-webkit-scrollbar-track, #ai-pin-list::-webkit-scrollbar-track,
+#update-notes::-webkit-scrollbar-track, .page-list::-webkit-scrollbar-track,
+.field textarea::-webkit-scrollbar-track, #connect-view::-webkit-scrollbar-track { background: transparent; }
+.bubble pre::-webkit-scrollbar, .md-code pre::-webkit-scrollbar { height: 6px; }
+.bubble pre::-webkit-scrollbar-thumb, .md-code pre::-webkit-scrollbar-thumb {
+  background: var(--border-strong); border-radius: 3px; }
+/* Firefox 口径一致性（本应用 WebView 以 webkit 引擎为主，此为补全） */
+#messages, #ai-messages, #conv-list, #tag-list, #fav-list, #drawer-list, #palette-list,
+.settings-body, #viewer-scroll, #search-results, #ribbon-list, #pin-list, #ai-pin-list,
+#update-notes, .page-list, .field textarea, #bt-device-list, .connect-side {
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
 
 /* ===== v2.1.0：列表收起 / 长文本折叠 / 文档提示条 / 拖放层 / 标签彩签 ===== */
 #chat-view { position: relative; }
@@ -589,10 +627,14 @@ section { display: flex; flex-direction: column; height: 100%; }
 .modal-box p { margin: 0 0 16px; font-size: 14px; line-height: 1.55; }
 .modal-btns { justify-content: flex-end; }
 .danger-btn { color: #E11D48; border-color: #E11D48; }
+/* v2.6.6 toast 收编：全应用唯一提示样式——主题色面/圆角 10/字阶 13/
+   内边距统一，bottom 由 JS 按当前输入框上沿锚定（#21），CSS 值仅为
+   无输入框页面的回落。进出动画统一 180ms 淡入上浮/淡出下沉。 */
 #toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); z-index: 70; background: var(--panel);
-  border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 8px; font-size: 13px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2); }
-#toast.hidden { display: none; }
+  border: 1px solid var(--border); color: var(--text); padding: 9px 18px; border-radius: 10px; font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2); max-width: min(86vw, 560px); text-align: center;
+  transition: opacity 0.18s ease, transform 0.18s ease, visibility 0.18s; }
+#toast.toast-off { opacity: 0; transform: translateX(-50%) translateY(8px); visibility: hidden; pointer-events: none; }
 #toast .toast-action { margin-left: 10px; border: none; background: none; color: var(--accent);
   font: inherit; font-weight: 600; cursor: pointer; padding: 0; }
 /* 版本号不可选中：双击/三击手势不再顺带选中文本（旧版双击会复制的成因） */
@@ -749,14 +791,18 @@ section { display: flex; flex-direction: column; height: 100%; }
 .gstack-count { position: absolute; top: 6px; right: 6px; background: rgba(15, 15, 16, 0.45);
   color: #fff; font-size: 10px; line-height: 1.5; padding: 0 7px; border-radius: 999px;
   backdrop-filter: blur(2px); }
-.gstack-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 26px; height: 40px;
-  z-index: 3; }
-  border: none; border-radius: 6px; background: rgba(15, 15, 16, 0.55); color: #fff;
-  font-size: 18px; line-height: 1; cursor: pointer; opacity: 0; transition: opacity 0.12s; }
-.gstack:hover .gstack-nav { opacity: 1; }
-.gstack-nav.prev { left: 6px; }
-.gstack-nav.next { right: 6px; }
-.gstack-nav:hover { background: rgba(15, 15, 16, 0.8); }
+/* v2.6.6 #18①：此规则此前被误写成提前闭合——后半截声明成了孤儿被
+   浏览器整段丢弃，切换钮丢了背景/透明/圆角全部样式、常驻成大灰块。
+   按定版重写：圆形 30px、半透明深色融图、悬浮（或键盘聚焦）才显形。 */
+.gstack-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 30px; height: 30px;
+  z-index: 3; border: none; border-radius: 50%; background: rgba(15, 15, 16, 0.45); color: #fff;
+  font-size: 16px; line-height: 1; cursor: pointer; opacity: 0; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  backdrop-filter: blur(2px); transition: opacity 0.12s, background 0.12s; }
+.gstack:hover .gstack-nav, .gstack-nav:focus-visible { opacity: 1; }
+.gstack-nav.prev { left: 8px; }
+.gstack-nav.next { right: 8px; }
+.gstack-nav:hover { background: rgba(15, 15, 16, 0.7); }
 
 /* ---------- 内置查看器（v2.6.0）：页内全屏覆盖层 ---------- */
 #viewer { position: fixed; inset: 0; z-index: 55; background: var(--bg);
@@ -767,8 +813,25 @@ section { display: flex; flex-direction: column; height: 100%; }
 #viewer-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
 #viewer-tools { display: inline-flex; align-items: center; gap: 6px; }
 #viewer-tools.hidden { display: none; }
-#viewer-fmt { font: inherit; font-size: 12px; padding: 4px 6px; border: 1px solid var(--border-strong);
-  border-radius: 6px; background: var(--panel); color: var(--text); max-width: 150px; }
+/* v2.6.6 #20：编码下拉与 #ai-source 同款自绘面（去原生外观 + SVG
+   箭头，明暗双主题箭头色），不再露系统原生下拉样式；弹出列表本体
+   由系统渲染、WebView 改不了，如实注记于 QA。 */
+#viewer-fmt { appearance: none; -webkit-appearance: none; font: inherit; font-size: 12px;
+  padding: 4px 24px 4px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background-color: var(--panel); color: var(--text); max-width: 150px; cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236B7280' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 7px center; }
+#viewer-fmt:hover { border-color: var(--border-strong); background-color: var(--panel-2); }
+#viewer-fmt:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+:root[data-theme="dark"] #viewer-fmt { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239BA1A6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) #viewer-fmt { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239BA1A6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); } }
+/* v2.6.6 #8：查看器改名行内编辑——输入框套应用口径（同 #15） */
+#viewer-rename-wrap { display: inline-flex; align-items: center; gap: 6px; }
+#viewer-rename-wrap.hidden { display: none; }
+#viewer-rename-input { width: 230px; font: inherit; font-size: 13px; color: var(--text);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 5px 9px; }
+#viewer-rename-input:focus-visible { outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft); }
 
 /* 文本查看器 */
 #viewer-text { flex: 1; display: flex; flex-direction: column; min-height: 0; }
@@ -889,8 +952,17 @@ section { display: flex; flex-direction: column; height: 100%; }
 .ai-conv-chip.active { border-color: var(--accent); color: #fff; background: var(--accent);
   font-weight: 600; box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35); }
 .ai-conv-chip.active::before { background: #fff; }
-.ai-conv-chip input { width: 130px; font: inherit; color: var(--text); background: var(--panel);
-  border: 1px solid var(--accent); border-radius: 4px; padding: 1px 4px; }
+/* v2.6.6 #10①：胶囊的焦点环改走 box-shadow（跟随 999px 圆角）——
+   全局 :focus-visible 的 outline 在部分引擎按矩形绘制，点过的胶囊
+   会顶着一圈方形蓝框（深色下尤为显眼），与圆角实底叠成「方块蓝」。 */
+.ai-conv-chip:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
+.ai-conv-chip.active:focus-visible { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent), 0 2px 8px rgba(37, 99, 235, 0.35); }
+/* v2.6.6 #15：改名行内框套应用输入框口径——主题边框/圆角 8/内边距，
+   聚焦只换边框色 + 柔影，不再叠全局 2px outline 成粗蓝双层框。 */
+.ai-conv-chip input { width: 130px; font: inherit; color: var(--text); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px; padding: 2px 8px; }
+.ai-conv-chip input:focus-visible { outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft); }
 #btn-ai-new-conv { flex: none; }
 #btn-ai-bottom { position: absolute; right: 18px; bottom: 96px; z-index: 8;
   border: 1px solid var(--border-strong); background: var(--panel); color: var(--text);
@@ -918,6 +990,9 @@ section { display: flex; flex-direction: column; height: 100%; }
 /* #1 图片消息行上下间距收紧（明显小于文本消息的 16px） */
 .msg-row.img-row { margin-bottom: 6px; }
 .msg-row.img-row.grouped { margin-bottom: 4px; }
+/* v2.6.6 #18③：图组行恢复普通消息间距（16px），不跟单图行收紧 */
+.msg-row.img-row.group-row { margin-bottom: 16px; }
+.msg-row.img-row.group-row.grouped { margin-bottom: 4px; }
 
 /* #1 单张图片气泡定稿：透明底、零内边距，照片直接落在聊天背景上，
    只留圆角 + 轻阴影 + 1px 细描边；发送端也不再有蓝板。 */
@@ -985,10 +1060,12 @@ section { display: flex; flex-direction: column; height: 100%; }
   border: 1px solid var(--border-strong); background: var(--panel); color: var(--accent);
   border-radius: 999px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
 
-/* #3 AI 会话条：滚动条极细弱化、悬停才显；拖拽中的胶囊半透明 */
-#ai-conv-list { scrollbar-width: none; }
-#ai-conv-list::-webkit-scrollbar { height: 4px; }
-#ai-conv-list::-webkit-scrollbar-thumb { background: transparent; border-radius: 2px; }
+/* #3 AI 会话条：细滚动条（常态弱化、悬停加深）；拖拽中的胶囊半透明。
+   v2.6.6 #6：容器补 min-width:0 允许在 flex 行内收缩出滚动（此前
+   溢出胶囊被挤出不可达）；滚轮纵向滚动转横向（JS 接管，见 app.js）。 */
+#ai-conv-list { min-width: 0; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+#ai-conv-list::-webkit-scrollbar { height: 6px; }
+#ai-conv-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 #ai-conv-list:hover::-webkit-scrollbar-thumb { background: var(--border-strong); }
 .ai-conv-chip.dragging { opacity: 0.55; }
 
@@ -1049,3 +1126,9 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 #clear-modal h3 { font-size: 15px; margin-bottom: 6px; }
 .clear-range-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0 16px; }
 .clear-range-list .btn { width: 100%; }
+
+/* v2.6.6 #12 续：数字输入框去掉原生步进钮（暗色下是白色小盒、浅色下是系统箭头，
+   都与应用控件口径不一致）；键盘上下键步进不受影响。 */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; appearance: textfield; }

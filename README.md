@@ -1,45 +1,91 @@
-# BlueLink-Refactor
+<div align="center">
 
-BlueLink 的**完全重构专属仓库**。原仓库 [123zpc/BlueLink](https://github.com/123zpc/BlueLink) 保持原样、不再改动，所有重构工作只在本仓库进行。
+<img src="app/icons/128x128.png" width="96" alt="BlueLink" />
 
-**重构原则（2026-11-17 定）：这是完全重写，不是代码搬运。只保留最终功能与核心思想 — 无网蓝牙点对点聊天与文件传输；其余一律不保留，原有代码可以全部放弃。语言、技术栈、协议、界面全部重新选型，不受原版 Java / Swing / RFCOMM 实现的约束。**
+# BlueLink
 
-## 这是什么
+**两台电脑，不联网、不经过任何服务器，用蓝牙直接聊天和传文件。**
 
-BlueLink 是一款无网环境下基于蓝牙的即时聊天与文件传输工具：两台电脑点对点直连，不经过云端、不经过局域网。
+[![Release](https://img.shields.io/github/v/release/123zpc/BlueLink-Refactor?style=flat-square)](https://github.com/123zpc/BlueLink-Refactor/releases)
+[![License](https://img.shields.io/github/license/123zpc/BlueLink-Refactor?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue?style=flat-square)](#下载与安装)
+[![Rust](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri%202-orange?style=flat-square)](#架构)
 
-原版（v2.0.1-preview）只支持 Windows。本仓库的目标是把它重构成一个**跨平台、传输更快、体积更小**的版本。
+中文 | [English](README.en.md)
 
-## 重构目标
+</div>
 
-1. **跨平台**：支持 Windows / macOS / Linux。原版传输层直接调用 Windows Winsock（JNA 调 `ws2_32.dll`），这是单平台的根源 — 重构第一步就是把传输层抽象出来，各平台各自实现。
-2. **传输提速**：流式分片传输（不再整文件读入内存再整包压缩），该压缩的才压缩，支持大文件与断点续传。
-3. **架构瘦身**：去掉为 AI 聊天记忆引入的整套 Spring Boot + 内嵌 Redis，改为轻量实现；AI 功能做成可插拔模块。
-4. **界面重做**：聊天界面组件化、长会话不卡顿；emoji 改为按需加载，不再打包数千张图片。
-5. **体积与代码规范**：仓库与安装包瘦身，补测试、补 `.gitignore`，版本号与发布标签对齐。
+---
 
-## 已定选型
+BlueLink 是一款点对点的桌面通讯工具：没有账号、没有云端，两台电脑配对后即可互发消息、图片和文件，断网、内网、隔离环境都能用。本项目是 [BlueLink](https://github.com/123zpc/BlueLink) 的 Rust 重构优化版。
 
-- **语言：Rust**（放弃 Java — 跨平台蓝牙生态对比见 [docs/DECISIONS.md](docs/DECISIONS.md)）
-- **界面：Tauri 2**，按成熟桌面通讯软件的标准做，拒绝玩具感与模板感
-- **传输：双通道** — BLE 负责发现/聊天/信令，文件走平台高速通道，流式分片、可续传
-- **代码注释一律中文**
+## 功能
 
-项目文档（按开发流程逐阶段评审确认）：
-- 现状测量与分阶段方案：[docs/REFACTOR_PLAN.md](docs/REFACTOR_PLAN.md)
-- 选型与产品标准：[docs/DECISIONS.md](docs/DECISIONS.md)
-- 产品需求（PRD）：[docs/PRD.md](docs/PRD.md)
-- 整体架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- 开发流程与评审关口：[docs/PROCESS.md](docs/PROCESS.md)
-- 每版本的完整流程：[docs/VERSION_PROCESS.md](docs/VERSION_PROCESS.md)
-- 交互与视觉设计：[docs/DESIGN.md](docs/DESIGN.md)
+- **蓝牙直连聊天**：文字、图片、文件，开箱即用；首次配对后，后续自动直连
+- **文件传输**：流式分片发送，大文件不占内存；文本类自动压缩，支持断点续传和完整性校验
+- **彩签分类**：9 种颜色就是 9 个分类，给消息选色即归类，可改名、按分类筛选回看
+- **收藏与置顶**：重要消息一键收藏、置顶，随时定位
+- **剪贴板同步**：在一台电脑复制，另一台直接粘贴（文字与图片）
+- **内置查看器**：代码和长文在应用内打开，语法高亮、代码格式化，文件名可手动修正
+- **AI 助手**：接入你自己的 AI 服务（OpenAI 兼容接口），聊天中可 @AI 提问、把消息发给 AI 解读；问答只保存在本机，不发给对方
+- **本地 API**：内置 OpenAI 兼容的本地接口（仅本机回环地址），可供其他软件调用你配置的 AI；密钥只保存在本机，永不经过蓝牙传输
+- **三种传输**：经典蓝牙（默认）、BLE、SimpleBLE，按环境任选
+- **深色 / 浅色主题**，关闭窗口缩到系统托盘后台待命
 
-## 基线
+## 下载与安装
 
-- 原仓库基线提交：`807c8edb91b97bcd7826c5efb1595c699504f057`（main，2026-03-25，合并 PR #2）
-- 原版规模：38 个 Java 文件 / 9,525 行；仓库 28 MB（其中 emoji 图片 15 MB）
-- 原版技术栈：Java 17、Swing + FlatLaf、JNA / Winsock RFCOMM、自研二进制协议、H2、Spring Boot 3.2.5 + Spring AI 1.0.0-M6 + 内嵌 Redis
+到本仓库的 [Releases](https://github.com/123zpc/BlueLink-Refactor/releases) 页面下载对应系统的安装包：
+
+| 系统 | 安装包 |
+| --- | --- |
+| Windows 10 / 11 | `.exe` 安装程序或 `.msi` |
+| macOS（Apple Silicon） | `.dmg` |
+| Linux | `.deb` / `.rpm` / `.AppImage` |
+
+安装包未做商业签名，Windows 或 macOS 首次运行时可能出现安全提示，选择继续运行即可。应用内可手动检查更新。
+
+## 使用
+
+1. 两台电脑都打开蓝牙并启动 BlueLink。
+2. 在一台电脑上进入连接页，选择对方设备（或输入对方的连接码）。
+3. 首次连接时按系统提示完成配对，之后打开即可自动重连。
+4. 连接成功后即可聊天、发图片和文件；接收的文件按日期保存在下载目录中。
+
+## 系统要求
+
+- 带蓝牙的电脑（经典蓝牙或 BLE 均可）
+- Windows 10 / 11、macOS、Linux 主流发行版
+
+## 架构
+
+无服务器的点对点结构，两台电脑直连、没有任何中转。代码按层拆分，上层只依赖下层的接口：
+
+```
+app/            应用外壳：窗口、托盘、本地 API 服务、系统平台适配
+ui/             界面层：页面呈现与用户交互（原生 JS，无框架）
+crates/
+├─ domain/      领域层：消息、会话、设置等核心数据模型
+├─ transport/   传输层：经典蓝牙 / BLE / SimpleBLE，对上只交付一条字节流
+├─ protocol/    协议层：分片编号、校验、乱序重组、zstd 压缩、断点续传
+├─ storage/     存储层：SQLite 持久化，聊天记录与设置落库
+├─ ai/          AI 层：模型接入与流式转发，可插拔
+└─ services/    业务层：连接、会话、文件、剪贴板同步的业务编排
+tools/node-cli/ 测试节点：无界面对端，用于双端联调与自动验证
+docs/           文档：设计文档与发布说明
+```
+
+关键设计就三条：传输与协议解耦，换传输方式不影响上层，单个消息或文件失败绝不连累连接；可靠性由协议层兜底，乱序能重组、损坏能重发；AI 密钥只存本机、永不经过蓝牙，全部数据只存本地、不上传。
+
+技术栈：Rust + Tauri 2。
 
 ## 许可证
 
-沿用原项目 MIT 许可证。
+MIT
+
+---
+
+<div align="center">
+
+作者：ZPC · [github.com/123zpc](https://github.com/123zpc)
+
+</div>

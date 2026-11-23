@@ -198,6 +198,12 @@ pub enum Control {
     },
     Ping,
     Pong,
+    /// 主动断开告别帧（v2.6.6，#17）：用户手动断开前先发此帧，对方
+    /// 收到即把会话标记为「对方主动断开」、不许触发自动重连。旧版本
+    /// 不认识此变体：serde 解码失败 → 帧层按坏帧丢弃并重对齐，连接
+    /// 照常关闭，混版安全（2026-11-22 真机定案：无告别信号时对方把
+    /// 每次手动断开都当意外中断、约 2 秒自动连回，用户被连回 5 次）。
+    Goodbye,
 }
 
 impl Control {
@@ -221,6 +227,7 @@ impl Control {
             Control::ClipboardText { .. } => 0x07,
             Control::Ping => 0x30,
             Control::Pong => 0x31,
+            Control::Goodbye => 0x32,
         }
     }
 }
@@ -703,6 +710,52 @@ mod tests {
                 mime: None,
             }
         );
+    }
+
+    /// #17：Goodbye 帧可编解码往返；且其线缆字节喂给「不认识
+    /// Goodbye 的解码方」时只能按坏帧丢弃、不许panic/不许污染后续帧
+    /// （混版安全：旧版 decode_payload 对未知变体 serde 失败，帧层
+    /// 丢帧重对齐——这里以未知类型码帧模拟同一路径）。
+    #[test]
+    fn goodbye帧往返与混版丢弃() {
+        let frame = Frame::Control(Control::Goodbye);
+        assert_eq!(Control::Goodbye.type_code(), 0x32);
+        let bytes = encode(&frame).unwrap();
+        let mut dec = FrameDecoder::new();
+        dec.push(&bytes);
+        assert_eq!(dec.next_frame(), Some(frame));
+        // 未知控制变体的 JSON（模拟旧版收到新帧）：解码必须报错而非产出帧
+        let bogus = serde_json::json!({ "NoSuchVariant": {} });
+        assert!(serde_json::from_slice::<Control>(&serde_json::to_vec(&bogus).unwrap()).is_err());
+        // 线缆级混版（评审补强）：控制帧的解码以 JSON 为准（类型
+        // 码不参与分发），旧版的真实处境 = 其 Control 枚举里没有
+        // Goodbye 变体、serde 必然失败、帧层整帧丢弃。用测试内
+        // 「旧版枚举」（只有 Ping/Pong）对 Goodbye 的真实序列化
+        // 字节验证必然失败；再把未知变体 JSON 按真实帧格式拼上
+        // 正确 CRC 喂解码器，必须整帧丢弃且不污染后续帧。
+        #[derive(serde::Deserialize, Debug)]
+        enum LegacyControl {
+            Ping,
+            Pong,
+        }
+        let goodbye_json = serde_json::to_vec(&Control::Goodbye).unwrap();
+        assert!(
+            serde_json::from_slice::<LegacyControl>(&goodbye_json).is_err(),
+            "旧版枚举必须解不出 Goodbye"
+        );
+        let payload = serde_json::to_vec(&bogus).unwrap();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&FRAME_MAGIC);
+        wire.extend_from_slice(&((payload.len() as u32 + 5).to_le_bytes()));
+        wire.push(Control::Goodbye.type_code());
+        wire.extend_from_slice(&payload);
+        let crc = crc32(&wire[6..]);
+        wire.extend_from_slice(&crc.to_le_bytes());
+        wire.extend_from_slice(&encode(&ping()).unwrap());
+        let mut dec2 = FrameDecoder::new();
+        dec2.push(&wire);
+        assert_eq!(dec2.next_frame(), Some(ping()), "未知帧丢弃后后续帧必须完好");
+        assert_eq!(dec2.frames_dropped, 1, "未知帧应计一次丢弃");
     }
 
     fn ping() -> Frame {
