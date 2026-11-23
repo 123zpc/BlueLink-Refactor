@@ -1118,20 +1118,58 @@ fn save_text_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| format!("写入失败：{e}"))
 }
 
+/// AI 文本附件入参（v1.0.1）：前端已解码为文本全文（类型/大小在入队
+/// 时按查看器同口径校验过），后端在 services 里还有第二道上限闸。
+#[derive(serde::Deserialize)]
+struct AiAttachmentArg {
+    name: String,
+    content: String,
+}
+
 #[tauri::command]
+
 async fn ai_send(
     state: State<'_, AppState>,
     text: String,
     thinking: Option<bool>,
     conversation_id: Option<String>,
+    attachments: Option<Vec<AiAttachmentArg>>,
 ) -> Result<Message, String> {
+    let atts: Vec<bluelink_services::AiAttachmentIn> = attachments
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| bluelink_services::AiAttachmentIn {
+            name: a.name,
+            content: a.content,
+        })
+        .collect();
     let (tx, rx) = oneshot::channel::<()>();
     *state.ai_cancel.lock().await = Some(tx);
     let node = state.node.clone();
     tokio::select! {
-        r = node.ai_send(&text, thinking, conversation_id) => r.map_err(|e| e.to_string()),
+        r = node.ai_send(&text, thinking, conversation_id, atts) => r.map_err(|e| e.to_string()),
         _ = rx => Err("已停止生成".to_string()),
     }
+}
+
+/// AI 文本附件清单（v1.0.1）：整个会话一调用，前端按 message_id 分组
+/// 给用户消息气泡挂文件片（名+大小，点击打开落盘副本）。
+#[tauri::command]
+fn ai_attachments_map(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<std::collections::HashMap<String, Vec<bluelink_domain::AiAttachment>>, String> {
+    let rows = state
+        .node
+        .storage
+        .ai_attachments_for_conversation(&conversation_id)
+        .map_err(|e| e.to_string())?;
+    let mut map: std::collections::HashMap<String, Vec<bluelink_domain::AiAttachment>> =
+        std::collections::HashMap::new();
+    for r in rows {
+        map.entry(r.message_id.clone()).or_default().push(r);
+    }
+    Ok(map)
 }
 
 /// ㉕ 新建 AI 会话（AI 页「新建会话」）。
@@ -1806,6 +1844,36 @@ fn clipboard_file_list() -> Result<Vec<String>, String> {
     win_clipboard::get_file_list()
 }
 
+/// 待发附件的一条入队信息（路径 + 大小）。
+#[derive(Serialize)]
+struct StagedFile {
+    path: String,
+    size: u64,
+}
+
+/// 粘贴图像回落：读系统剪贴板里的原始图像（截图等无文件形态的图），
+/// 编码 PNG 落盘暂存，返回入队信息；剪贴板里没有图片返回 null——
+/// 前端在文件路线、DataTransfer 图片都落空后才调它，两条路线都
+/// 确实没有时才给用户提示（见 ui 粘贴分流注释）。
+#[tauri::command]
+fn clipboard_take_image(state: State<'_, AppState>) -> Result<Option<StagedFile>, String> {
+    let Some(png) = bluelink_services::clipboard_image_png().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    if png.is_empty() || png.len() > 32 * 1024 * 1024 {
+        return Err("图片数据无效或过大".into());
+    }
+    let dir = state.data_dir.join("pasted");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let name = format!("粘贴的图片-{}.png", bluelink_domain::now_ms());
+    let path = dir.join(name);
+    std::fs::write(&path, &png).map_err(|e| e.to_string())?;
+    Ok(Some(StagedFile {
+        path: path.to_string_lossy().to_string(),
+        size: png.len() as u64,
+    }))
+}
+
 /// 待发附件的入队校验信息：文件须存在且是普通文件，返回文件名与大小。
 #[derive(Serialize)]
 struct AttachInfo {
@@ -2109,6 +2177,43 @@ pub(crate) fn on_notification_activated(app: &AppHandle, conversation_id: &str) 
     );
 }
 
+/// 通知正文摘要（v1.0.1）：与前端统一摘要 msgSummary（ui/app.js）同口径、
+/// 同文案——按消息类型生成人话，内部载荷绝不上屏。此前这里只特判了
+/// 文件类型，图片组直接摘 body 前 60 字，把清单 JSON 推给了系统通知
+/// （用户真机实报）；文本节选同样对齐 msgSummary：空白折叠 + 60 字截断。
+fn notify_body(m: &Message) -> String {
+    use bluelink_domain::MessageKind;
+    match m.kind {
+        MessageKind::ImageGroup => {
+            let n = bluelink_domain::parse_group_manifest(&m.body).len();
+            if n > 0 {
+                format!("图片组 · 共 {n} 张")
+            } else {
+                "图片组".to_string()
+            }
+        }
+        MessageKind::File => {
+            let lower = m.body.to_ascii_lowercase();
+            if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+                .iter()
+                .any(|e| lower.ends_with(e))
+            {
+                format!("图片 · {}", m.body)
+            } else {
+                format!("文件 · {}", m.body)
+            }
+        }
+        _ => {
+            let t = m.body.split_whitespace().collect::<Vec<_>>().join(" ");
+            if t.chars().count() > 60 {
+                format!("{}…", t.chars().take(60).collect::<String>())
+            } else {
+                t
+            }
+        }
+    }
+}
+
 /// 系统通知（v2.5.1）：收到对方新聊天消息时，仅当开关开且窗口不在前台
 /// （隐藏到托盘/最小化/失焦）才弹。窗口可见且有焦点 = 用户正看着应用，不弹。
 /// 只针对聊天新消息；连接/AI 等其他事件不弹。
@@ -2146,24 +2251,7 @@ fn maybe_notify_new_message(app: &AppHandle, node: &Arc<Node>, m: &Message) {
         })
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "对方".to_string());
-    let body = if m.kind == MessageKind::File {
-        let lower = m.body.to_ascii_lowercase();
-        if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
-            .iter()
-            .any(|e| lower.ends_with(e))
-        {
-            format!("[图片] {}", m.body)
-        } else {
-            format!("[文件] {}", m.body)
-        }
-    } else {
-        let excerpt: String = m.body.chars().take(60).collect();
-        if m.body.chars().count() > 60 {
-            format!("{excerpt}…")
-        } else {
-            excerpt
-        }
-    };
+    let body = notify_body(m);
     #[cfg(windows)]
     win_notify::send(&title, &body, &m.conversation_id);
     #[cfg(not(windows))]
@@ -2780,6 +2868,7 @@ fn main() {
             save_draft,
             save_text_file,
             ai_send,
+            ai_attachments_map,
             create_ai_conversation,
             rename_ai_conversation,
             delete_ai_conversation,
@@ -2829,6 +2918,7 @@ fn main() {
             copy_file_as,
             copy_file_to_clipboard,
             clipboard_file_list,
+            clipboard_take_image,
             file_attach_info,
             stage_pasted_image,
             stage_text_document,
@@ -2840,4 +2930,68 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("启动 BlueLink 失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notify_body;
+    use bluelink_domain::{GroupItem, Message, MessageKind, MessageStatus, Sender};
+
+    fn msg(kind: MessageKind, body: String) -> Message {
+        Message {
+            id: "t".into(),
+            conversation_id: "c".into(),
+            sender: Sender::Peer,
+            kind,
+            body,
+            file_id: None,
+            reply_to: None,
+            status: MessageStatus::Delivered,
+            created_at: 0,
+            seq: 0,
+        }
+    }
+
+    /// v1.0.1 回归：图片组通知正文必须是人话摘要，绝不许再漏清单 JSON。
+    #[test]
+    fn notify_body_imagegroup_is_summary_not_json() {
+        let items: Vec<GroupItem> = (0..4)
+            .map(|i| GroupItem {
+                msg_id: format!("m{i}"),
+                file_id: format!("f{i}"),
+                name: format!("p{i}.png"),
+                size: 10,
+                sha256: String::new(),
+                idx: i,
+            })
+            .collect();
+        let body = bluelink_domain::group_manifest_json(&items);
+        let out = notify_body(&msg(MessageKind::ImageGroup, body));
+        assert_eq!(out, "图片组 · 共 4 张");
+        assert!(!out.contains("msg_id") && !out.contains('{'));
+        // 清单坏掉也只给类型名，不回落原文
+        let out = notify_body(&msg(MessageKind::ImageGroup, "{\"v\":1".into()));
+        assert_eq!(out, "图片组");
+    }
+
+    #[test]
+    fn notify_body_file_and_text() {
+        assert_eq!(
+            notify_body(&msg(MessageKind::File, "截图.PNG".into())),
+            "图片 · 截图.PNG"
+        );
+        assert_eq!(
+            notify_body(&msg(MessageKind::File, "报表.xlsx".into())),
+            "文件 · 报表.xlsx"
+        );
+        // 文本：空白折叠后 60 字截断，与前端 msgSummary 同口径
+        let long = "一二三四五六七八九十".repeat(8);
+        let out = notify_body(&msg(MessageKind::Text, format!("  {long}\n")));
+        assert_eq!(out.chars().count(), 61);
+        assert!(out.ends_with('…'));
+        assert_eq!(
+            notify_body(&msg(MessageKind::Text, "你好\n  世界".into())),
+            "你好 世界"
+        );
+    }
 }

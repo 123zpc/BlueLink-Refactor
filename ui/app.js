@@ -30,6 +30,8 @@ const state = {
   categories: [],
   catEditId: null,
   pendingFiles: [],
+  aiPendingAtt: [], // AI 文本附件待发队列（v1.0.1）：{path, name, size, content}
+  aiAttMap: {}, // 当前 AI 会话的附件清单（message_id → [{name,size,path}]）
   transferMap: {},
   // #2 传输权威记账（v2.6.6）：transfer_id → { msgId, received,
   // total, state }。事件先记账再上屏；气泡迟建（分页补页/重渲染）
@@ -701,6 +703,10 @@ function appendMessage(container, m, renderedSet, opts) {
   const el = buildMessageEl(m, opts);
   el.dataset.ts = m.created_at;
   el.dataset.seq = m.seq || 0;
+  // v1.0.1：AI 页用户消息的附件文件片（数据来自 state.aiAttMap，
+  // loadAiMessages/发送后都会刷新；实时到达时 map 可能还没刷新，
+  // fillAiAttChips 无数据即跳过，发送方 finally 的重渲染会补上）
+  if (opts.ai && m.sender === "me") fillAiAttChips(el, m);
   // 消息分组：同日、同发送者、间隔 < 5 分钟时压缩间距
   if (!newDay && last && last.dataset.sender === m.sender && m.created_at - lastTs < 5 * 60 * 1000) {
     el.classList.add("grouped");
@@ -1374,7 +1380,9 @@ async function stagePastedImageFile(file) {
 // ①剪贴板带普通文字 → 文字优先，永远按文字粘（Excel 等场景），不处理；
 // ②带文件对象 → 文件优先：向系统剪贴板要真实路径（文件管理器里复制
 //   的文件），逐个入待发队列，绝不把文件路径当文字粘进输入框；
-// ③没有文件对象路径但有一张图片位图 → 截图粘贴，落盘入队（旧规则）；
+// ③没有文件对象路径但剪贴板里有图片位图 → 截图粘贴，落盘入队：
+//   先试 DataTransfer 的图片项，拿不到再向后端直读系统剪贴板图像
+//   （v1.0.1 回落，Windows 截图在 WebView2 里只有这条路通）；
 // ④其余（平台读不到文件列表/虚拟文件）→ 诚实提示，不粘任何东西。
 // 注意：文件对象在各 WebView 的 DataTransfer 里暴露程度不一（WebKitGTK
 // 对 uri-list 剪贴板甚至既不给 text 也不给 files），故分流的权威来源是
@@ -1442,6 +1450,24 @@ $("input").addEventListener("paste", async (e) => {
     const f = img.getAsFile();
     if (f) { await stagePastedImageFile(f); return; }
   }
+  // ③的回落（v1.0.1）：WebView 没把剪贴板图片交出来时，向后端要系统
+  // 剪贴板里的原始图像。Windows 截图（Win+Shift+S）在 WebView2 的
+  // DataTransfer 里只有一个取不到数据的 file 占位，getAsFile 拿不到
+  // 图，旧版走到这里就直接报「未能读取」——但截图在剪贴板里是位图
+  // 数据、本就没有文件形态，只有后端直读剪贴板这条路能拿到。
+  // 文件路线与图像路线都确实没有，才落到下面的提示。
+  try {
+    const staged = await invoke("clipboard_take_image");
+    if (staged && staged.path) {
+      state.pendingFiles.push({
+        path: staged.path,
+        name: staged.path.split(/[\\/]/).pop() || "粘贴的图片.png",
+        size: staged.size,
+      });
+      renderAttachBar();
+      return;
+    }
+  } catch (_) { /* 回落失败不单独报错，与下方统一提示合并 */ }
   if (fileItems.length || (cd.files && cd.files.length)) {
     showToast(paths === null ? "此系统暂未支持粘贴文件，请用附件按钮选择" : "未能读取粘贴的文件，已忽略");
   }
@@ -2586,6 +2612,8 @@ async function openFileMenu(mid, x, y) {
 document.addEventListener("click", (e) => {
   const menu = $("file-menu");
   if (menu && !menu.classList.contains("hidden") && !menu.contains(e.target)) menu.classList.add("hidden");
+  const fmtMenu = $("viewer-fmt-menu");
+  if (fmtMenu && !fmtMenu.classList.contains("hidden") && !fmtMenu.contains(e.target)) fmtMenu.classList.add("hidden");
 });
 
 // ---------- 聊天页右上角彩签（分类） ----------
@@ -3041,6 +3069,7 @@ async function loadAiMessages() {
   if (state.locateInProgress) return; // ㉔：定位链路自己管加载，不并发重铺
   await refreshFavIds();
   await refreshPinIds();
+  await refreshAiAttMap();
   const msgs = await invoke("list_messages", { conversationId: state.aiConvId, limit: 200 });
   const container = $("ai-messages");
   container.innerHTML = "";
@@ -3166,11 +3195,136 @@ async function maybeAutoNameAiConversation(text) {
   } catch (_) { /* 静默 */ }
 }
 
+// ---------- AI 文本附件（v1.0.1） ----------
+// 只收文本类文件：类型判定与查看器共用 TEXT_EXTS；图片/二进制明确
+// 拒绝（文本模型看不了图，不假装能收）。上限：单件 512 KB、合计
+// 512 KB、最多 5 个——超限 toast 拒绝、不静默截断（后端还有第二道闸）。
+const AI_ATT_MAX_SINGLE = 512 * 1024;
+const AI_ATT_MAX_TOTAL = 512 * 1024;
+const AI_ATT_MAX_COUNT = 5;
+
+function renderAiAttachBar() {
+  const bar = $("ai-attach-bar");
+  const list = $("ai-attach-list");
+  list.innerHTML = "";
+  for (const f of state.aiPendingAtt) {
+    const chip = document.createElement("span");
+    chip.className = "attach-chip";
+    const label = document.createElement("span");
+    label.className = "attach-name";
+    label.textContent = `${f.name} · ${fmtSize(f.size)}`;
+    label.title = f.path;
+    const x = document.createElement("button");
+    x.className = "attach-x";
+    x.textContent = "×";
+    x.title = "移除";
+    x.addEventListener("click", () => {
+      state.aiPendingAtt = state.aiPendingAtt.filter((q) => q.path !== f.path);
+      renderAiAttachBar();
+    });
+    chip.appendChild(label);
+    chip.appendChild(x);
+    list.appendChild(chip);
+  }
+  $("ai-attach-count").textContent = state.aiPendingAtt.length
+    ? `待发送 ${state.aiPendingAtt.length} 个附件（随问题一并发给 AI）` : "";
+  bar.classList.toggle("hidden", state.aiPendingAtt.length === 0);
+}
+$("ai-attach-clear").addEventListener("click", () => {
+  state.aiPendingAtt = [];
+  renderAiAttachBar();
+});
+
+/** 把一批路径逐个校验入 AI 附件队列：类型不对/超限的逐个 toast 说明
+ * 并跳过，不连累其余。返回实际入队数量。 */
+async function stageAiFilePaths(paths) {
+  let added = 0;
+  for (const path of paths || []) {
+    if (!path || state.aiPendingAtt.some((q) => q.path === path)) continue;
+    const base = String(path).split(/[\\/]/).pop() || path;
+    let info;
+    try { info = await invoke("file_attach_info", { path }); }
+    catch (err) { showToast(`无法添加「${base}」：${err}`); continue; }
+    if (!TEXT_EXTS.has(fileExt(info.name))) {
+      showToast(`「${info.name}」不是文本文件——AI 附件只支持文本文件`);
+      continue;
+    }
+    if (info.size > AI_ATT_MAX_SINGLE) {
+      showToast(`「${info.name}」超过 512 KB 单件上限，未添加`);
+      continue;
+    }
+    if (state.aiPendingAtt.length >= AI_ATT_MAX_COUNT) {
+      showToast(`附件最多 ${AI_ATT_MAX_COUNT} 个，「${info.name}」未添加`);
+      continue;
+    }
+    const total = state.aiPendingAtt.reduce((s, q) => s + q.size, 0) + info.size;
+    if (total > AI_ATT_MAX_TOTAL) {
+      showToast(`附件总大小将超过 512 KB 上限，「${info.name}」未添加`);
+      continue;
+    }
+    try {
+      const data = await invoke("read_text_file", { path });
+      const dec = decodeTextBytes(base64ToBytes(data.base64));
+      const content = dec.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      state.aiPendingAtt.push({ path, name: info.name, size: info.size, content });
+      added++;
+    } catch (err) { showToast(`读取「${info.name}」失败：${err}`); }
+  }
+  if (added) renderAiAttachBar();
+  return added;
+}
+
+$("btn-ai-file").addEventListener("click", async () => {
+  if (state.pickingAiFiles) return;
+  state.pickingAiFiles = true;
+  try {
+    const picked = await window.__TAURI__.dialog.open({ multiple: true, directory: false });
+    if (!picked) return;
+    const paths = Array.isArray(picked) ? picked : [picked];
+    const added = await stageAiFilePaths(paths);
+    if (paths.length && added === 0 && !state.aiPendingAtt.length) {
+      /* 逐个的拒绝原因已在 stageAiFilePaths 里 toast 过，这里不叠提示 */
+    }
+    $("ai-input").focus();
+  } catch (e) { showToast("选择文件失败：" + e); }
+  finally { state.pickingAiFiles = false; }
+});
+
+/** 刷新当前 AI 会话的附件清单（渲染文件片用）。 */
+async function refreshAiAttMap() {
+  try {
+    state.aiAttMap = await invoke("ai_attachments_map", { conversationId: state.aiConvId });
+  } catch (_) { state.aiAttMap = {}; }
+}
+
+/** 给一条 AI 用户消息的气泡挂附件文件片（名+大小，点击开查看器）。 */
+function fillAiAttChips(rowEl, m) {
+  const atts = state.aiAttMap[m.id];
+  if (!atts || !atts.length) return;
+  const bubble = rowEl.querySelector(".bubble");
+  if (!bubble || bubble.querySelector(".ai-att-list")) return;
+  const list = document.createElement("div");
+  list.className = "ai-att-list";
+  for (const a of atts) {
+    const chip = document.createElement("span");
+    chip.className = "attach-chip ai-att-chip";
+    chip.title = "点击查看附件内容";
+    const label = document.createElement("span");
+    label.className = "attach-name";
+    label.textContent = `${a.name} · ${fmtSize(a.size)}`;
+    chip.appendChild(label);
+    chip.addEventListener("click", () => openTextViewer({ name: a.name, path: a.path }, null));
+    list.appendChild(chip);
+  }
+  bubble.appendChild(list);
+}
+
 async function sendAi() {
   const text = $("ai-input").value.trim();
   const ref = state.pendingAskRef;
+  const atts = state.aiPendingAtt;
   if (state.aiGenerating) return;
-  if (!text && !ref) return;
+  if (!text && !ref && !atts.length) return;
   state.follow.ai = true;
   if (!(await aiReadyOrRemind())) return;
   $("ai-input").value = ""; autoGrow($("ai-input"));
@@ -3180,16 +3334,36 @@ async function sendAi() {
   try {
     if (ref) {
       // ㉒ 引用模式：引用消息作上下文 + 用户文字作问题一起发出；
-      // 没输文字则 extra 为空，后端按引用原文问（兜底）
+      // 没输文字则 extra 为空，后端按引用原文问（兜底）。
+      // v1.0.1：带附件时把附件内容按同一包裹格式拼进 extra 随问题走
+      // （内容确实送达模型；但引用路径的落库正文本就是组装全文，
+      // 文件片不单独登记——附件落库/文件片只在普通发送路径，见报告）
+      let extra = text;
+      if (atts.length) {
+        const blocks = atts.map((a) => `附件：${a.name}\n\`\`\`\n${a.content}\n\`\`\``).join("\n\n");
+        extra = extra ? `${extra}\n\n${blocks}` : blocks;
+      }
       await invoke("ai_ask_message", {
         conversationId: ref.convId, messageId: ref.msgId,
-        thinking: currentThinking(), extra: text || null,
+        thinking: currentThinking(), extra: extra || null,
       });
+      if (atts.length) {
+        state.aiPendingAtt = [];
+        renderAiAttachBar();
+      }
       clearAskRef();
     } else {
-      await invoke("ai_send", { text, thinking: currentThinking(), conversationId: state.aiConvId });
-      // #5：首条消息发出后给「新会话」自动命名（截短规则见上）
-      maybeAutoNameAiConversation(text);
+      await invoke("ai_send", {
+        text, thinking: currentThinking(), conversationId: state.aiConvId,
+        attachments: atts.map((a) => ({ name: a.name, content: a.content })),
+      });
+      if (atts.length) {
+        state.aiPendingAtt = [];
+        renderAiAttachBar();
+      }
+      // #5：首条消息发出后给「新会话」自动命名（截短规则见上）；
+      // 纯附件无文字时用首个附件名兜底
+      maybeAutoNameAiConversation(text || (atts.length ? atts[0].name : ""));
     }
   } catch (e) {
     showToast("AI 提问失败：" + e);
@@ -3200,6 +3374,7 @@ async function sendAi() {
     state.streamText = "";
     $("btn-ai-stop").classList.add("hidden");
     if (ref) loadAiMessages();
+    else if (atts.length) { await refreshAiAttMap(); loadAiMessages(); }
   }
 }
 async function regenerateAi() {
@@ -3405,7 +3580,7 @@ function showAiQuoteBar(m) {
   if (state.aiGenerating) { showToast("AI 正在生成中，请稍候"); return; }
   state.pendingAskRef = { convId: m.conversation_id, msgId: m.id };
   const who = m.sender === "me" ? "我" : m.sender === "ai" ? "AI" : "对方";
-  $("ai-quote-text").textContent = `引用${who}的消息：${(m.body || "").slice(0, 80)}`;
+  $("ai-quote-text").textContent = `引用${who}的消息：${msgSummary(m, 80)}`;
   $("ai-quote-bar").classList.remove("hidden");
   $("ai-input").focus();
 }
@@ -4322,8 +4497,14 @@ $("update-action").addEventListener("click", async () => {
         $("drop-overlay").classList.remove("hidden");
       } else if (p.type === "drop") {
         $("drop-overlay").classList.add("hidden");
-        const added = await stageFilePaths(p.paths || []);
-        if (added) showToast(`已添加 ${added} 个文件，点发送键发送`);
+        if (state.view === "ai") {
+          // v1.0.1：在 AI 页放下 → 进 AI 文本附件队列（只收文本文件）
+          const added = await stageAiFilePaths(p.paths || []);
+          if (added) showToast(`已添加 ${added} 个文本附件，点发送键随问题发给 AI`);
+        } else {
+          const added = await stageFilePaths(p.paths || []);
+          if (added) showToast(`已添加 ${added} 个文件，点发送键发送`);
+        }
       } else {
         $("drop-overlay").classList.add("hidden");
       }
@@ -4416,8 +4597,8 @@ function buildGroupBubble(bubble, m, row) {
         <div class="gstack-ph">${iconUse("i-file", "ico ico-28")}<span class="gstack-ph-name"></span></div>
       </div>
       <span class="gstack-count" title="共 ${items.length} 张">${items.length} 张</span>
-      <button class="gstack-nav prev" title="上一张">‹</button>
-      <button class="gstack-nav next" title="下一张">›</button>
+      <button class="gstack-nav prev" title="上一张"><svg class="ico ico-16"><use href="#i-chevron-left"/></svg></button>
+      <button class="gstack-nav next" title="下一张"><svg class="ico ico-16"><use href="#i-chevron-right"/></svg></button>
     </div>
     <div class="progress hidden"><div></div></div>
     <div class="progress-meta hidden"></div>
@@ -4763,8 +4944,11 @@ function showViewer(mode, title, sub) {
   $("viewer-image").classList.toggle("hidden", mode !== "image");
   $("viewer-media").classList.toggle("hidden", mode !== "media");
   $("viewer-tools").classList.toggle("hidden", mode !== "text");
+  viewerRenameHide();
+  closeViewerFmtMenu();
 }
 function closeViewer() {
+  viewerRenameHide();
   $("viewer").classList.add("hidden");
   // 关闭即释放：停播并摘掉媒体/图片源，文本模型整体丢弃
   for (const id of ["viewer-video", "viewer-audio"]) {
@@ -5026,7 +5210,7 @@ async function openTextViewer(info, msgId) {
   // 没有来源消息（理论上不存在此路径）时不给改名入口
   TV.msgId = msgId || null;
   $("viewer-rename-btn").classList.toggle("hidden", !TV.msgId);
-  $("viewer-rename-wrap").classList.add("hidden");
+  viewerRenameHide();
   let data;
   try {
     data = await invoke("read_text_file", { path: info.path });
@@ -5552,10 +5736,37 @@ const TV_FMT_LABEL = {
   reindent: "代码整理缩进", b64enc: "Base64 编码", b64dec: "Base64 解码",
   urlEnc: "URL 编码", urlDec: "URL 解码", tsConv: "时间戳转换",
 };
-$("viewer-fmt-go").addEventListener("click", () => {
-  const kind = $("viewer-fmt").value;
-  if (!kind) { showToast("先选择一种处理"); return; }
-  tvApplyTransform(kind);
+// ---------- 格式化菜单（v1.0.1 合并）：按语言格式化 + 全部快捷处理 ----------
+// 原三件（「格式化」钮 /「格式化处理…」下拉 /「执行」钮）合一为自绘下拉：
+// 「执行」钮的唯一职责就是把下拉选中项交给 tvApplyTransform、没有独立
+// 用途（核实结论），随合并撤掉；菜单点项即执行。各处理仍是显示层、
+// 原文不动，行为逻辑未变，只换入口与组织。
+function closeViewerFmtMenu() { $("viewer-fmt-menu").classList.add("hidden"); }
+function openViewerFmtMenu() {
+  const menu = $("viewer-fmt-menu");
+  menu.innerHTML = "";
+  const addItem = (label, fn) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.addEventListener("click", () => { closeViewerFmtMenu(); fn(); });
+    menu.appendChild(b);
+  };
+  addItem(`按语言格式化（${TV_LANG_LABEL[TV.lang] || "通用整理"}）`, () => {
+    if (!TV.origText && !TV.text) return;
+    tvFormatByLang();
+  });
+  const sep = document.createElement("div");
+  sep.className = "fmt-sep";
+  menu.appendChild(sep);
+  for (const [kind, label] of Object.entries(TV_FMT_LABEL)) {
+    addItem(label, () => tvApplyTransform(kind));
+  }
+  menu.classList.remove("hidden");
+}
+$("viewer-fmt-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  if ($("viewer-fmt-menu").classList.contains("hidden")) openViewerFmtMenu();
+  else closeViewerFmtMenu();
 });
 $("viewer-copy-all").addEventListener("click", () => {
   if (TV.text) copyText(TV.text);
@@ -5571,11 +5782,20 @@ $("viewer-banner-close").addEventListener("click", () => {
 });
 
 // ---------- #8 查看器内改名（v2.6.6）：改名即最终身份 ----------
+// 改名编辑态进出：输入组显隐与顶栏 .editing 让位类必须成对切换（样式见 style.css）
+function viewerRenameShow() {
+  closeViewerFmtMenu();
+  $("viewer-rename-wrap").classList.remove("hidden");
+  document.querySelector(".viewer-top").classList.add("editing");
+}
+function viewerRenameHide() {
+  $("viewer-rename-wrap").classList.add("hidden");
+  document.querySelector(".viewer-top").classList.remove("editing");
+}
 $("viewer-rename-btn").addEventListener("click", () => {
   if (!TV.msgId) return;
-  const wrap = $("viewer-rename-wrap");
   const input = $("viewer-rename-input");
-  wrap.classList.remove("hidden");
+  viewerRenameShow();
   input.value = TV.name || "";
   input.focus();
   // 默认选中主名部分（后缀留给用户顺手改，改后缀正是本功能的一半）
@@ -5583,23 +5803,23 @@ $("viewer-rename-btn").addEventListener("click", () => {
   input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
 });
 $("viewer-rename-cancel").addEventListener("click", () => {
-  $("viewer-rename-wrap").classList.add("hidden");
+  viewerRenameHide();
 });
 $("viewer-rename-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); $("viewer-rename-ok").click(); }
-  if (e.key === "Escape") { e.stopPropagation(); $("viewer-rename-wrap").classList.add("hidden"); }
+  if (e.key === "Escape") { e.stopPropagation(); viewerRenameHide(); }
 });
 $("viewer-rename-ok").addEventListener("click", async () => {
   const newName = $("viewer-rename-input").value.trim();
   if (!newName || !TV.msgId) return;
-  if (newName === TV.name) { $("viewer-rename-wrap").classList.add("hidden"); return; }
+  if (newName === TV.name) { viewerRenameHide(); return; }
   try {
     const finalName = await invoke("rename_message_file", { messageId: TV.msgId, newName });
     TV.name = finalName;
     TV.ext = fileExt(finalName);
     TV.lang = langOfExt(TV.ext);
     $("viewer-title").textContent = finalName;
-    $("viewer-rename-wrap").classList.add("hidden");
+    viewerRenameHide();
     // 若正看着显示层变换结果，先回原文再按新语言重排高亮
     if (TV.transformed) {
       TV.transformed = null;
@@ -5618,10 +5838,7 @@ $("viewer-rename-ok").addEventListener("click", async () => {
 });
 
 // ---------- #7 按语言格式化（v2.6.6，全轻量自研、只改显示） ----------
-$("viewer-format-btn").addEventListener("click", () => {
-  if (!TV.origText && !TV.text) return;
-  tvFormatByLang();
-});
+// 入口已并入格式化菜单（见上方 openViewerFmtMenu 第一项），此处只留实现。
 const TV_LANG_LABEL = { py: "Python", js: "JavaScript", c: "Java/C 家族", sql: "SQL", ms: "MagicAPI", json: "JSON" };
 function tvFormatByLang() {
   const src = TV.origText;

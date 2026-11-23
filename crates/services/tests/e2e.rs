@@ -196,11 +196,11 @@ async fn ai代理无网方经有网方提问() {
     连接两节点(&a, &b).await;
 
     // 未开启转发许可时必须被明确拒绝（默认关，花的是 B 的额度）
-    let denied = a.ai_send("报个到", None, None).await;
+    let denied = a.ai_send("报个到", None, None, vec![]).await;
     assert!(denied.is_err(), "未开许可不应转发成功");
     // 开启许可后转发通畅，且统计有记录
     b.storage.set_setting("ai_proxy_allow", "1").unwrap();
-    let reply = a.ai_send("报个到", None, None).await.unwrap();
+    let reply = a.ai_send("报个到", None, None, vec![]).await.unwrap();
     assert_eq!(reply.body, "你好世界");
     assert_eq!(b.proxy_today_stats().0, 1);
     assert_eq!(reply.sender, Sender::Ai);

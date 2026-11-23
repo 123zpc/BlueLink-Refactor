@@ -50,7 +50,7 @@ async fn ai会话新建改名与隔离() {
         .unwrap()
         .len();
     let _ = a
-        .ai_send("只进新会话的问题", None, Some(c1.id.clone()))
+        .ai_send("只进新会话的问题", None, Some(c1.id.clone()), vec![])
         .await;
     let in_c1 = a.storage.list_messages(&c1.id, None, 100).unwrap();
     assert!(
@@ -66,7 +66,7 @@ async fn ai会话新建改名与隔离() {
 
     // 不存在的会话 id 发送应明确报错，不许静默落到默认会话
     assert!(a
-        .ai_send("x", None, Some("ai-不存在".into()))
+        .ai_send("x", None, Some("ai-不存在".into()), vec![])
         .await
         .is_err());
 }

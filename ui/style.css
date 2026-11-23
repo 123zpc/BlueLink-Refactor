@@ -96,7 +96,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
   display: flex; align-items: center; justify-content: center;
   transition: left 0.18s ease, background-color 0.12s, border-color 0.12s, color 0.12s; }
 #btn-aside-float:hover { background: var(--panel-2); border-color: var(--border-strong); color: var(--text); }
-#btn-aside-float:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* v1.0.1：圆形钮的焦点环改走 box-shadow 柔环（原 outline 在按矩形
+   绘制的引擎下会给圆钮套方框，同 #10 族）；原有投影保留在环之后。 */
+#btn-aside-float:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft), 0 2px 8px rgba(0, 0, 0, 0.14); }
 .search-box { display: flex; align-items: center; gap: 7px; background: var(--bg);
   border: 1px solid var(--border); border-radius: 8px; padding: 0 10px; color: var(--muted); }
 .search-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); color: var(--accent); }
@@ -248,7 +250,9 @@ section { display: flex; flex-direction: column; height: 100%; }
   border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); transition: left 0.15s; }
 .switch input:checked + .switch-track { background: var(--accent); }
 .switch input:checked + .switch-track::after { left: 19px; }
-.switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* v1.0.1：开关轨道是圆角胶囊，焦点环改走 box-shadow 柔环跟随圆角
+   （原 2px outline 在按矩形绘制 outline 的引擎下是方框，同 #10 族）。 */
+.switch input:focus-visible + .switch-track { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
 
 /* 按钮与图标按钮 */
 .btn { border: 1px solid var(--border); background: var(--panel); color: var(--text); border-radius: 8px;
@@ -590,11 +594,11 @@ section { display: flex; flex-direction: column; height: 100%; }
 #back-to-reply { position: absolute; right: 18px; bottom: 160px; z-index: 8; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); }
 #btn-bottom { position: absolute; right: 18px; bottom: 118px; z-index: 8; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); }
 
-#attach-bar { display: flex; align-items: flex-start; gap: 8px; padding: 6px 10px; margin-bottom: 6px;
+#attach-bar, #ai-attach-bar { display: flex; align-items: flex-start; gap: 8px; padding: 6px 10px; margin-bottom: 6px;
   background: var(--accent-soft); border-radius: 8px; font-size: 12.5px; }
-#attach-bar.hidden { display: none; }
+#attach-bar.hidden, #ai-attach-bar.hidden { display: none; }
 /* 待发文件队列（多文件批量发送）：每个文件一枚 chip，可单独移除、可清空 */
-#attach-list { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; }
+#attach-list, #ai-attach-list { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; }
 .attach-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel);
   border: 1px solid var(--border); border-radius: 999px; padding: 2px 6px 2px 10px; max-width: 100%; }
 .attach-chip .attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -810,24 +814,34 @@ section { display: flex; flex-direction: column; height: 100%; }
 #viewer.hidden { display: none; }
 .viewer-top { display: flex; align-items: center; gap: 10px; padding: 8px 12px;
   background: var(--panel); border-bottom: 1px solid var(--border); flex: none; }
-#viewer-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
-#viewer-tools { display: inline-flex; align-items: center; gap: 6px; }
+#viewer-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; min-width: 0; }
+#viewer-sub { white-space: nowrap; flex: none; }
+#viewer-tools { display: inline-flex; align-items: center; gap: 6px; flex: none; }
 #viewer-tools.hidden { display: none; }
-/* v2.6.6 #20：编码下拉与 #ai-source 同款自绘面（去原生外观 + SVG
-   箭头，明暗双主题箭头色），不再露系统原生下拉样式；弹出列表本体
-   由系统渲染、WebView 改不了，如实注记于 QA。 */
-#viewer-fmt { appearance: none; -webkit-appearance: none; font: inherit; font-size: 12px;
-  padding: 4px 24px 4px 8px; border: 1px solid var(--border); border-radius: 6px;
-  background-color: var(--panel); color: var(--text); max-width: 150px; cursor: pointer;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236B7280' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat; background-position: right 7px center; }
-#viewer-fmt:hover { border-color: var(--border-strong); background-color: var(--panel-2); }
-#viewer-fmt:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-:root[data-theme="dark"] #viewer-fmt { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239BA1A6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) #viewer-fmt { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239BA1A6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); } }
+/* 工具栏防挤压：查看器内所有按钮文字永不换行、整组不收缩——空间不足时
+   只允许标题在自己区域内省略，绝不再把按钮挤成逐字竖排（用户真机截图实报） */
+#viewer .btn { white-space: nowrap; flex: none; }
+/* v1.0.1 格式化合并：原「格式化」钮 +「格式化处理…」原生 select +「执行」
+   钮三件合一为自绘下拉菜单（#20 口径，不用原生 select）——菜单与
+   #file-menu 同一套视觉令牌（面色/边框/圆角/阴影/条目悬停），锚在
+   按钮正下方右对齐，点项即执行。 */
+#viewer-fmt-wrap { position: relative; display: inline-flex; flex: none; }
+#viewer-fmt-menu { position: absolute; right: 0; top: calc(100% + 6px); min-width: 216px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18); z-index: 5; padding: 4px; }
+#viewer-fmt-menu.hidden { display: none; }
+#viewer-fmt-menu button { display: block; width: 100%; text-align: left; padding: 7px 10px;
+  border: none; background: none; color: var(--text); font-size: 13px; border-radius: 6px;
+  cursor: pointer; white-space: nowrap; }
+#viewer-fmt-menu button:hover { background: var(--hover); }
+#viewer-fmt-menu .fmt-sep { height: 1px; background: var(--border); margin: 4px 6px; } }
 /* v2.6.6 #8：查看器改名行内编辑——输入框套应用口径（同 #15） */
-#viewer-rename-wrap { display: inline-flex; align-items: center; gap: 6px; }
+#viewer-rename-wrap { display: inline-flex; align-items: center; gap: 6px; flex: none; }
 #viewer-rename-wrap.hidden { display: none; }
+/* 改名编辑态让位：编辑是临时状态，输入框替代标题位置——标题/副题/铅笔与
+   工具组整组隐藏（编辑中本来也用不到），✕ 保留；退出编辑态摘掉 .editing 全恢复 */
+.viewer-top.editing #viewer-title, .viewer-top.editing #viewer-sub,
+.viewer-top.editing #viewer-rename-btn, .viewer-top.editing #viewer-tools { display: none; }
 #viewer-rename-input { width: 230px; font: inherit; font-size: 13px; color: var(--text);
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 5px 9px; }
 #viewer-rename-input:focus-visible { outline: none; border-color: var(--accent);
@@ -886,7 +900,8 @@ section { display: flex; flex-direction: column; height: 100%; }
 #viewer-img { max-width: none; user-select: none; -webkit-user-drag: none; will-change: transform; }
 .viewer-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 40px; height: 64px;
   border: none; border-radius: 8px; background: rgba(15, 15, 16, 0.55); color: #fff;
-  font-size: 26px; cursor: pointer; z-index: 2; }
+  cursor: pointer; z-index: 2; padding: 0;
+  display: flex; align-items: center; justify-content: center; }
 .viewer-nav:hover { background: rgba(15, 15, 16, 0.85); }
 #viewer-img-prev { left: 14px; }
 #viewer-img-next { right: 14px; }
@@ -949,14 +964,21 @@ section { display: flex; flex-direction: column; height: 100%; }
   background: var(--border-strong); flex: none; }
 .ai-conv-chip:hover { color: var(--text); border-color: var(--border-strong);
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08); }
+/* v1.0.1 方框边收口：选中态去掉蓝色投影——只留一层圆角实底。原
+   0 2px 8px 蓝色投影在 WebView2 下于胶囊下角糊出方形蓝色块（用户
+   浅色实报；与 #10 深色「方块蓝」同族），选中信号靠实底+白字已足够，
+   不再叠任何投影层。 */
 .ai-conv-chip.active { border-color: var(--accent); color: #fff; background: var(--accent);
-  font-weight: 600; box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35); }
+  font-weight: 600; }
 .ai-conv-chip.active::before { background: #fff; }
 /* v2.6.6 #10①：胶囊的焦点环改走 box-shadow（跟随 999px 圆角）——
    全局 :focus-visible 的 outline 在部分引擎按矩形绘制，点过的胶囊
-   会顶着一圈方形蓝框（深色下尤为显眼），与圆角实底叠成「方块蓝」。 */
+   会顶着一圈方形蓝框（深色下尤为显眼），与圆角实底叠成「方块蓝」。
+   v1.0.1 补：普通 :focus 也一并去 outline（列表重渲染后焦点落回
+   胶囊时不走 :focus-visible，UA 的矩形焦点框仍可能透出）。 */
+.ai-conv-chip:focus { outline: none; }
 .ai-conv-chip:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
-.ai-conv-chip.active:focus-visible { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent), 0 2px 8px rgba(37, 99, 235, 0.35); }
+.ai-conv-chip.active:focus-visible { box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px var(--accent); }
 /* v2.6.6 #15：改名行内框套应用输入框口径——主题边框/圆角 8/内边距，
    聚焦只换边框色 + 柔影，不再叠全局 2px outline 成粗蓝双层框。 */
 .ai-conv-chip input { width: 130px; font: inherit; color: var(--text); background: var(--bg);
@@ -971,11 +993,17 @@ section { display: flex; flex-direction: column; height: 100%; }
 #btn-ai-bottom.hidden { display: none; }
 #ai-think-note { padding: 4px 14px; font-size: 11.5px; color: var(--muted); }
 #ai-think-note.hidden { display: none; }
+/* v1.0.1 思考胶囊定版（用户点验效果图）：去掉裸勾选框，状态由胶囊
+   自身表达——开=强调色实底+白字，关=弱化灰面+灰字。checkbox 本体按
+   .switch 同款手法视觉隐藏（状态/事件/持久化逻辑全不动，仍是唯一
+   状态源）；键盘聚焦时给胶囊一圈柔环，不裸奔。 */
 #ai-thinking-wrap { display: inline-flex; align-items: center; gap: 4px; flex: none;
-  font-size: 12px; color: var(--text-2); cursor: pointer; user-select: none;
-  border: 1px solid var(--border); border-radius: 999px; padding: 4px 9px; }
-#ai-thinking-wrap:has(input:checked) { color: var(--accent); border-color: var(--accent); }
-#ai-thinking { margin: 0; accent-color: var(--accent); }
+  font-size: 12px; color: var(--text-2); background: var(--panel-2); cursor: pointer; user-select: none;
+  border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px;
+  transition: background-color 0.12s, color 0.12s, border-color 0.12s; }
+#ai-thinking-wrap:has(input:checked) { color: #fff; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+#ai-thinking-wrap:has(input:focus-visible) { box-shadow: 0 0 0 3px var(--accent-soft); }
+#ai-thinking { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
 #project-link { color: var(--accent); text-decoration: none; }
 #project-link:hover { text-decoration: underline; }
 
@@ -1039,7 +1067,13 @@ section { display: flex; flex-direction: column; height: 100%; }
      5 行 ≈110px），堆在封面下方形成死空白——与图片尺寸无关。图组气泡
      不需要保留空白，改回 normal 后模板空白不再成行，高度即贴合封面。 */
   white-space: normal; }
-.gstack { width: 240px; height: 180px; margin: 22px 24px 2px 2px; z-index: 0; }
+/* v1.0.1 间距校准（用户点验「几乎接近完美、只差一点点」）：倾斜/错位
+   一律不动，只把预留边距按后层卡的实际探出量补足——c2 平移 (20,-20)
+   再叠 -5° 旋转，右上角总探出约 30px 高 / 28px 宽，原预留 22/24px 装
+   不下：卡角贴进上方时间行、右侧探出气泡框外（照片里的小字被切在
+   框外成残影）。上 22→30、右 24→30 后全部探出收回气泡框内、与时间
+   行留出一线间距，不多留空白。 */
+.gstack { width: 240px; height: 180px; margin: 30px 30px 2px 2px; z-index: 0; }
 .gstack-card { position: absolute; inset: 0; width: 100%; height: 100%;
   object-fit: cover; border-radius: 18px; border: 1px solid var(--border);
   background: var(--panel-2); }
@@ -1082,14 +1116,21 @@ section { display: flex; flex-direction: column; height: 100%; }
 .ai-collapsed-hint { flex: none; font-size: 11.5px; color: var(--accent); }
 
 /* #16 待发队列：首行钉住（计数/合并/清空），chips 区限高约两行、区内滚动 */
-#attach-bar { flex-direction: column; align-items: stretch; gap: 4px; }
-#attach-head { display: flex; align-items: center; gap: 10px; min-height: 24px; }
-#attach-count { font-size: 12px; color: var(--text-2); flex: none; }
+#attach-bar, #ai-attach-bar { flex-direction: column; align-items: stretch; gap: 4px; }
+#attach-head, #ai-attach-head { display: flex; align-items: center; gap: 10px; min-height: 24px; }
+#attach-count, #ai-attach-count { font-size: 12px; color: var(--text-2); flex: none; }
 #attach-head #attach-group-row { padding: 0; }
-#attach-list { max-height: 60px; overflow-y: auto; align-content: flex-start; }
-#attach-list::-webkit-scrollbar { width: 6px; }
-#attach-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+#attach-list, #ai-attach-list { max-height: 60px; overflow-y: auto; align-content: flex-start; }
+#attach-list::-webkit-scrollbar, #ai-attach-list::-webkit-scrollbar { width: 6px; }
+#attach-list::-webkit-scrollbar-thumb, #ai-attach-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
 .attach-chip { padding: 1px 4px 1px 8px; font-size: 12px; max-width: 260px; }
+/* v1.0.1 AI 历史消息里的附件文件片：与待发 chip 同形态，点击在
+   查看器打开落盘副本（只读查看，msgId 传空、不给改名入口）。 */
+.ai-att-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+/* 气泡里文字默认继承气泡色（我方蓝气泡是白字），chip 是浅底，
+   必须显式给回正文色，否则名/大小白压白看不见 */
+.ai-att-chip { cursor: pointer; color: var(--text); }
+.ai-att-chip:hover { border-color: var(--accent); }
 
 /* 自动重连横幅（v2.6.2）：固定在窗口顶部中央，任何视图都可见 */
 #reconnect-banner { position: fixed; top: 10px; left: 50%; transform: translateX(-50%);

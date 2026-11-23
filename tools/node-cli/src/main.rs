@@ -139,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => println!("[图片组发送失败] {e}"),
             }
         } else if let Some(q) = line.strip_prefix("ai ") {
-            match node2.ai_send(q, None, None).await {
+            match node2.ai_send(q, None, None, vec![]).await {
                 Ok(m) => println!("[AI 回复] {}", m.body),
                 Err(e) => println!("[AI 失败] {e}"),
             }

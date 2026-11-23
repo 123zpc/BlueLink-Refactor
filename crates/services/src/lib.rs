@@ -406,6 +406,34 @@ pub fn reveal_file(path: &Path) -> Result<(), ServiceError> {
     result
 }
 
+/// 一次性读系统剪贴板里的原始图像，编码为 PNG 字节返回（输入框粘贴
+/// 的图像回落路线）：截图、画图/浏览器里复制的图片在剪贴板里只有
+/// 位图数据、没有文件形态，前端 WebView 的 DataTransfer 在部分平台
+/// （Windows/WebView2 实测）只给一个取不到数据的 file 占位，靠它
+/// 拿不到图——权威来源与文件列表同口径：直接读系统剪贴板。
+/// 没有图片、剪贴板被占用或平台读不到 → Ok(None)，不算失败：
+/// 它只是文件路线之后的回落，两条都没有才由前端提示。
+/// 与 clip_read_with 不同，这里是短命句柄「只读一次」：X11 上读
+/// 选择内容不依赖本进程持有，读完即放，不碰 Node 的长驻句柄。
+pub fn clipboard_image_png() -> Result<Option<Vec<u8>>, ServiceError> {
+    let mut cb = match arboard::Clipboard::new() {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let img = match cb.get_image() {
+        Ok(i) => i,
+        Err(_) => return Ok(None),
+    };
+    let rgba =
+        image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+            .ok_or_else(|| ServiceError::Other("剪贴板图片尺寸异常".into()))?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .map_err(|e| ServiceError::Other(format!("图片编码失败：{e}")))?;
+    Ok(Some(buf.into_inner()))
+}
+
 /// 当前分片压缩算法名（发送完成日志用；与协议层压缩标志对应）。
 const COMPRESSION_LABEL: &str = "zstd";
 /// zstd 压缩级别：3 级是速度/压缩率的平衡点（空中带宽才是瓶颈，
@@ -994,6 +1022,17 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// ㉓ 预算裁剪（纯函数，组装与测试共用）：bodies 为正序历史正文，返回
 /// 保留段的起始下标——从最新往旧累加估算 token（每条 +4 结构开销），
 /// 装满预算为止；最新一条无条件保留（最新一轮不许截断）。
+/// AI 文本附件入参（v1.0.1）：name 是展示文件名，content 是已解码的
+/// 文本全文。前端入队时已按同一组上限校验（类型/单件/总量/件数），
+/// ai_push_and_answer 里还有第二道闸防绕过；超限整条拒绝、绝不截断。
+pub struct AiAttachmentIn {
+    pub name: String,
+    pub content: String,
+}
+pub const AI_ATT_MAX_SINGLE: usize = 512 * 1024;
+pub const AI_ATT_MAX_TOTAL: usize = 512 * 1024;
+pub const AI_ATT_MAX_COUNT: usize = 5;
+
 pub fn ai_kept_from(bodies: &[&str]) -> usize {
     let mut used = 0usize;
     let mut kept = 0usize;
@@ -4265,9 +4304,11 @@ impl Node {
         text: &str,
         thinking: Option<bool>,
         conversation_id: Option<String>,
+        attachments: Vec<AiAttachmentIn>,
     ) -> Result<Message, ServiceError> {
         let conv_id = self.resolve_ai_conversation(conversation_id)?;
-        self.ai_push_and_answer(&conv_id, text, thinking).await
+        self.ai_push_and_answer(&conv_id, text, thinking, &attachments)
+            .await
     }
 
     /// 聊天页「问AI」：把某条聊天消息作为上下文发给默认 AI，问答落在 AI 会话里
@@ -4311,7 +4352,8 @@ impl Node {
                 !extra.is_empty()
             ),
         );
-        self.ai_push_and_answer(&ai_conv, &body, thinking).await
+        self.ai_push_and_answer(&ai_conv, &body, thinking, &[])
+            .await
     }
 
     /// 聊天框 @AI 提问：问题与回答都落在当前聊天会话里（仅本机保存，不发给对方），
@@ -4439,16 +4481,48 @@ impl Node {
     /// 预算从最新往旧装历史、装满为止；最新一条无条件完整保留（最新
     /// 一轮不许截断）。被预算丢弃的老内容先摘要成一段纪要（见
     /// ai_summary_for），纪要作为 system 注记放最前面。
+    /// AI 文本附件展开（v1.0.1）：把一条消息变成送模型的完整内容——
+    /// 正文之后逐个拼「附件：文件名 + 代码块包裹的内容」。本机调用与
+    /// 对方转发共用 assemble_ai_context 的组装结果，附件内容随问题走
+    /// 既有通道、不另传文件实体。附件文件缺失时给占位说明，不静默丢。
+    fn ai_content_of(m: &Message, att_map: &HashMap<String, Vec<AiAttachment>>) -> String {
+        let Some(list) = att_map.get(&m.id) else {
+            return m.body.clone();
+        };
+        let mut s = m.body.clone();
+        for a in list {
+            let content = std::fs::read_to_string(&a.path)
+                .unwrap_or_else(|_| "（附件内容文件缺失）".to_string());
+            if !s.is_empty() {
+                s.push_str("\n\n");
+            }
+            s.push_str(&format!("附件：{}\n```\n{}\n```", a.name, content));
+        }
+        s
+    }
+
     async fn assemble_ai_context(
         self: &Arc<Self>,
         conv_id: &str,
     ) -> Result<Vec<ChatMessage>, ServiceError> {
         let all = self.storage.list_messages(conv_id, None, 100_000)?;
-        let bodies: Vec<&str> = all.iter().map(|m| m.body.as_str()).collect();
+        // 附件按消息分组（没有附件的会话这里是空表，行为与旧版一致）
+        let mut att_map: HashMap<String, Vec<AiAttachment>> = HashMap::new();
+        for r in self.storage.ai_attachments_for_conversation(conv_id)? {
+            att_map.entry(r.message_id.clone()).or_default().push(r);
+        }
+        let expanded: Vec<String> = all
+            .iter()
+            .map(|m| Self::ai_content_of(m, &att_map))
+            .collect();
+        let bodies: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
         let kept_from = ai_kept_from(&bodies);
         let dropped = &all[..kept_from];
         let kept = &all[kept_from..];
-        let kept_tokens: usize = kept.iter().map(|m| estimate_tokens(&m.body) + 4).sum();
+        let kept_tokens: usize = expanded[kept_from..]
+            .iter()
+            .map(|b| estimate_tokens(b) + 4)
+            .sum();
         log_line(
             "ai",
             &format!(
@@ -4460,21 +4534,21 @@ impl Node {
         );
         let mut out: Vec<ChatMessage> = Vec::new();
         if !dropped.is_empty() {
-            if let Some(summary) = self.ai_summary_for(conv_id, dropped).await {
+            if let Some(summary) = self.ai_summary_for(conv_id, dropped, &att_map).await {
                 out.push(ChatMessage {
                     role: "system".into(),
                     content: format!("此前对话摘要：{summary}"),
                 });
             }
         }
-        for m in kept.iter() {
+        for (i, m) in kept.iter().enumerate() {
             out.push(ChatMessage {
                 role: if m.sender == Sender::Ai {
                     "assistant".into()
                 } else {
                     "user".into()
                 },
-                content: m.body.clone(),
+                content: expanded[kept_from + i].clone(),
             });
         }
         Ok(out)
@@ -4488,6 +4562,7 @@ impl Node {
         self: &Arc<Self>,
         conv_id: &str,
         dropped: &[Message],
+        att_map: &HashMap<String, Vec<AiAttachment>>,
     ) -> Option<String> {
         let upto_key = format!("ai_summary_upto_{conv_id}");
         let text_key = format!("ai_summary_text_{conv_id}");
@@ -4522,7 +4597,7 @@ impl Node {
             } else {
                 "用户"
             };
-            src.push_str(&format!("{who}：{}\n", m.body));
+            src.push_str(&format!("{who}：{}\n", Self::ai_content_of(m, att_map)));
         }
         let prompt = format!(
             "请把下面这段对话压缩成一段不超过 {} 字的中文纪要，只保留后续对话需要知道的事实、话题与结论，不要寒暄、不要分点罗列，写成连贯的一段话：\n\n{src}",
@@ -4579,7 +4654,30 @@ impl Node {
         conv_id: &str,
         text: &str,
         thinking: Option<bool>,
+        attachments: &[AiAttachmentIn],
     ) -> Result<Message, ServiceError> {
+        // AI 文本附件第二道闸（v1.0.1）：前端已验，这里防绕过——
+        // 单件/总量/件数任一超限整条拒绝，绝不静默截断。
+        if !attachments.is_empty() {
+            if attachments.len() > AI_ATT_MAX_COUNT {
+                return Err(ServiceError::Other(format!(
+                    "附件最多 {AI_ATT_MAX_COUNT} 个"
+                )));
+            }
+            let total: usize = attachments.iter().map(|a| a.content.len()).sum();
+            if total > AI_ATT_MAX_TOTAL {
+                return Err(ServiceError::Other("附件总大小超过 512 KB 上限".into()));
+            }
+            if let Some(a) = attachments
+                .iter()
+                .find(|a| a.content.len() > AI_ATT_MAX_SINGLE)
+            {
+                return Err(ServiceError::Other(format!(
+                    "附件「{}」超过 512 KB 上限",
+                    a.name
+                )));
+            }
+        }
         let conv_id = conv_id.to_string();
         let mut user_msg = Message {
             id: new_id(),
@@ -4594,6 +4692,46 @@ impl Node {
             seq: 0,
         };
         user_msg.seq = self.storage.insert_message(&user_msg)?;
+        // AI 文本附件落盘 + 登记（v1.0.1）：内容副本存数据目录
+        // ai-att/<消息 id>/ 下，重启后文件片与「点开看内容」靠它；
+        // 消息正文只留用户输入的文字，内容在组装上下文时才拼入。
+        if !attachments.is_empty() {
+            let dir = self
+                .default_download_dir
+                .parent()
+                .map(|p| p.join("ai-att").join(&user_msg.id))
+                .unwrap_or_else(|| PathBuf::from("ai-att").join(&user_msg.id));
+            std::fs::create_dir_all(&dir)?;
+            for (i, a) in attachments.iter().enumerate() {
+                let base = a
+                    .name
+                    .replace(['/', '\\'], "_")
+                    .trim()
+                    .trim_start_matches('.')
+                    .to_string();
+                let base = if base.is_empty() {
+                    format!("附件{}", i + 1)
+                } else {
+                    base
+                };
+                let path = dir.join(format!("{}-{}", i + 1, base));
+                std::fs::write(&path, &a.content)?;
+                self.storage.insert_ai_attachment(
+                    &user_msg.id,
+                    &a.name,
+                    a.content.len() as i64,
+                    &path.to_string_lossy(),
+                )?;
+            }
+            log_line(
+                "ai",
+                &format!(
+                    "essential: AI 文本附件已登记（消息 {}，{} 个）",
+                    user_msg.id,
+                    attachments.len()
+                ),
+            );
+        }
         self.emit(Event::MessageNew(user_msg));
 
         // ㉓ 组装上下文：token 预算（24K）+ 老内容摘要，不再固定最近 20 条

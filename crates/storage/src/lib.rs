@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS reading_positions(conversation_id TEXT PRIMARY KEY, message_id TEXT, updated_at INTEGER);
 CREATE TABLE IF NOT EXISTS categories(color INTEGER PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS message_category(message_id TEXT PRIMARY KEY, color INTEGER NOT NULL, note TEXT);
+CREATE TABLE IF NOT EXISTS ai_attachments(message_id TEXT, name TEXT, size INTEGER, path TEXT);
+CREATE INDEX IF NOT EXISTS idx_ai_att_msg ON ai_attachments(message_id);
 INSERT OR IGNORE INTO categories(color,name) VALUES (0,'灰色'),(1,'红色'),(2,'橙色'),(3,'黄色'),(4,'绿色'),(5,'青色'),(6,'蓝色'),(7,'紫色'),(8,'粉色');
 "#;
 
@@ -326,6 +328,63 @@ impl Storage {
         let mut v: Vec<Message> = rows.collect::<Result<_, _>>()?;
         v.reverse();
         Ok(v)
+    }
+
+    /// AI 文本附件（v1.0.1）：登记一条附件（内容文件已由 services 落盘）。
+    pub fn insert_ai_attachment(
+        &self,
+        message_id: &str,
+        name: &str,
+        size: i64,
+        path: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO ai_attachments(message_id, name, size, path) VALUES(?1, ?2, ?3, ?4)",
+            params![message_id, name, size, path],
+        )?;
+        Ok(())
+    }
+
+    /// 某条消息的全部附件（登记序）。
+    pub fn list_ai_attachments(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<bluelink_domain::AiAttachment>, StorageError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT message_id, name, size, path FROM ai_attachments WHERE message_id=?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![message_id], |r| {
+            Ok(bluelink_domain::AiAttachment {
+                message_id: r.get(0)?,
+                name: r.get(1)?,
+                size: r.get(2)?,
+                path: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 整个会话的全部附件（上下文组装/前端文件片渲染按 message_id 分组用）。
+    pub fn ai_attachments_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<bluelink_domain::AiAttachment>, StorageError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT a.message_id, a.name, a.size, a.path FROM ai_attachments a
+             JOIN messages m ON m.id = a.message_id WHERE m.conversation_id=?1 ORDER BY a.rowid",
+        )?;
+        let rows = stmt.query_map(params![conversation_id], |r| {
+            Ok(bluelink_domain::AiAttachment {
+                message_id: r.get(0)?,
+                name: r.get(1)?,
+                size: r.get(2)?,
+                path: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// 子串搜索，返回命中消息（按时间倒序，上限 200）。

@@ -55,6 +55,11 @@
     <symbol id="i-edit" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></symbol>
     <symbol id="i-chevrons-left" viewBox="0 0 24 24"><path d="m11 17-5-5 5-5"/><path d="m18 17-5-5 5-5"/></symbol>
     <symbol id="i-chevrons-right" viewBox="0 0 24 24"><path d="m6 17 5-5-5-5"/><path d="m13 17 5-5-5-5"/></symbol>
+    <!-- 单箭头（v1.0.1 第 9 项）：路径按「视觉中心」校准——箭头墨迹重心
+         偏向尖角一侧，故整体向反方向移 1.2 单位，让重心落回 viewBox
+         中心；文字字形 ‹ › 的墨迹分布不受控、各字体下都偏，已弃用 -->
+    <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m14.7 17-5.5-5 5.5-5"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9.3 17 5.5-5-5.5-5"/></symbol>
   </defs>
 </svg>
 
@@ -304,7 +309,16 @@
       <div id="ai-think-note" class="hidden">当前接口不支持思考模式开关，本次已忽略该设置</div>
       <div id="ai-quote-bar" class="hidden"><span id="ai-quote-text"></span><button id="ai-quote-x" class="ghost" title="取消引用">×</button></div>
       <div id="ai-composer">
+        <div id="ai-attach-bar" class="hidden">
+          <div id="ai-attach-head">
+            <span id="ai-attach-count"></span>
+            <span class="flex-spacer"></span>
+            <button id="ai-attach-clear" class="btn small-btn">清空</button>
+          </div>
+          <div id="ai-attach-list"></div>
+        </div>
         <div class="composer-row composer-card">
+          <button id="btn-ai-file" class="icon-btn" title="添加文本附件（只支持文本文件）"><svg class="ico"><use href="#i-clip"/></svg></button>
           <label id="ai-thinking-wrap" title="开启后请 AI 先思考再回答（仅 DeepSeek 等支持的接口生效）"><input type="checkbox" id="ai-thinking">思考</label>
           <textarea id="ai-input" rows="1" placeholder="向 AI 提问，Enter 发送，Shift+Enter 换行"></textarea>
           <button id="btn-ai-send" class="send-round" title="发送"><svg class="ico ico-16"><use href="#i-arrow-up"/></svg></button>
@@ -541,20 +555,10 @@
       </span>
       <span class="flex-spacer"></span>
       <span id="viewer-tools" class="hidden">
-        <button id="viewer-format-btn" class="btn small-btn" title="按当前文件语言做轻量格式化（只改显示，原文不动）">格式化</button>
-        <select id="viewer-fmt" title="格式化快捷处理（只改显示，原文不动）">
-          <option value="">格式化处理…</option>
-          <option value="jsonPretty">JSON 美化</option>
-          <option value="jsonMin">JSON 压缩</option>
-          <option value="xmlPretty">XML 美化</option>
-          <option value="reindent">代码整理缩进</option>
-          <option value="b64enc">Base64 编码</option>
-          <option value="b64dec">Base64 解码</option>
-          <option value="urlEnc">URL 编码</option>
-          <option value="urlDec">URL 解码</option>
-          <option value="tsConv">时间戳 → 时间</option>
-        </select>
-        <button id="viewer-fmt-go" class="btn small-btn">执行</button>
+        <span id="viewer-fmt-wrap">
+          <button id="viewer-fmt-btn" class="btn small-btn" title="格式化与快捷处理（只改显示，原文不动）">格式化 ▾</button>
+          <div id="viewer-fmt-menu" class="hidden"></div>
+        </span>
         <button id="viewer-find-btn" class="btn small-btn">查找</button>
         <button id="viewer-copy-all" class="btn small-btn">复制全文</button>
       </span>
@@ -588,8 +592,8 @@
     <div id="viewer-image" class="hidden">
       <div id="viewer-img-stage">
         <img id="viewer-img" alt="" draggable="false">
-        <button id="viewer-img-prev" class="viewer-nav hidden" title="上一张 (←)">‹</button>
-        <button id="viewer-img-next" class="viewer-nav hidden" title="下一张 (→)">›</button>
+        <button id="viewer-img-prev" class="viewer-nav hidden" title="上一张 (←)"><svg class="ico ico-20"><use href="#i-chevron-left"/></svg></button>
+        <button id="viewer-img-next" class="viewer-nav hidden" title="下一张 (→)"><svg class="ico ico-20"><use href="#i-chevron-right"/></svg></button>
       </div>
       <div class="viewer-imgbar">
         <button id="vi-fit" class="btn small-btn">适屏</button>

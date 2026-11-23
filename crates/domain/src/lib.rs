@@ -133,6 +133,18 @@ pub struct GroupManifest {
     pub items: Vec<GroupItem>,
 }
 
+/// AI 文本附件（v1.0.1）：挂在一条 AI 会话用户消息上的文本文件。
+/// 内容副本落在数据目录 ai-att/ 下（path 指它），消息本体只存用户
+/// 输入的文字；组装上下文时才把附件内容按「附件：名 + 代码块」拼
+/// 进该条用户消息——本机与对方转发两条路线共用同一份组装结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiAttachment {
+    pub message_id: String,
+    pub name: String,
+    pub size: i64,
+    pub path: String,
+}
+
 /// 把成员清单编码为组消息 body。序列化失败理论上不会发生（纯数据
 /// 结构），兜底给空清单 JSON 而不是 panic。
 pub fn group_manifest_json(items: &[GroupItem]) -> String {
