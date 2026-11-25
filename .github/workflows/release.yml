@@ -40,6 +40,11 @@ jobs:
       # 文件缺失直接红灯，不许静默出空正文包。
       - name: 读取发布说明
         id: notes
+        # Windows runner 上 run 默认是 PowerShell（date/$$/$RANDOM/heredoc
+        # 全是 bash 写法会直接红灯——v1.0.2 首轮发布即因此折在 Windows），
+        # 必须显式指定 bash（git bash 随 runner 自带，本仓 simpleble-check
+        # 亦同此口径）。
+        shell: bash
         run: |
           f="docs/releases/${{ github.ref_name }}.md"
           test -f "$f" || { echo "缺少发布说明 $f"; exit 1; }
