@@ -459,7 +459,7 @@
         <p class="muted small version-line">BlueLink <span id="set-version"></span>（重构版）</p>
         <div class="setting-row"><span>软件更新</span><span class="row-gap"><span id="update-status" class="muted small">仅手动检查，不会自动联网</span><button id="btn-check-update" class="btn small-btn">检查更新</button></span></div>
         <div class="setting-row"><span>作者</span><b>ZPC</b></div>
-        <div class="setting-row"><span>邮箱</span><span class="muted small">privacyporton@proton.me</span></div>
+        <div class="setting-row"><span>邮箱</span><span id="author-email" class="muted small" title="双击复制">privacyporton@proton.me</span></div>
         <div class="setting-row"><span>项目</span><a id="project-link" class="small" href="https://github.com/123zpc/BlueLink">https://github.com/123zpc/BlueLink</a></div>
        </div>
       </div>
@@ -551,7 +551,7 @@
   <div id="update-modal" class="hidden">
     <div class="modal-box">
       <h3 id="update-title">发现新版本</h3>
-      <p id="update-notes"></p>
+      <div id="update-notes"></div>
       <div id="update-progress-wrap" class="hidden">
         <div class="progress"><div id="update-progress-bar"></div></div>
         <div id="update-progress-text" class="progress-meta"></div>

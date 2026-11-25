@@ -4651,12 +4651,44 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
 
 // ---------- 软件更新（v2.5.2）：仅手动触发，平时绝不自动联网检查 ----------
 // 流程：点「检查更新」→ 查 GitHub 已发布版 latest.json（草稿不会被推送）→
-// 已是最新给明确提示；发现新版弹窗（版本号+说明节选）→「立即更新」下载
+// 已是最新给明确提示；发现新版弹窗（版本号+说明全文渲染）→「立即更新」下载
 // （进度条；下载中可取消——插件下载无法中途掐断，取消=放弃，下载完不安装）→
 // 下载完成再确认 → 安装并自动重启。签名校验由 updater 插件按公钥执行。
 let updHandle = null;   // check() 返回的 Update 对象
 let updPhase = "idle";  // idle | found | downloading | downloaded | installing
 let updAbandoned = false;
+
+/** 更新说明 Markdown 子集 → HTML（v1.0.2 换包修复）：发布说明原文是
+ *  Markdown，旧实现用 textContent 原样贴出，# / ** 标记裸显，还被
+ *  600 字截断砍掉大半。只支持发布说明实际用到的子集：一级标题（与
+ *  更新框标题「发现新版本 vX.Y.Z」重复，整行丢弃）、## 小节标题、
+ *  - / * 列表、段落、行内 **粗体** 与 `代码`。先逐行转义再套结构，
+ *  原始 HTML 永远进不了 DOM；不支持的语法按纯文字呈现，不引库。 */
+function renderReleaseNotes(md) {
+  const inline = (t) => esc(t)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
+  const out = [];
+  let inList = false;
+  const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+  for (const raw of String(md || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) { closeList(); continue; }
+    if (/^#\s/.test(line)) { closeList(); continue; }
+    const h = line.match(/^#{2,6}\s+(.*)$/);
+    if (h) { closeList(); out.push(`<h4>${inline(h[1])}</h4>`); continue; }
+    const li = line.match(/^[-*]\s+(.*)$/);
+    if (li) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${inline(li[1])}</li>`);
+      continue;
+    }
+    closeList();
+    out.push(`<p>${inline(line)}</p>`);
+  }
+  closeList();
+  return out.join("");
+}
 
 function updSetStatus(text) { $("update-status").textContent = text; }
 function friendlyUpdError(e) {
@@ -4699,7 +4731,11 @@ $("btn-check-update").addEventListener("click", async () => {
     updAbandoned = false;
     $("update-title").textContent = `发现新版本 v${update.version}`;
     const notes = (update.body || "").trim();
-    $("update-notes").textContent = notes ? notes.slice(0, 600) : "（此版本未附更新说明）";
+    const notesEl = $("update-notes");
+    // 说明全文呈现（Markdown 子集渲染，见 renderReleaseNotes），不再截断
+    if (notes) notesEl.innerHTML = renderReleaseNotes(notes);
+    else notesEl.textContent = "（此版本未附更新说明）";
+    notesEl.scrollTop = 0;
     $("update-progress-wrap").classList.add("hidden");
     $("update-action").textContent = "立即更新";
     $("update-action").disabled = false;
@@ -4715,6 +4751,14 @@ $("btn-check-update").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
   }
+});
+
+// 关于·作者邮箱：双击复制到剪贴板（与消息复制同一条 navigator.clipboard
+// 路径，成败都走统一 toast，不静默）
+$("author-email").addEventListener("dblclick", async (e) => {
+  const text = e.currentTarget.textContent.trim();
+  try { await navigator.clipboard.writeText(text); showToast("邮箱已复制"); }
+  catch (_) { showToast("复制失败：当前系统剪贴板不可用"); }
 });
 
 // ② 设置页「项目」地址：点开走系统浏览器（后端 open_url 只放行 http/https）

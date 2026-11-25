@@ -641,7 +641,17 @@ section { display: flex; flex-direction: column; height: 100%; }
 #modal.hidden, #update-modal.hidden { display: none; }
 #update-modal .modal-box { width: 400px; }
 #update-modal h3 { margin: 0 0 10px; font-size: 15px; }
-#update-notes { white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow-y: auto; font-size: 13px; }
+/* 更新说明：内容由 renderReleaseNotes 渲染为结构化 HTML（小节标题/
+   列表/段落），全文呈现、区域内滚动（细滚动条已在全应用统一口径内） */
+#update-notes { word-break: break-word; max-height: 40vh; overflow-y: auto; font-size: 13px; line-height: 1.6; margin: 0 0 16px; padding-right: 6px; }
+#update-notes h4 { margin: 12px 0 6px; font-size: 13.5px; color: var(--text); }
+#update-notes h4:first-child { margin-top: 0; }
+#update-notes p { margin: 0 0 8px; font-size: 13px; line-height: 1.6; }
+#update-notes ul { margin: 0 0 8px; padding-left: 18px; }
+#update-notes li { margin: 0 0 6px; }
+#update-notes li:last-child { margin-bottom: 0; }
+#update-notes p:last-child, #update-notes ul:last-child { margin-bottom: 0; }
+#update-notes code { background: var(--hover); padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
 #update-progress-wrap { margin-bottom: 16px; }
 .modal-box { background: var(--panel); border-radius: 12px; padding: 20px; width: 340px; max-width: 90vw; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3); }
 .modal-box p { margin: 0 0 16px; font-size: 14px; line-height: 1.55; }
@@ -1171,7 +1181,7 @@ section { display: flex; flex-direction: column; height: 100%; }
 body { user-select: none; -webkit-user-select: none; }
 .bubble, .bubble *, #viewer-lines, #viewer-lines *,
 .msg-text, .ai-collapsed-text, .file-name, pre, code,
-#update-notes, #modal-text, .gstack-ph-name
+#update-notes, #modal-text, .gstack-ph-name, #author-email
   { user-select: text; -webkit-user-select: text; }
 input, textarea { user-select: text; -webkit-user-select: text; }
 
