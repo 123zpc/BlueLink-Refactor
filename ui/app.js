@@ -1171,6 +1171,35 @@ function renderPinBar(pins, convId, bar) {
   };
 }
 
+// ---------- 弹出菜单统一定位（v1.0.3 验后 #2） ----------
+// 旧实现按写死数字猜菜单尺寸（高 240/160/120、宽 190），项数一多就
+// 溢出窗口底边、末项被切（用户截图实证：底部文件消息 7 项菜单约
+// 290px > 猜的 240px）。统一改为实测：菜单内容填充完毕后调用，
+// 先以 visibility:hidden 显示量出真实宽高，再把左上角钳进视口
+// （四边留 4px）；下方放不下自然贴底上移，右侧同理。
+function placeMenuAt(menu, x, y) {
+  menu.style.visibility = "hidden";
+  menu.classList.remove("hidden");
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  menu.style.left = Math.max(4, Math.min(x, window.innerWidth - w - 4)) + "px";
+  menu.style.top = Math.max(4, Math.min(y, window.innerHeight - h - 4)) + "px";
+  menu.style.visibility = "";
+}
+// 锚点弹出层（彩签层/改名层/置顶列表/彩签悬停列表）收尾钳位：
+// 调用方先按锚点设好 top/left 并显示，本函数按实测矩形把探出视口
+// 的部分往回挪。矩形差值与 offsetTop/offsetLeft 同为像素偏移，
+// 与 offsetParent 无关，可直接相加。
+function clampPopIntoView(el) {
+  const r = el.getBoundingClientRect();
+  let dy = 0, dx = 0;
+  if (r.bottom > window.innerHeight - 4) dy = window.innerHeight - 4 - r.bottom;
+  if (r.top + dy < 4) dy = 4 - r.top;
+  if (r.right > window.innerWidth - 4) dx = window.innerWidth - 4 - r.right;
+  if (r.left + dx < 4) dx = 4 - r.left;
+  if (dy) el.style.top = (el.offsetTop + dy) + "px";
+  if (dx) el.style.left = (el.offsetLeft + dx) + "px";
+}
+
 /** ㉖ 取消置顶菜单（置顶列表条目/单条置顶栏共用）：点「取消置顶」先
  * 弹确认，确认才真取消；取消/关弹窗保持置顶不动。 */
 function openUnpinMenu(m, x, y) {
@@ -1190,9 +1219,7 @@ function openUnpinMenu(m, x, y) {
     }
   });
   menu.appendChild(b);
-  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
-  menu.style.top = Math.min(y, window.innerHeight - 120) + "px";
-  menu.classList.remove("hidden");
+  placeMenuAt(menu, x, y);
 }
 
 // ---------- 置顶消息列表（≥2 条时点置顶栏弹出，点哪条跳哪条） ----------
@@ -1220,6 +1247,7 @@ function openPinList() {
   }
   list.style.top = (bar.offsetTop + bar.offsetHeight + 4) + "px";
   list.classList.remove("hidden");
+  clampPopIntoView(list); // v1.0.3 #2：矮窗口下实测钳位防探底（高度另有 46vh 上限）
   pinListOpen = true;
 }
 function closePinList() {
@@ -2430,12 +2458,13 @@ async function openCatPop(mid, anchor) {
   pop.classList.remove("hidden");
   const r = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
   if (r) {
-    pop.style.top = Math.min(window.innerHeight - 330, r.bottom + 6) + "px";
-    pop.style.left = Math.max(8, Math.min(window.innerWidth - 316, r.left - 120)) + "px";
+    pop.style.top = (r.bottom + 6) + "px";
+    pop.style.left = (r.left - 120) + "px";
   } else {
     pop.style.top = "80px";
     pop.style.left = "300px";
   }
+  clampPopIntoView(pop); // v1.0.3 #2：实测钳位，替代写死猜高/猜宽
 }
 function renderCatGrid(selected) {
   const grid = $("cat-grid");
@@ -2532,9 +2561,7 @@ function openMsgMenu(m, x, y, ai = false) {
     });
     menu.appendChild(b);
   }
-  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
-  menu.style.top = Math.min(y, window.innerHeight - 240) + "px";
-  menu.classList.remove("hidden");
+  placeMenuAt(menu, x, y);
 }
 
 // ---------- 文件菜单 ----------
@@ -2621,9 +2648,7 @@ async function openFileMenu(mid, x, y) {
     hint.textContent = "文件已不在原位置（可能尚未接收完成或已被移动）";
     menu.appendChild(hint);
   }
-  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
-  menu.style.top = Math.min(y, window.innerHeight - 240) + "px";
-  menu.classList.remove("hidden");
+  placeMenuAt(menu, x, y);
 }
 document.addEventListener("click", (e) => {
   const menu = $("file-menu");
@@ -2712,6 +2737,7 @@ function showRibbonList(color, tab) {
   const main = $("main").getBoundingClientRect();
   box.style.top = Math.max(64, r.top - main.top) + "px";
   box.classList.remove("hidden");
+  clampPopIntoView(box); // v1.0.3 #2：实测钳位防探底（高度另有 46vh 上限）
 }
 $("ribbon-list").addEventListener("mouseenter", () => clearTimeout(ribbonHideTimer));
 $("ribbon-list").addEventListener("mouseleave", () => scheduleHideRibbonList());
@@ -2725,9 +2751,10 @@ function openRenamePop(color, anchor) {
   pop.classList.remove("hidden");
   const r = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
   if (r) {
-    pop.style.top = Math.min(window.innerHeight - 180, r.bottom + 6) + "px";
-    pop.style.left = Math.max(8, Math.min(window.innerWidth - 276, r.left - 60)) + "px";
+    pop.style.top = (r.bottom + 6) + "px";
+    pop.style.left = (r.left - 60) + "px";
   }
+  clampPopIntoView(pop); // v1.0.3 #2：实测钳位，替代写死猜高/猜宽
   $("rename-input").focus();
   $("rename-input").select();
 }
@@ -3006,9 +3033,7 @@ function openAiChipMenu(chip, conv, x, y) {
     });
     menu.appendChild(b);
   }
-  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
-  menu.style.top = Math.min(y, window.innerHeight - 160) + "px";
-  menu.classList.remove("hidden");
+  placeMenuAt(menu, x, y);
 }
 
 function openAiConversation(id) {
@@ -3737,17 +3762,51 @@ document.addEventListener("focusin", (e) => {
     lastOtherInputAt = Date.now();
   }
 });
-window.addEventListener("focus", () => {
-  if (document.querySelector("#modal:not(.hidden), #clear-modal:not(.hidden), #update-modal:not(.hidden), #viewer:not(.hidden), #file-menu:not(.hidden), #viewer-fmt-menu:not(.hidden), #ai-source-menu:not(.hidden), #clip-mode-menu:not(.hidden), #clip-count-menu:not(.hidden)")) return;
-  const active = document.activeElement;
-  if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
-  if (lastOtherInputAt > lastComposerAt) return; // 失焦前最后停在别处控件
+// v1.0.3 验后 #1：还焦点改双路共用实现。页面 window focus 事件在
+// 「被动最小化→恢复」时可靠，但手动点标题栏最小化按钮/任务栏图标
+// 最小化后恢复，WebView2 的 activeElement 常残留旧值（仍报输入框），
+// 旧实现被「已在输入处」守卫误判跳过、键盘焦点其实已丢。故后端在
+// 窗口从最小化恢复并获得焦点时另发 window-restored 事件，前端收到后
+// 走 force 路径：目标与残留焦点是同一元素时先 blur 再 focus，逼
+// WebView2 做一次真实重聚焦。守卫口径与旧实现一致（对话框/菜单/
+// 查看器打开不抢、失焦前停在别处控件不抢、焦点真在别处输入控件不抢）。
+let lastFocusDoneAt = 0; // 上次真正执行还焦点的时刻（双路同轮去重）
+function restoreComposerFocus(source, force) {
+  const note = (msg) => {
+    if (source === "backend") invoke("log_frontend", { msg }).catch(() => {});
+  };
+  if (document.querySelector("#modal:not(.hidden), #clear-modal:not(.hidden), #update-modal:not(.hidden), #viewer:not(.hidden), #file-menu:not(.hidden), #viewer-fmt-menu:not(.hidden), #ai-source-menu:not(.hidden), #clip-mode-menu:not(.hidden), #clip-count-menu:not(.hidden)")) {
+    note("窗口恢复还焦点：有对话框/菜单/查看器打开，跳过");
+    return;
+  }
+  if (lastOtherInputAt > lastComposerAt) { // 失焦前最后停在别处控件
+    note("窗口恢复还焦点：失焦前停在别处控件，跳过");
+    return;
+  }
   let el = lastComposerId ? $(lastComposerId) : null;
   if (!el || el.offsetParent === null) {
     el = state.view === "ai" ? $("ai-input") : state.view === "chat" ? $("input") : null;
   }
-  if (el && el.offsetParent !== null) el.focus();
-});
+  if (!el || el.offsetParent === null) {
+    note("窗口恢复还焦点：当前页无主输入框，跳过");
+    return;
+  }
+  const active = document.activeElement;
+  const activeDesc = active ? active.tagName + (active.id ? "#" + active.id : "") : "无";
+  if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA") && active !== el) {
+    note(`窗口恢复还焦点：焦点在别处输入控件（${activeDesc}），跳过`);
+    return;
+  }
+  if (active === el && !force) return; // 页面路径旧口径：已在输入框就不动
+  const now = Date.now();
+  if (now - lastFocusDoneAt < 300) return; // 页面事件与后端事件同轮先后到，只执行一次
+  lastFocusDoneAt = now;
+  if (active === el) el.blur(); // 残留焦点先摘再重落，逼 WebView2 真正重聚焦
+  el.focus();
+  invoke("log_frontend", { msg: `窗口恢复还焦点（${source}）：恢复前 activeElement=${activeDesc}，已还给 #${el.id}` }).catch(() => {});
+}
+window.addEventListener("focus", () => restoreComposerFocus("page", false));
+listen("window-restored", () => restoreComposerFocus("backend", true)).catch(() => {});
 $("btn-ai-stop").addEventListener("click", () => invoke("ai_stop"));
 // ⑥ AI 页「回到最新」：上滑后出现，点按回底并恢复跟随
 $("ai-messages").addEventListener("scroll", syncAiBottomBtn);
@@ -5248,9 +5307,7 @@ function openGroupMenu(m, x, y) {
     });
     menu.appendChild(b);
   }
-  menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
-  menu.style.top = Math.min(y, window.innerHeight - 240) + "px";
-  menu.classList.remove("hidden");
+  placeMenuAt(menu, x, y);
 }
 
 /** 文件气泡点击分流（v2.6.0）：文本/代码→内置文本查看器，图片→

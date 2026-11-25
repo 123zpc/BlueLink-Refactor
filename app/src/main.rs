@@ -2645,6 +2645,44 @@ fn main() {
                     .unwrap_or((900.0, 600.0));
                 center_window_clamped(&win, lw, lh);
                 let _ = win.show();
+                // v1.0.3 验后 #1：最小化恢复的后端驱动还焦点。手动最小化
+                // （标题栏按钮/任务栏图标）恢复时，WebView2 里页面 window
+                // focus 事件不可靠（activeElement 还残留旧值，前端守卫误判
+                // 「已在输入处」跳过还焦点，人却打不了字）——被动路径
+                // （托盘 show+unminimize+set_focus）则正常。故后端记下
+                // 「曾最小化」，窗口重新获得焦点时 emit window-restored，
+                // 前端收到后走带真实重聚焦的还焦点。托盘恢复同样会触发
+                // Focused(true)，靠 was_minimized 一次性标记去重：只有真从
+                // 最小化回来才发，普通切窗口不发。
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    use tauri::Emitter as _;
+                    let win2 = win.clone();
+                    let was_minimized = std::sync::Arc::new(AtomicBool::new(false));
+                    let flag = was_minimized.clone();
+                    win.on_window_event(move |event| {
+                        match event {
+                            tauri::WindowEvent::Resized(_)
+                            | tauri::WindowEvent::Focused(false) => {
+                                // Tauri 2 没有专门的最小化事件：在尺寸变化与
+                                // 失焦这两个时机顺手查一次最小化状态并记账。
+                                if let Ok(true) = win2.is_minimized() {
+                                    flag.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            tauri::WindowEvent::Focused(true)
+                                if flag.swap(false, Ordering::SeqCst) =>
+                            {
+                                bluelink_services::log_line(
+                                    "app",
+                                    "窗口恢复：从最小化恢复并获得焦点，已通知前端还焦点（window-restored）",
+                                );
+                                let _ = win2.emit("window-restored", ());
+                            }
+                            _ => {}
+                        }
+                    });
+                }
             }
             // Windows 原生通知（WinRT toast + 点击激活回调）尽早初始化：
             // COM 激活类注册要赶在系统可能投递激活请求之前完成。
