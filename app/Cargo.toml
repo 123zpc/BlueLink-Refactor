@@ -14,6 +14,9 @@ tauri-plugin-single-instance = "2"
 # 软件更新（v2.5.2）：官方 updater 插件，仅设置页手动触发检查；签名公钥与
 # 端点在 tauri.conf.json 的 plugins.updater（端点只认 GitHub 已发布版）
 tauri-plugin-updater = "2"
+# 全局快捷键（剪贴板手动同步触发）：仅手动模式时由应用层注册/注销，
+# 注册失败（被其他程序占用）如实上报，不静默
+tauri-plugin-global-shortcut = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

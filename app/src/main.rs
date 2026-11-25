@@ -1862,9 +1862,24 @@ fn copy_file_to_clipboard(path: String) -> Result<(), String> {
 /// 读系统剪贴板里的文件列表（输入框粘贴文件时取真实路径）：在文件
 /// 管理器里复制文件后剪贴板里就是文件对象格式。Ok(空)=没有文件对象；
 /// UNSUPPORTED 错误=此平台暂未实现读取（见 win_clipboard 模块说明）。
+/// 整个读取带 500ms 总截止（services 的 CLIPBOARD_READ_BUDGET）：
+/// 剪贴板被占用/所有者无响应时降级为「没有文件」+ essential 日志，
+/// 前端转走文字粘贴，绝不让粘贴被锁死的剪贴板无限期拖住。
 #[tauri::command]
 fn clipboard_file_list() -> Result<Vec<String>, String> {
-    win_clipboard::get_file_list()
+    match bluelink_services::call_with_deadline(
+        bluelink_services::CLIPBOARD_READ_BUDGET,
+        win_clipboard::get_file_list,
+    ) {
+        Some(r) => r,
+        None => {
+            bluelink_services::log_line(
+                "clipboard",
+                "粘贴读取剪贴板文件列表降级：500ms 内无响应，按没有文件处理（文字粘贴不受影响）",
+            );
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// 剪贴板里是否有图片（只查存在性，不落盘、不返回数据）：AI 框粘贴
@@ -2098,31 +2113,169 @@ async fn get_gateway_settings(state: State<'_, AppState>) -> Result<GatewaySetti
     Ok(v)
 }
 
-/// 剪贴板同步状态（设置页展示）：本机开关、对方开关、是否已连接。
+/// 剪贴板同步状态（设置页展示）：本机开关、对方开关、是否已连接，
+/// 以及触发方式/条数/快捷键与快捷键实际注册状态。
 #[derive(Serialize)]
 struct ClipboardSyncView {
     local: bool,
     peer: bool,
     connected: bool,
+    mode: String,
+    count: u32,
+    hotkey: String,
+    hotkey_registered: bool,
 }
 
 #[tauri::command]
 async fn get_clipboard_sync(state: State<'_, AppState>) -> Result<ClipboardSyncView, String> {
     let (local, peer, connected) = state.node.clipboard_status().await;
+    let hotkey = state.node.clipboard_sync_hotkey();
+    let hotkey_registered = CLIP_HOTKEY_ACTIVE
+        .lock()
+        .map(|a| a.as_deref() == Some(hotkey.as_str()))
+        .unwrap_or(false);
     Ok(ClipboardSyncView {
         local,
         peer,
         connected,
+        mode: state.node.clipboard_sync_mode().to_string(),
+        count: state.node.clipboard_sync_count() as u32,
+        hotkey,
+        hotkey_registered,
     })
 }
 
 #[tauri::command]
-async fn set_clipboard_sync(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+async fn set_clipboard_sync(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    on: bool,
+) -> Result<(), String> {
     state
         .node
         .set_clipboard_sync(on)
         .await
+        .map_err(|e| e.to_string())?;
+    // 开关影响快捷键注册条件（同步开 + 手动方式才注册）
+    refresh_clipboard_hotkey(&app, &state.node);
+    Ok(())
+}
+
+/// 设置剪贴板同步触发方式（auto/manual）：落库后刷新快捷键注册。
+#[tauri::command]
+async fn set_clipboard_sync_mode(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    mode: String,
+) -> Result<(), String> {
+    state
+        .node
+        .set_clipboard_sync_mode(&mode)
+        .map_err(|e| e.to_string())?;
+    refresh_clipboard_hotkey(&app, &state.node);
+    Ok(())
+}
+
+/// 设置一次同步的条数（1/2/3/5，其余在服务层回落 1）。
+#[tauri::command]
+async fn set_clipboard_sync_count(state: State<'_, AppState>, count: u32) -> Result<(), String> {
+    state
+        .node
+        .set_clipboard_sync_count(count as usize)
         .map_err(|e| e.to_string())
+}
+
+/// 设置手动同步快捷键：先验格式（解析不过直接报错、不落库坏值），
+/// 落库后刷新注册；手动方式下注册失败会经 refresh 发事件+日志上报。
+#[tauri::command]
+async fn set_clipboard_sync_hotkey(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    hotkey: String,
+) -> Result<(), String> {
+    if hotkey
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .is_err()
+    {
+        return Err("这个组合键的格式不对，换一个试试".to_string());
+    }
+    state
+        .node
+        .set_clipboard_sync_hotkey(&hotkey)
+        .map_err(|e| e.to_string())?;
+    refresh_clipboard_hotkey(&app, &state.node);
+    Ok(())
+}
+
+/// 手动同步结果（界面据 kind 给人话提示）。
+#[derive(Serialize, Clone)]
+struct ManualSyncView {
+    kind: String,
+    count: u32,
+}
+
+fn manual_sync_view(outcome: bluelink_services::ManualSyncOutcome) -> ManualSyncView {
+    use bluelink_services::ManualSyncOutcome as O;
+    let (kind, count) = match outcome {
+        O::Sent(n) => ("sent", n as u32),
+        O::NotConnected => ("not_connected", 0),
+        O::LocalOff => ("local_off", 0),
+        O::PeerOff => ("peer_off", 0),
+        O::Empty => ("empty", 0),
+    };
+    ManualSyncView {
+        kind: kind.to_string(),
+        count,
+    }
+}
+
+/// 立即同步一次（设置页按钮）：与全局快捷键走同一条服务层路径。
+#[tauri::command]
+async fn sync_clipboard_now(state: State<'_, AppState>) -> Result<ManualSyncView, String> {
+    Ok(manual_sync_view(state.node.sync_clipboard_now().await))
+}
+
+/// 当前实际注册中的手动同步快捷键（用户设置的字符串）：注册/注销
+/// 只走 refresh_clipboard_hotkey，设置页据此显示是否真生效。
+static CLIP_HOTKEY_ACTIVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 按当前设置刷新全局快捷键注册：仅在「同步开 + 手动方式」时注册
+/// 存储的组合键；切回自动/关同步/改组合键时先注销旧的。注册失败
+/// （多半被其他程序占用）不静默：打 essential 日志 + 发事件让界面
+/// 弹提示，设置页也会显示快捷键未生效。
+fn refresh_clipboard_hotkey(app: &AppHandle, node: &Arc<Node>) {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt as _;
+    let want = if node.clipboard_local_on() && node.clipboard_sync_mode() == "manual" {
+        Some(node.clipboard_sync_hotkey())
+    } else {
+        None
+    };
+    let mut active = CLIP_HOTKEY_ACTIVE.lock().unwrap();
+    if *active == want {
+        return;
+    }
+    if let Some(old) = active.take() {
+        let _ = app.global_shortcut().unregister(old.as_str());
+    }
+    let Some(hk) = want else { return };
+    match app.global_shortcut().register(hk.as_str()) {
+        Ok(()) => {
+            bluelink_services::log_line("clipboard", &format!("手动同步快捷键已注册：{hk}"));
+            *active = Some(hk);
+        }
+        Err(e) => {
+            bluelink_services::log_line(
+                "clipboard",
+                &format!(
+                    "手动同步快捷键注册失败：{hk}（{e}）——可能被其他程序占用，快捷键暂不生效，可用设置页的「立即同步一次」按钮"
+                ),
+            );
+            let _ = app.emit(
+                "clipboard_hotkey_error",
+                format!("快捷键 {hk} 注册失败，可能被其他程序占用了，换一个组合键试试"),
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -2456,6 +2609,25 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // 全局快捷键（剪贴板手动同步）：注册/注销由 refresh_clipboard_hotkey
+        // 按设置管理（仅同步开 + 手动方式时注册）；按下时走与设置页按钮
+        // 同一条服务层路径，结果经事件回前端给人话提示。
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                let view =
+                                    manual_sync_view(state.node.sync_clipboard_now().await);
+                                let _ = app.emit("clipboard_manual_result", view);
+                            }
+                        });
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             // ㉗ 启动居中（只在进程启动这一次）：按主屏工作区实测现算，
             // 禁止写死坐标；工作区比窗口小时钳回左上角，保标题栏可见、
@@ -2762,6 +2934,12 @@ fn main() {
                 listening: Mutex::new(None),
                 local_api: Mutex::new(local_handle),
             });
+            // 剪贴板手动同步快捷键按已存设置注册（仅同步开 + 手动方式时；
+            // 注册失败只记日志——启动阶段前端还没就绪，设置页会显示未生效）
+            {
+                let st = app.state::<AppState>();
+                refresh_clipboard_hotkey(app.handle(), &st.node);
+            }
             // 系统托盘：聊天软件的标准行为——关窗口只隐藏到托盘，蓝牙与连接不断；
             // 真正退出走托盘菜单「退出」。左键点托盘图标重新打开窗口。
             {
@@ -2962,6 +3140,10 @@ fn main() {
             set_local_api,
             get_clipboard_sync,
             set_clipboard_sync,
+            set_clipboard_sync_mode,
+            set_clipboard_sync_count,
+            set_clipboard_sync_hotkey,
+            sync_clipboard_now,
         ])
         .run(tauri::generate_context!())
         .expect("启动 BlueLink 失败");

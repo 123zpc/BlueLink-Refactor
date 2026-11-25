@@ -406,6 +406,58 @@ pub fn reveal_file(path: &Path) -> Result<(), ServiceError> {
     result
 }
 
+/// 粘贴/发送准备路径上剪贴板读取的总时长上限：剪贴板被其他程序长
+/// 时间占用、或内容所有者对延迟渲染迟迟不响应时，系统读取调用会
+/// 无限期阻塞——用户实测长文本「发送中」十几分钟、文件真正传输只
+/// 用 698ms，卡的就是这一步（诊断见 goal hidden_files 的
+/// clipboard-lock-diagnosis-2026-11-25）。这条路径上的读取一律设
+/// 截止：超时/被占用即降级，绝不无限等待。
+pub const CLIPBOARD_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 在独立线程里执行闭包并设总时长上限：超时返回 None，调用方降级。
+/// 卡住的线程留在系统调用里自生自灭——它只持有自己新建的短句柄、
+/// 不碰 Node 的长驻句柄与任何共享锁，拖不垮其他路径；这类线程只
+/// 由用户粘贴操作触发（每次至多一条），不会累积失控。
+pub fn call_with_deadline<T: Send + 'static>(
+    budget: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(budget).ok()
+}
+
+/// 一次带截止的剪贴板图片读取结果：拿到图 / 确实没有图 / 降级
+/// （超时或被占用——调用方按「没有图片」走，但必须留痕定责）。
+enum ClipImageRead {
+    Image(arboard::ImageData<'static>),
+    None,
+    Degraded(&'static str),
+}
+
+/// 用独立短句柄在截止内读一次剪贴板图片（粘贴路径专用：不碰 Node
+/// 长驻句柄与 clip_handle 锁，剪贴板锁死时也不会排队等待）。
+fn read_clipboard_image_bounded() -> ClipImageRead {
+    match call_with_deadline(CLIPBOARD_READ_BUDGET, || {
+        let mut cb = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(_) => return ClipImageRead::None,
+        };
+        match cb.get_image() {
+            Ok(img) => ClipImageRead::Image(img),
+            Err(arboard::Error::ClipboardOccupied) => {
+                ClipImageRead::Degraded("剪贴板被其他程序占用")
+            }
+            Err(_) => ClipImageRead::None,
+        }
+    }) {
+        Some(r) => r,
+        None => ClipImageRead::Degraded("读取超时（剪贴板无响应）"),
+    }
+}
+
 /// 一次性读系统剪贴板里的原始图像，编码为 PNG 字节返回（输入框粘贴
 /// 的图像回落路线）：截图、画图/浏览器里复制的图片在剪贴板里只有
 /// 位图数据、没有文件形态，前端 WebView 的 DataTransfer 在部分平台
@@ -414,15 +466,20 @@ pub fn reveal_file(path: &Path) -> Result<(), ServiceError> {
 /// 没有图片、剪贴板被占用或平台读不到 → Ok(None)，不算失败：
 /// 它只是文件路线之后的回落，两条都没有才由前端提示。
 /// 与 clip_read_with 不同，这里是短命句柄「只读一次」：X11 上读
-/// 选择内容不依赖本进程持有，读完即放，不碰 Node 的长驻句柄。
+/// 选择内容不依赖本进程持有，读完即放，不碰 Node 的长驻句柄；
+/// 读取本身带 500ms 截止（见 CLIPBOARD_READ_BUDGET），被占用/
+/// 超时降级为「没有图片」并打 essential 日志，绝不拖住粘贴。
 pub fn clipboard_image_png() -> Result<Option<Vec<u8>>, ServiceError> {
-    let mut cb = match arboard::Clipboard::new() {
-        Ok(c) => c,
-        Err(_) => return Ok(None),
-    };
-    let img = match cb.get_image() {
-        Ok(i) => i,
-        Err(_) => return Ok(None),
+    let img = match read_clipboard_image_bounded() {
+        ClipImageRead::Image(i) => i,
+        ClipImageRead::None => return Ok(None),
+        ClipImageRead::Degraded(why) => {
+            log::log_line(
+                "clipboard",
+                &format!("粘贴读取剪贴板图片降级：{why}，按没有图片处理（文字粘贴不受影响）"),
+            );
+            return Ok(None);
+        }
     };
     let rgba =
         image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
@@ -437,13 +494,20 @@ pub fn clipboard_image_png() -> Result<Option<Vec<u8>>, ServiceError> {
 /// 剪贴板里是否有图片（只查存在性，不解码、不编码、不落盘）：供 AI 框
 /// 粘贴图片时补判。旧命令曾复用 clipboard_image_png 的完整 PNG 编码，
 /// 只为判存在性白白编一次大图（第三方评审）；这里只读一次 get_image
-/// 的成败，图大也不编码。
+/// 的成败，图大也不编码。读取带 500ms 截止：被占用/超时降级为
+/// 「没有图片」并打 essential 日志，绝不拖住粘贴。
 pub fn clipboard_has_image() -> Result<bool, ServiceError> {
-    let mut cb = match arboard::Clipboard::new() {
-        Ok(c) => c,
-        Err(_) => return Ok(false),
-    };
-    Ok(cb.get_image().is_ok())
+    match read_clipboard_image_bounded() {
+        ClipImageRead::Image(_) => Ok(true),
+        ClipImageRead::None => Ok(false),
+        ClipImageRead::Degraded(why) => {
+            log::log_line(
+                "clipboard",
+                &format!("粘贴探测剪贴板图片降级：{why}，按没有图片处理"),
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// 当前分片压缩算法名（发送完成日志用；与协议层压缩标志对应）。
@@ -778,6 +842,30 @@ fn clip_normalize_text(t: &str) -> String {
     t.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// clip_handle 锁的最长等待：正常持有只有一次读写的毫秒级，等不到
+/// 只可能是持有者卡在系统调用里——等满即放弃，绝不无限排队。
+const CLIP_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 带截止地拿一把 std Mutex（try_lock 自旋）：超时或锁毒化返回 None。
+fn lock_with_deadline<T>(
+    m: &std::sync::Mutex<T>,
+    budget: std::time::Duration,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    let start = std::time::Instant::now();
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if start.elapsed() >= budget {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 /// 两份剪贴板内容是否「同一份」（等价判定，v2.6.6 #16）：
 /// 系统剪贴板格式转换会改字节不改内容——文字可能换行尾、图片可能
 /// 动 alpha 通道或个别字节。哈希全等只是等价的特例；防回环必须按
@@ -840,6 +928,22 @@ struct AppliedClip {
     readback_hash: Option<String>,
 }
 
+/// 手动同步一次的结果（快捷键/设置页按钮触发）：界面据此给人话提示，
+/// 被拦下的每种情况在服务层都已打 essential 日志。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManualSyncOutcome {
+    /// 已发出最新 N 条。
+    Sent(usize),
+    /// 尚未连接设备。
+    NotConnected,
+    /// 本机剪贴板同步未开启。
+    LocalOff,
+    /// 对方未开启剪贴板同步。
+    PeerOff,
+    /// 没攒到可同步的内容（或全部超限/发送失败）。
+    Empty,
+}
+
 /// poll 一次读到本机内容后的裁决（#16 状态机，纯逻辑可单测）。
 enum ClipPollDecision {
     /// 与本机基线相同：无变化。
@@ -892,10 +996,24 @@ struct ClipGuard {
     /// 本进程经同步路径实际写入系统剪贴板的累计次数（#16 埋点）：
     /// 真机再现「历史多一条」时，日志里第 N 次写入可逐次对账。
     write_count: u64,
+    /// 本机剪贴板历史缓冲（多条/手动同步用）：只存内存、进程退出即
+    /// 清，绝不落盘/入 DB。只收 poll 裁决为「本机新复制」的内容与
+    /// 手动模式下 prime 的基线，远端应用来的内容绝不入列（那是回声）。
+    history: std::collections::VecDeque<ClipContent>,
+    /// 最近应用过的远端内容哈希账（线缆哈希与回读哈希都记）：多条
+    /// 依次写入时单槽 applied 只记得住最后一条，这本账覆盖整批——
+    /// poll/apply 命中即认回声/本机已有，绝不回发整批中的任何一条。
+    applied_recent: std::collections::VecDeque<String>,
 }
 
 /// 发送登记容量：回声最迟隔一轮往返，16 条足够；超限挤掉最旧的。
 const CLIP_SENT_CAP: usize = 16;
+
+/// 本机历史缓冲容量（仅内存）：「最新 5 条」设置上限的两倍余量。
+const CLIP_HISTORY_CAP: usize = 10;
+
+/// 应用哈希账容量：覆盖整批（最大 5 条 × 线缆+回读两哈希）再留余量。
+const CLIP_APPLIED_CAP: usize = 16;
 
 impl ClipGuard {
     /// poll 裁决：读到的内容是没变、同步回声、还是用户新复制。
@@ -914,10 +1032,45 @@ impl ClipGuard {
                 return ClipPollDecision::SyncEcho;
             }
         }
+        // 整批应用账：多条同步依次写入时，早期条目可能已被单槽
+        // applied 挤掉，但只要还在账里就仍是同步来的，绝不回发。
+        // 与单槽 applied 同口径的已知取舍：刚被同步过的内容短时间
+        // 内在本机再复制同份，会先被认作回声（等它被后续应用挤出
+        // 账本、或进程重启后恢复）——防回环优先于这一 corner。
+        if self.applied_recent.contains(&hash) {
+            self.local_seen = Some(hash);
+            return ClipPollDecision::SyncEcho;
+        }
         if self.local_seen.as_deref() == Some(hash.as_str()) {
             return ClipPollDecision::Unchanged;
         }
         ClipPollDecision::Send
+    }
+
+    /// 记入本机历史缓冲：与最新一条同哈希不重复记，超容挤最旧。
+    fn note_history(&mut self, content: ClipContent) {
+        if let Some(last) = self.history.back() {
+            if last.hash() == content.hash() {
+                return;
+            }
+        }
+        self.history.push_back(content);
+        while self.history.len() > CLIP_HISTORY_CAP {
+            self.history.pop_front();
+        }
+    }
+
+    /// 取历史里最新 n 条（时间正序：旧→新；发送时依次发，对方按序
+    /// 写入、最终停在最新一条）。
+    fn history_latest(&self, n: usize) -> Vec<ClipContent> {
+        let skip = self.history.len().saturating_sub(n);
+        self.history.iter().skip(skip).cloned().collect()
+    }
+
+    /// 手动模式的观察登记：只推进基线，不进发送登记（还没发出去，
+    /// 发出时由 send_clip_contents 走 note_sent 登记）。
+    fn note_observed(&mut self, hash: String) {
+        self.local_seen = Some(hash);
     }
 
     /// 发送成功后登记（基线 + 发送登记同记）。
@@ -937,6 +1090,11 @@ impl ClipGuard {
         if self.sent.contains(&hash) {
             return ClipApplyDecision::EchoDrop;
         }
+        // 整批应用账：本机刚按批写入过的内容被对方回传时，单槽
+        // applied 可能已被后一条挤掉，账里命中同样判本机已有。
+        if self.applied_recent.contains(&hash) {
+            return ClipApplyDecision::AlreadyLocal;
+        }
         if self.local_seen.as_deref() == Some(hash.as_str()) {
             return ClipApplyDecision::AlreadyLocal;
         }
@@ -950,9 +1108,19 @@ impl ClipGuard {
 
     /// 写入成功（或本机已是该内容）后登记应用账：本体 + 线缆哈希 +
     /// 回读哈希一并钉死；基线推进到回读哈希（poll 接下来读到的就是它）。
+    /// 线缆/回读两哈希同时进整批账（applied_recent），多条依次写入时
+    /// 每条都留痕，不只最后一条。
     fn note_applied(&mut self, content: ClipContent, readback_hash: Option<String>) {
         let wire_hash = content.hash();
         self.local_seen = Some(readback_hash.clone().unwrap_or_else(|| wire_hash.clone()));
+        for h in std::iter::once(wire_hash.clone()).chain(readback_hash.iter().cloned()) {
+            if !self.applied_recent.contains(&h) {
+                self.applied_recent.push_back(h);
+            }
+        }
+        while self.applied_recent.len() > CLIP_APPLIED_CAP {
+            self.applied_recent.pop_front();
+        }
         self.applied = Some(AppliedClip {
             content,
             wire_hash,
@@ -2440,8 +2608,12 @@ impl Node {
 
     /// 取长驻剪贴板句柄执行闭包（句柄不存在时懒创建；系统剪贴板不可用返回 None）。
     /// 只在阻塞线程里调用：std Mutex 不跨 await。
+    /// 锁等待带截止（CLIP_LOCK_BUDGET）：正常持有只有一次读写的毫秒级，
+    /// 等不到只可能是某个调用卡在系统调用里（如剪贴板所有者对延迟渲染
+    /// 无响应）——等满即放弃返回 None，绝不无限排队；粘贴路径更是不碰
+    /// 这把锁（独立短句柄 + 500ms 截止，见 read_clipboard_image_bounded）。
     fn with_clipboard<R>(&self, f: impl FnOnce(&mut arboard::Clipboard) -> R) -> Option<R> {
-        let mut guard = self.clip_handle.lock().ok()?;
+        let mut guard = lock_with_deadline(&self.clip_handle, CLIP_LOCK_BUDGET)?;
         if guard.is_none() {
             *guard = arboard::Clipboard::new().ok();
         }
@@ -2507,6 +2679,200 @@ impl Node {
         Ok(())
     }
 
+    /// 剪贴板同步触发方式（设置键 clipboard_sync_mode）：auto=复制了
+    /// 马上发（现状）；manual=先攒进本机历史缓冲，按快捷键/按钮才发。
+    /// 默认 auto；存量值非法时回落 auto。
+    pub fn clipboard_sync_mode(&self) -> &'static str {
+        match self
+            .storage
+            .get_setting("clipboard_sync_mode")
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("manual") => "manual",
+            _ => "auto",
+        }
+    }
+
+    pub fn set_clipboard_sync_mode(&self, mode: &str) -> Result<(), ServiceError> {
+        let mode = if mode == "manual" { "manual" } else { "auto" };
+        self.storage.set_setting("clipboard_sync_mode", mode)?;
+        log::log_line(
+            "clipboard",
+            &format!(
+                "剪贴板同步方式：{}",
+                if mode == "manual" {
+                    "手动（按快捷键或按钮才发）"
+                } else {
+                    "自动（复制了马上发）"
+                }
+            ),
+        );
+        Ok(())
+    }
+
+    /// 一次同步的条数（设置键 clipboard_sync_count）：只认 1/2/3/5，
+    /// 其余一律回落 1（=只发最新一条，与旧行为一致）。
+    pub fn clipboard_sync_count(&self) -> usize {
+        match self
+            .storage
+            .get_setting("clipboard_sync_count")
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("2") => 2,
+            Some("3") => 3,
+            Some("5") => 5,
+            _ => 1,
+        }
+    }
+
+    pub fn set_clipboard_sync_count(&self, n: usize) -> Result<(), ServiceError> {
+        let n = match n {
+            2 | 3 | 5 => n,
+            _ => 1,
+        };
+        self.storage
+            .set_setting("clipboard_sync_count", &n.to_string())?;
+        log::log_line("clipboard", &format!("剪贴板每次同步条数：最新 {n} 条"));
+        Ok(())
+    }
+
+    /// 手动同步快捷键（设置键 clipboard_sync_hotkey，显示格式如
+    /// "Ctrl+Alt+V"）：默认 Ctrl+Alt+V；空值回落默认。
+    pub fn clipboard_sync_hotkey(&self) -> String {
+        self.storage
+            .get_setting("clipboard_sync_hotkey")
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Ctrl+Alt+V".to_string())
+    }
+
+    pub fn set_clipboard_sync_hotkey(&self, hotkey: &str) -> Result<(), ServiceError> {
+        self.storage.set_setting("clipboard_sync_hotkey", hotkey)?;
+        log::log_line("clipboard", &format!("剪贴板手动同步快捷键：{hotkey}"));
+        Ok(())
+    }
+
+    /// 把一批剪贴板内容按时间正序（旧→新）依次发给对方，返回实际
+    /// 发出的条数。逐条走既有口径：超 2MB 跳过并记日志、发送成功
+    /// 才登记（note_sent，整批哈希全进发送登记——对方回声抑制的
+    /// 第一道闸）。图片不走自动单条路径的出站延后（#18）：批量里
+    /// 除最新一条外都是「补发的历史」，再延后只会乱序；手动触发
+    /// 更是用户明确指令，不让行。
+    async fn send_clip_contents(
+        &self,
+        session: &Arc<PeerSession>,
+        items: Vec<ClipContent>,
+    ) -> usize {
+        let mut sent = 0usize;
+        for content in items {
+            let hash = content.hash();
+            let ok = match content {
+                ClipContent::Text(text) => {
+                    if text.len() > CLIPBOARD_MAX_BYTES {
+                        log::log_line(
+                            "clipboard",
+                            &format!("剪贴板文字 {} 字节，超过 2MB 上限，跳过同步", text.len()),
+                        );
+                        false
+                    } else {
+                        session
+                            .conn
+                            .send(&Frame::Control(Control::ClipboardText {
+                                hash: hash.clone(),
+                                text,
+                            }))
+                            .await
+                            .is_ok()
+                    }
+                }
+                ClipContent::Image {
+                    width,
+                    height,
+                    rgba,
+                } => {
+                    let digest = clip_image_digest(width, height, &rgba);
+                    let compressed = zstd_compress(&rgba).filter(|c| c.len() < rgba.len());
+                    let (data, comp_algo) = match &compressed {
+                        Some(c) => (c.clone(), COMP_ZSTD),
+                        None => (rgba, COMP_NONE),
+                    };
+                    if data.len() > CLIPBOARD_MAX_BYTES {
+                        log::log_line(
+                            "clipboard",
+                            &format!(
+                                "剪贴板图片 {width}x{height}（发送大小 {} 字节），超过 2MB 上限，跳过同步",
+                                data.len()
+                            ),
+                        );
+                        false
+                    } else {
+                        session
+                            .conn
+                            .send(&Frame::ClipboardImage(ClipboardImage {
+                                hash: digest,
+                                width,
+                                height,
+                                compression: comp_algo,
+                                data,
+                            }))
+                            .await
+                            .is_ok()
+                    }
+                }
+            };
+            if ok {
+                let mut g = self.clip_guard.lock().await;
+                g.note_sent(hash);
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    /// 手动同步一次（快捷键与设置页按钮共用）：把本机历史缓冲里
+    /// 最新 N 条（N=同步条数设置）按序发给对方。未连接/任一侧未开/
+    /// 没攒到内容时不发送、只打日志并把原因如实返回给界面提示。
+    pub async fn sync_clipboard_now(self: &Arc<Self>) -> ManualSyncOutcome {
+        if !self.clipboard_local_on() {
+            log::log_line("clipboard", "手动同步未发出：本机剪贴板同步未开启");
+            return ManualSyncOutcome::LocalOff;
+        }
+        let session = match self.session().await {
+            Ok(s) => s,
+            Err(_) => {
+                log::log_line("clipboard", "手动同步未发出：尚未连接设备");
+                return ManualSyncOutcome::NotConnected;
+            }
+        };
+        if !self.clipboard_peer_on() {
+            log::log_line("clipboard", "手动同步未发出：对方未开启剪贴板同步");
+            return ManualSyncOutcome::PeerOff;
+        }
+        let items = {
+            let g = self.clip_guard.lock().await;
+            g.history_latest(self.clipboard_sync_count())
+        };
+        if items.is_empty() {
+            log::log_line(
+                "clipboard",
+                "手动同步未发出：还没有攒到可同步的内容（先复制点东西）",
+            );
+            return ManualSyncOutcome::Empty;
+        }
+        let sent = self.send_clip_contents(&session, items).await;
+        if sent == 0 {
+            log::log_line("clipboard", "手动同步未发出：内容超限或发送失败");
+            return ManualSyncOutcome::Empty;
+        }
+        log::log_line("clipboard", &format!("手动同步：已发出最新 {sent} 条"));
+        ManualSyncOutcome::Sent(sent)
+    }
+
     /// 本机剪贴板监视任务（随会话启动、会话结束自动退出）：每 700ms 轮询一次。
     /// 隐私底线：本机开关关闭时连读都不读；对方未开启时读了也不发，同样不读。
     ///
@@ -2561,6 +2927,13 @@ impl Node {
         {
             let mut g = self.clip_guard.lock().await;
             g.local_seen = Some(content.hash());
+            // 手动模式例外（用户裁定）：基线内容只登记、绝不自动发，
+            // 但要进历史缓冲——用户连上之后按快捷键主动发它，正是
+            // 手动模式的意义。自动模式不种：基线之前的旧内容不许
+            // 借「多条同步」溜出去（重连不重推旧内容的规矩不破）。
+            if self.clipboard_sync_mode() == "manual" {
+                g.note_history(content);
+            }
         }
         log::log_verbose(
             "clipboard",
@@ -2596,19 +2969,51 @@ impl Node {
         }
         let Some(content) = read.content else { return };
         let hash = content.hash();
-        {
+        let decision = {
             let mut g = self.clip_guard.lock().await;
-            match g.poll_decide(&content) {
-                ClipPollDecision::Unchanged => return, // 没变化
-                ClipPollDecision::SyncEcho => {
-                    // 同步写入本机的内容（含系统格式转换后的形态）：
-                    // 基线已在裁决里推进，绝不回发（#16 防回环核心）
-                    drop(g);
-                    log::log_verbose("clipboard", "剪贴板监视：读到的是同步写入的内容，不回发");
-                    return;
-                }
-                ClipPollDecision::Send => {}
+            let d = g.poll_decide(&content);
+            if matches!(d, ClipPollDecision::Send) {
+                // 本机新复制：先记进历史缓冲（自动多条与手动触发共用，
+                // 只存内存、退出即清，绝不落盘）
+                g.note_history(content.clone());
             }
+            d
+        };
+        match decision {
+            ClipPollDecision::Unchanged => return, // 没变化
+            ClipPollDecision::SyncEcho => {
+                // 同步写入本机的内容（含系统格式转换后的形态）：
+                // 基线已在裁决里推进，绝不回发（#16 防回环核心）
+                log::log_verbose("clipboard", "剪贴板监视：读到的是同步写入的内容，不回发");
+                return;
+            }
+            ClipPollDecision::Send => {}
+        }
+        // 手动模式：只观察不发送——推进基线（不进发送登记，还没发
+        // 出去），内容已在历史缓冲里攒着，等快捷键/按钮触发。
+        if self.clipboard_sync_mode() == "manual" {
+            let mut g = self.clip_guard.lock().await;
+            g.note_observed(hash);
+            drop(g);
+            log::log_verbose(
+                "clipboard",
+                "剪贴板监视（手动模式）：新内容已攒入待同步，未发送",
+            );
+            return;
+        }
+        // 自动模式且条数 >1：最新 N 条按时间正序整批发出。N=1 走下方
+        // 既有单条路径，行为与旧版完全一致（含图片出站延后 #18）。
+        let count = self.clipboard_sync_count();
+        if count > 1 {
+            let items = {
+                let g = self.clip_guard.lock().await;
+                g.history_latest(count)
+            };
+            let sent = self.send_clip_contents(session, items).await;
+            if sent > 0 {
+                log::log_line("clipboard", &format!("剪贴板同步：已发送最新 {sent} 条"));
+            }
+            return;
         }
         match content {
             ClipContent::Text(text) => {
@@ -6256,6 +6661,136 @@ mod clip_state_tests {
         let fresh = ClipContent::Text("全新内容".into());
         assert!(matches!(g.poll_decide(&fresh), ClipPollDecision::Send));
         assert!(matches!(g.apply_decide(&fresh), ClipApplyDecision::Proceed));
+    }
+}
+
+#[cfg(test)]
+mod clip_bounded_and_batch_tests {
+    use super::*;
+
+    /// 任务一核心机制：带截止的调用——快闭包拿到结果，慢闭包在
+    /// 预算内返回 None（降级），绝不陪它等完。
+    #[test]
+    fn 截止包装快慢两路() {
+        let fast = call_with_deadline(std::time::Duration::from_millis(500), || 42);
+        assert_eq!(fast, Some(42));
+        let start = std::time::Instant::now();
+        let slow = call_with_deadline(std::time::Duration::from_millis(100), || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            7
+        });
+        assert_eq!(slow, None, "超时必须降级为 None");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "降级必须在预算量级内返回，不能陪慢闭包等完"
+        );
+    }
+
+    /// 任务一锁审计：锁被长时间持有时，带截止的获取等满即放弃；
+    /// 锁空闲时立即拿到。
+    #[test]
+    fn 带截止锁不无限排队() {
+        let m = std::sync::Mutex::new(1);
+        let free = lock_with_deadline(&m, std::time::Duration::from_millis(500));
+        assert!(free.is_some());
+        drop(free);
+        let _held = m.lock().unwrap();
+        let start = std::time::Instant::now();
+        let blocked = lock_with_deadline(&m, std::time::Duration::from_millis(100));
+        assert!(blocked.is_none(), "锁被占时等满截止必须放弃");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// 历史缓冲：相邻同内容不重复记、超容挤最旧、取最新 N 条为
+    /// 时间正序（旧→新）。
+    #[test]
+    fn 历史缓冲去重限容与正序() {
+        let mut g = ClipGuard::default();
+        let a = ClipContent::Text("甲".into());
+        g.note_history(a.clone());
+        g.note_history(a.clone()); // 相邻重复：不记第二遍
+        assert_eq!(g.history.len(), 1);
+        for i in 0..12 {
+            g.note_history(ClipContent::Text(format!("条目{i}")));
+        }
+        assert_eq!(g.history.len(), CLIP_HISTORY_CAP, "超容必须挤最旧");
+        let latest3 = g.history_latest(3);
+        assert_eq!(latest3.len(), 3);
+        assert_eq!(latest3[0], ClipContent::Text("条目9".into()));
+        assert_eq!(latest3[2], ClipContent::Text("条目11".into()));
+        assert_eq!(g.history_latest(99).len(), CLIP_HISTORY_CAP);
+    }
+
+    /// 多条整批回声抑制：对方按序应用 3 条后，单槽 applied 只剩
+    /// 最后一条——整批账必须让前两条在 poll 与 apply 两侧都被认出。
+    #[test]
+    fn 整批应用后每条都被回声抑制覆盖() {
+        let mut b = ClipGuard::default();
+        let items: Vec<ClipContent> = (0..3)
+            .map(|i| ClipContent::Text(format!("第{i}条")))
+            .collect();
+        for it in &items {
+            assert!(matches!(b.apply_decide(it), ClipApplyDecision::Proceed));
+            b.note_applied(it.clone(), Some(it.hash()));
+        }
+        // poll 侧：剪贴板若停在整批中任何一条（含已被挤出单槽的），
+        // 都必须判同步回声、绝不回发
+        for it in &items {
+            assert!(
+                matches!(b.poll_decide(it), ClipPollDecision::SyncEcho),
+                "整批中的 {} 未被 poll 侧回声抑制覆盖",
+                it.hash()
+            );
+        }
+        // apply 侧：整批中任何一条被回传，都判本机已有、不重复写
+        for it in &items {
+            assert!(
+                matches!(b.apply_decide(it), ClipApplyDecision::AlreadyLocal),
+                "整批中的 {} 未被 apply 侧覆盖",
+                it.hash()
+            );
+        }
+    }
+
+    /// 手动模式观察登记：推进基线（再读判无变化）但绝不进发送
+    /// 登记——没发出去的内容若被对方传回，必须照常判 Proceed。
+    #[test]
+    fn 手动观察只推进基线不冒充已发送() {
+        let mut g = ClipGuard::default();
+        let c = ClipContent::Text("手动攒着的内容".into());
+        assert!(matches!(g.poll_decide(&c), ClipPollDecision::Send));
+        g.note_observed(c.hash());
+        assert!(matches!(g.poll_decide(&c), ClipPollDecision::Unchanged));
+        assert!(g.sent.is_empty(), "没发出去不许进发送登记");
+        // 对方若传回同一内容：因基线相同判「本机已有」（不重复写），
+        // 但绝不能是 EchoDrop——那是发送登记命中，观察登记不许冒充。
+        assert!(matches!(
+            g.apply_decide(&c),
+            ClipApplyDecision::AlreadyLocal
+        ));
+    }
+
+    /// 设置回落口径：条数只认 1/2/3/5、方式只认 manual，其余回落
+    /// 默认（auto / 1 条）；快捷键空值回落 Ctrl+Alt+V。
+    #[test]
+    fn 同步设置存取与非法回落() {
+        let base = std::env::temp_dir().join(format!("bl-clip-set-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let node = Node::new(&base, "测试机").expect("建节点");
+        assert_eq!(node.clipboard_sync_mode(), "auto");
+        assert_eq!(node.clipboard_sync_count(), 1);
+        assert_eq!(node.clipboard_sync_hotkey(), "Ctrl+Alt+V");
+        node.set_clipboard_sync_mode("manual").unwrap();
+        assert_eq!(node.clipboard_sync_mode(), "manual");
+        node.set_clipboard_sync_mode("乱填").unwrap();
+        assert_eq!(node.clipboard_sync_mode(), "auto", "非法方式必须回落 auto");
+        node.set_clipboard_sync_count(5).unwrap();
+        assert_eq!(node.clipboard_sync_count(), 5);
+        node.set_clipboard_sync_count(4).unwrap();
+        assert_eq!(node.clipboard_sync_count(), 1, "4 不在选项内，必须回落 1");
+        node.set_clipboard_sync_hotkey("Ctrl+Shift+P").unwrap();
+        assert_eq!(node.clipboard_sync_hotkey(), "Ctrl+Shift+P");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

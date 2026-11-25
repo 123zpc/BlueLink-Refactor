@@ -410,6 +410,34 @@
           <label class="switch"><input type="checkbox" id="clip-sync-toggle"><span class="switch-track"></span></label>
         </div>
         <div class="setting-row"><span>同步状态</span><span id="clip-sync-status" class="muted small">未开启</span></div>
+        <div class="setting-row">
+          <span>同步方式</span>
+          <span id="clip-mode-wrap">
+            <button id="clip-mode-btn" class="btn small-btn" type="button">自动 ▾</button>
+            <span id="clip-mode-menu" class="hidden"></span>
+          </span>
+        </div>
+        <p class="muted small" id="clip-mode-hint">自动：这边一复制，那边马上就能粘贴。</p>
+        <div class="setting-row">
+          <span>每次同步条数</span>
+          <span id="clip-count-wrap">
+            <button id="clip-count-btn" class="btn small-btn" type="button">最新 1 条 ▾</button>
+            <span id="clip-count-menu" class="hidden"></span>
+          </span>
+        </div>
+        <p class="muted small">条数是什么意思：比如选了「最新 2 条」，你最近复制的两段内容会按先后顺序发给对方，对方那边最后停在最新的一段；要是对方电脑开着 Windows 剪贴板历史（按 Win+V 能看），先发的那段也能在历史里找到。</p>
+        <div class="setting-row hidden" id="clip-hotkey-row">
+          <span>手动同步快捷键</span>
+          <span class="row-gap">
+            <input id="clip-hotkey-input" type="text" readonly value="Ctrl+Alt+V" title="点一下，再按下想用的组合键">
+            <button id="clip-hotkey-reset" class="btn small-btn" type="button">恢复默认</button>
+          </span>
+        </div>
+        <p class="muted small hidden" id="clip-hotkey-warn">快捷键没注册上，可能被其他程序占用了。换一个组合键，或者用下面的「立即同步一次」。</p>
+        <div class="setting-row">
+          <span>手动同步一次</span>
+          <button id="btn-clip-sync-now" class="btn small-btn" type="button">立即同步一次</button>
+        </div>
         <h3>存储</h3>
         <div class="setting-row"><span>聊天记录</span><span id="store-chat" class="muted small">-</span></div>
         <div class="setting-row"><span>接收文件</span><span id="store-files" class="muted small">-</span></div>

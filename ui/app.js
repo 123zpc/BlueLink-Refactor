@@ -2632,6 +2632,10 @@ document.addEventListener("click", (e) => {
   if (fmtMenu && !fmtMenu.classList.contains("hidden") && !fmtMenu.contains(e.target)) fmtMenu.classList.add("hidden");
   const srcMenu = $("ai-source-menu");
   if (srcMenu && !srcMenu.classList.contains("hidden") && !srcMenu.contains(e.target)) srcMenu.classList.add("hidden");
+  const clipModeMenu = $("clip-mode-menu");
+  if (clipModeMenu && !clipModeMenu.classList.contains("hidden") && !clipModeMenu.contains(e.target)) clipModeMenu.classList.add("hidden");
+  const clipCountMenu = $("clip-count-menu");
+  if (clipCountMenu && !clipCountMenu.classList.contains("hidden") && !clipCountMenu.contains(e.target)) clipCountMenu.classList.add("hidden");
 });
 
 // ---------- 聊天页右上角彩签（分类） ----------
@@ -3734,7 +3738,7 @@ document.addEventListener("focusin", (e) => {
   }
 });
 window.addEventListener("focus", () => {
-  if (document.querySelector("#modal:not(.hidden), #clear-modal:not(.hidden), #update-modal:not(.hidden), #viewer:not(.hidden), #file-menu:not(.hidden), #viewer-fmt-menu:not(.hidden), #ai-source-menu:not(.hidden)")) return;
+  if (document.querySelector("#modal:not(.hidden), #clear-modal:not(.hidden), #update-modal:not(.hidden), #viewer:not(.hidden), #file-menu:not(.hidden), #viewer-fmt-menu:not(.hidden), #ai-source-menu:not(.hidden), #clip-mode-menu:not(.hidden), #clip-count-menu:not(.hidden)")) return;
   const active = document.activeElement;
   if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
   if (lastOtherInputAt > lastComposerAt) return; // 失焦前最后停在别处控件
@@ -3906,11 +3910,26 @@ function clipStatusText(v) {
   if (!v.peer) return "对方未开启";
   return "已同步";
 }
+const CLIP_MODE_LABEL = { auto: "自动", manual: "手动" };
+const CLIP_COUNT_LABEL = { 1: "最新 1 条", 2: "最新 2 条", 3: "最新 3 条", 5: "最新 5 条" };
+let clipView = { mode: "auto", count: 1, hotkey: "Ctrl+Alt+V" };
 async function loadClipboardSync() {
   try {
     const v = await invoke("get_clipboard_sync");
+    clipView = v;
     $("clip-sync-toggle").checked = !!v.local;
     $("clip-sync-status").textContent = clipStatusText(v);
+    $("clip-mode-btn").textContent = `${CLIP_MODE_LABEL[v.mode] || "自动"} ▾`;
+    $("clip-count-btn").textContent = `${CLIP_COUNT_LABEL[v.count] || CLIP_COUNT_LABEL[1]} ▾`;
+    const manual = v.mode === "manual";
+    $("clip-hotkey-row").classList.toggle("hidden", !manual);
+    $("clip-mode-hint").textContent = manual
+      ? "手动：复制的东西先攒着，按快捷键（或点下面的「立即同步一次」）才发给对方。"
+      : "自动：这边一复制，那边马上就能粘贴。";
+    // 快捷键未生效提示：手动方式且同步已开、但这个组合键没注册上
+    $("clip-hotkey-warn").classList.toggle("hidden", !(manual && v.local && !v.hotkey_registered));
+    const hk = $("clip-hotkey-input");
+    if (document.activeElement !== hk) hk.value = v.hotkey || "Ctrl+Alt+V";
   } catch (_) { /* 忽略 */ }
 }
 let lastStorageStats = null; // 上次统计结果：进设置页先画它，不让用户对着旧占位干等
@@ -4027,6 +4046,116 @@ $("clip-sync-toggle").addEventListener("change", async (e) => {
   await invoke("set_clipboard_sync", { on: e.target.checked });
   showToast(e.target.checked ? "剪贴板同步已开启（对方也开启后生效）" : "剪贴板同步已关闭");
   loadClipboardSync();
+});
+// ---------- 剪贴板同步方式/条数自绘下拉（与默认AI 来源同款实现：
+// 按钮 + 应用内菜单，✓ 标当前项，Esc/上下键导航，选完焦点还给按钮） ----------
+function setupMenuDropdown(btnId, menuId, options, getCurrent, onPick) {
+  const btn = $(btnId), menu = $(menuId);
+  const close = () => menu.classList.add("hidden");
+  const open = () => {
+    menu.innerHTML = "";
+    const cur = getCurrent();
+    for (const [v, label] of options) {
+      const b = document.createElement("button");
+      b.textContent = (String(cur) === String(v) ? "✓ " : "") + label;
+      b.addEventListener("click", async () => {
+        close();
+        btn.focus();
+        await onPick(v);
+      });
+      menu.appendChild(b);
+    }
+    menu.onkeydown = (e) => {
+      const items = [...menu.querySelectorAll("button")];
+      const i = items.indexOf(document.activeElement);
+      if (e.key === "Escape") { e.preventDefault(); close(); btn.focus(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); (items[i + 1] || items[0]).focus(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); (items[i - 1] || items[items.length - 1]).focus(); }
+    };
+    menu.classList.remove("hidden");
+    const curBtn = [...menu.querySelectorAll("button")].find((b) => b.textContent.startsWith("✓ "));
+    (curBtn || menu.querySelector("button")).focus();
+  };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (menu.classList.contains("hidden")) open(); else close();
+  });
+}
+setupMenuDropdown("clip-mode-btn", "clip-mode-menu",
+  [["auto", "自动"], ["manual", "手动"]],
+  () => clipView.mode,
+  async (v) => {
+    await invoke("set_clipboard_sync_mode", { mode: v }).catch(() => {});
+    showToast(v === "manual" ? "已改成手动同步：复制的东西先攒着，按快捷键才发给对方" : "已改成自动同步：复制了马上发给对方");
+    loadClipboardSync();
+  });
+setupMenuDropdown("clip-count-btn", "clip-count-menu",
+  [[1, "最新 1 条"], [2, "最新 2 条"], [3, "最新 3 条"], [5, "最新 5 条"]],
+  () => clipView.count,
+  async (v) => {
+    await invoke("set_clipboard_sync_count", { count: v }).catch(() => {});
+    showToast(`每次同步条数已设为：最新 ${v} 条`);
+    loadClipboardSync();
+  });
+// ---------- 手动同步快捷键录制：点中输入框后按下组合键即录入
+// （必须带 Ctrl/Alt/Super 至少一个，不然会跟平时打字冲突）；
+// Esc 取消，录完即保存，后端随即重新注册。 ----------
+let clipHotkeyRecording = false;
+const clipHotkeyInput = $("clip-hotkey-input");
+clipHotkeyInput.addEventListener("focus", () => {
+  clipHotkeyRecording = true;
+  clipHotkeyInput.classList.add("recording");
+  clipHotkeyInput.value = "请按下组合键…";
+});
+clipHotkeyInput.addEventListener("blur", () => {
+  clipHotkeyRecording = false;
+  clipHotkeyInput.classList.remove("recording");
+  loadClipboardSync();
+});
+clipHotkeyInput.addEventListener("keydown", async (e) => {
+  if (!clipHotkeyRecording) return;
+  e.preventDefault();
+  if (e.key === "Escape") { clipHotkeyInput.blur(); return; }
+  if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) return; // 只按了修饰键，等主键
+  if (!e.ctrlKey && !e.altKey && !e.metaKey) {
+    showToast("快捷键要带上 Ctrl 或 Alt 一起按，不然会跟平时打字冲突");
+    return;
+  }
+  const parts = [];
+  if (e.ctrlKey) parts.push("Ctrl");
+  if (e.altKey) parts.push("Alt");
+  if (e.shiftKey) parts.push("Shift");
+  if (e.metaKey) parts.push("Super");
+  let key = e.key;
+  if (key === " ") key = "Space";
+  else if (key.length === 1) key = key.toUpperCase();
+  parts.push(key);
+  const combo = parts.join("+");
+  try {
+    await invoke("set_clipboard_sync_hotkey", { hotkey: combo });
+    showToast(`手动同步快捷键已设为 ${combo}`);
+  } catch (err) { showToast(String(err)); }
+  clipHotkeyInput.blur();
+});
+$("clip-hotkey-reset").addEventListener("click", async () => {
+  try {
+    await invoke("set_clipboard_sync_hotkey", { hotkey: "Ctrl+Alt+V" });
+    showToast("快捷键已恢复默认：Ctrl+Alt+V");
+  } catch (err) { showToast(String(err)); }
+  loadClipboardSync();
+});
+// ---------- 立即同步一次（按钮与全局快捷键共用结果口径） ----------
+function clipManualResultToast(v) {
+  if (!v) return;
+  if (v.kind === "sent") showToast(v.count > 1 ? `已把最近 ${v.count} 条同步给对方` : "已同步给对方");
+  else if (v.kind === "not_connected") showToast("还没连接设备，先连上再同步");
+  else if (v.kind === "local_off") showToast("本机剪贴板同步还没开启");
+  else if (v.kind === "peer_off") showToast("对方还没开启剪贴板同步");
+  else if (v.kind === "empty") showToast("还没有可同步的内容，先复制点东西");
+}
+$("btn-clip-sync-now").addEventListener("click", async () => {
+  try { clipManualResultToast(await invoke("sync_clipboard_now")); }
+  catch (e) { showToast("同步失败：" + e); }
 });
 $("local-api-toggle").addEventListener("change", async (e) => {
   await invoke("set_local_api", { enabled: e.target.checked, key: null });
@@ -4381,6 +4510,13 @@ async function wireEvents() {
     const v = e.payload || {};
     $("clip-sync-toggle").checked = !!v.local;
     $("clip-sync-status").textContent = clipStatusText(v);
+  });
+  // 全局快捷键触发的手动同步结果：与按钮同一套人话提示
+  await listen("clipboard_manual_result", (e) => clipManualResultToast(e.payload));
+  // 快捷键注册失败（被其他程序占用）：弹提示 + 刷新设置页未生效标记
+  await listen("clipboard_hotkey_error", (e) => {
+    showToast(String(e.payload || "快捷键注册失败"));
+    loadClipboardSync();
   });
   await listen("reconnect_state", (e) => {
     const v = e.payload || {};

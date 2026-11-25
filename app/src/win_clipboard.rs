@@ -135,7 +135,17 @@ pub fn get_file_list() -> Result<Vec<String>, String> {
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     const CF_HDROP_ID: u32 = 15;
     unsafe {
-        OpenClipboard(None).map_err(|e| format!("打开剪贴板失败：{e}"))?;
+        // 打开失败多半是剪贴板被其他程序占用：粘贴路径按「没有文件
+        // 对象」降级（前端转走文字粘贴），不把占用当成平台不支持
+        // 报给用户；留 essential 日志定责。总时长另有命令层 500ms
+        // 截止兜底（GetClipboardData 遇延迟渲染所有者无响应会阻塞）。
+        if OpenClipboard(None).is_err() {
+            bluelink_services::log_line(
+                "clipboard",
+                "粘贴读取剪贴板文件列表降级：剪贴板被占用打不开，按没有文件处理（文字粘贴不受影响）",
+            );
+            return Ok(Vec::new());
+        }
         let result = (|| -> Result<Vec<String>, String> {
             let handle = match GetClipboardData(CF_HDROP_ID) {
                 Ok(h) => h,
@@ -161,11 +171,16 @@ pub fn get_file_list() -> Result<Vec<String>, String> {
 
 /// Linux 读取：尽力而为——经 xclip 读 text/uri-list（文件管理器复制文件
 /// 时都会提供这个目标）；没有 xclip 时返回 UNSUPPORTED。
+/// xclip 在选择所有者无响应时会无限阻塞：等待带 500ms 截止，超时
+/// 杀掉子进程并按「没有文件对象」降级 + 留痕，绝不拖住粘贴。
 #[cfg(target_os = "linux")]
 pub fn get_file_list() -> Result<Vec<String>, String> {
-    let out = std::process::Command::new("xclip")
+    use std::io::Read as _;
+    let mut child = std::process::Command::new("xclip")
         .args(["-selection", "clipboard", "-t", "text/uri-list", "-o"])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "UNSUPPORTED: 未找到 xclip，无法读取剪贴板文件列表".to_string()
@@ -173,7 +188,33 @@ pub fn get_file_list() -> Result<Vec<String>, String> {
                 format!("读取剪贴板失败：{e}")
             }
         })?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let exited = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(format!("读取剪贴板失败：{e}")),
+        }
+    };
+    if !exited {
+        bluelink_services::log_line(
+            "clipboard",
+            "粘贴读取剪贴板文件列表降级：xclip 500ms 内无响应（剪贴板所有者无响应），按没有文件处理",
+        );
+        return Ok(Vec::new());
+    }
+    let mut buf = Vec::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_end(&mut buf);
+    }
+    let text = String::from_utf8_lossy(&buf);
     let mut paths = Vec::new();
     for line in text.lines() {
         let line = line.trim();
