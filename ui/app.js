@@ -357,10 +357,17 @@ function paintTransferState(b, rec, replay) {
       if (cap) { cap.classList.remove("hidden"); cap.textContent = "校验中"; }
     } else if (tstate === "done") {
       if (mid) attachImagePhoto(b, mid);
-      setTimeout(() => {
+      // ⑥ v1.0.2：回放时同步隐藏、不用 400ms 延时（旧版回放也走延时，
+      // 整页重渲染时所有已完成气泡先露进度条再消失、齐闪一下）
+      if (replay) {
         if (strip) strip.classList.add("hidden");
         if (cap) cap.classList.add("hidden");
-      }, 400);
+      } else {
+        setTimeout(() => {
+          if (strip) strip.classList.add("hidden");
+          if (cap) cap.classList.add("hidden");
+        }, 400);
+      }
     } else if (tstate === "verify_failed") {
       if (strip) strip.classList.add("hidden");
       if (cap) cap.classList.add("hidden");
@@ -385,10 +392,16 @@ function paintTransferState(b, rec, replay) {
     }
     const fname = b.querySelector(".file-name");
     if (mid && fname && isImageExt(fileExt(fname.textContent || ""))) attachImagePreview(b, mid);
-    setTimeout(() => {
+    // ⑥ v1.0.2：回放时同步隐藏、不用 400ms 延时
+    if (replay) {
       if (bar) bar.classList.add("hidden");
       if (meta) meta.classList.add("hidden");
-    }, 400);
+    } else {
+      setTimeout(() => {
+        if (bar) bar.classList.add("hidden");
+        if (meta) meta.classList.add("hidden");
+      }, 400);
+    }
   } else if (tstate === "verifying") {
     if (bar) bar.classList.remove("hidden");
     if (meta) {
@@ -444,9 +457,12 @@ function buildMessageEl(m, opts = {}) {
     });
     // #2 回放：气泡迟建（分页补页/整页重渲染）时按权威账补画
     // 进度与终态——事件比气泡先到也不丢、全部落定
+    // ⑥ v1.0.2：已终态（TRANSFER_TERMINAL）回放不再画进度、直接落定——
+    // 旧版无条件先画进度再由终态 400ms 后隐藏，连接成功整页重渲染时
+    // 本次运行所有已完成气泡齐闪一下进度条。进行中/校验中照旧画进度。
     const trec = transferRecordOf(m.id);
     if (trec) {
-      if (trec.total) paintTransferProgress(bubble, trec);
+      if (trec.total && !TRANSFER_TERMINAL.includes(trec.state)) paintTransferProgress(bubble, trec);
       if (trec.state) paintTransferState(bubble, trec, true);
     }
     bubble.querySelector(".transfer-retry").addEventListener("click", async () => {
@@ -2614,6 +2630,8 @@ document.addEventListener("click", (e) => {
   if (menu && !menu.classList.contains("hidden") && !menu.contains(e.target)) menu.classList.add("hidden");
   const fmtMenu = $("viewer-fmt-menu");
   if (fmtMenu && !fmtMenu.classList.contains("hidden") && !fmtMenu.contains(e.target)) fmtMenu.classList.add("hidden");
+  const srcMenu = $("ai-source-menu");
+  if (srcMenu && !srcMenu.classList.contains("hidden") && !srcMenu.contains(e.target)) srcMenu.classList.add("hidden");
 });
 
 // ---------- 聊天页右上角彩签（分类） ----------
@@ -2950,29 +2968,14 @@ function openAiChipMenu(chip, conv, x, y) {
     b.addEventListener("click", async () => {
       if (label === "清空聊天记录") {
         if (state.aiGenerating) {
-          // 被生成状态打断时撤销已武装的确认（评审补强）：否则生成
-          // 结束后的下一次点击会跳过两步确认直接清空
-          delete b.dataset.armed;
-          b.textContent = label;
           showToast("AI 正在生成中，请稍候");
           return;
         }
-        // 两步确认（同删除口径）：第一下变确认文案，第二下才真清
-        if (!b.dataset.armed) {
-          b.dataset.armed = "1";
-          b.textContent = "确认清空？（会话保留）";
-          return;
-        }
+        // v1.0.2 ④：与设置页范围清空复用同一对话框（会话模式 + 同一
+        // 「同时删除相关文件」勾选），口径一致；对话框 + 通用二次确认
+        // 本就是两步确认，不再另做菜单内两步武装。
         menu.classList.add("hidden");
-        try {
-          const n = await invoke("clear_ai_conversation_messages", { conversationId: conv.id });
-          if (state.aiConvId === conv.id) {
-            state.renderedAi.clear();
-            await loadAiMessages();
-            refreshPinBar();
-          }
-          showToast(`已清空 ${n} 条聊天记录`);
-        } catch (e) { showToast("清空失败：" + e); }
+        openClearModal({ kind: "conversation", convId: conv.id, title: conv.title || "AI 会话" });
         return;
       }
       if (label === "删除会话") {
@@ -3406,8 +3409,7 @@ async function updateAiState() {
     state.aiLocalModel = cfg.model || "";
     const src = await invoke("get_ai_source").catch(() => "auto");
     state.aiSource = src;
-    const sel = $("ai-source");
-    if (sel && document.activeElement !== sel) sel.value = src;
+    paintAiSource(src);
     const peerLabel = state.peerName || "对方设备";
     const aiStateText =
       src === "local"
@@ -3424,9 +3426,57 @@ async function updateAiState() {
     $("ai-state").title = aiStateText;
   } catch (_) { /* 忽略 */ }
 }
-$("ai-source").addEventListener("change", async (e) => {
-  await invoke("set_ai_source", { source: e.target.value }).catch(() => {});
-  updateAiState();
+// ---------- 默认AI 来源自绘下拉（v1.0.2 ③）：与查看器「格式化 ▾」
+// 同款实现（按钮 + 应用内菜单，不用原生 select——展开列表由 Windows
+// 系统绘制、样式管不到，用户实报丑）。选项与旧 select 一致：自动 /
+// 本机AI / 对方设备AI；当前项菜单里打 ✓。
+const AI_SOURCE_LABEL = { auto: "自动", local: "本机AI", peer: "对方设备AI" };
+function paintAiSource(src) {
+  const btn = $("ai-source-btn");
+  if (btn) btn.textContent = `${AI_SOURCE_LABEL[src] || AI_SOURCE_LABEL.auto} ▾`;
+}
+function closeAiSourceMenu() { $("ai-source-menu").classList.add("hidden"); }
+function openAiSourceMenu() {
+  const menu = $("ai-source-menu");
+  menu.innerHTML = "";
+  for (const [v, label] of Object.entries(AI_SOURCE_LABEL)) {
+    const b = document.createElement("button");
+    b.textContent = (state.aiSource === v ? "✓ " : "") + label;
+    b.addEventListener("click", async () => {
+      closeAiSourceMenu();
+      $("ai-source-btn").focus(); // 选完焦点还给按钮（第三方评审）
+      await invoke("set_ai_source", { source: v }).catch(() => {});
+      updateAiState();
+    });
+    menu.appendChild(b);
+  }
+  // 键盘导航（第三方评审：原生 select 有的方向键/Esc，自绘菜单不能丢）：
+  // Esc 关闭并回按钮，上下键在选项间移动。onkeydown 直接赋值，避免
+  // 每次打开重复挂监听。
+  menu.onkeydown = (e) => {
+    const items = [...menu.querySelectorAll("button")];
+    const i = items.indexOf(document.activeElement);
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeAiSourceMenu();
+      $("ai-source-btn").focus();
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      (items[i + 1] || items[0]).focus();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      (items[i - 1] || items[items.length - 1]).focus();
+    }
+  };
+  menu.classList.remove("hidden");
+  // 打开时焦点落在当前项，键盘用户不用先 Tab 进来。
+  const cur = [...menu.querySelectorAll("button")].find((b) => b.textContent.startsWith("✓ "));
+  (cur || menu.querySelector("button")).focus();
+}
+$("ai-source-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  if ($("ai-source-menu").classList.contains("hidden")) openAiSourceMenu();
+  else closeAiSourceMenu();
 });
 
 // ---------- 聊天框 @AI ----------
@@ -3612,6 +3662,87 @@ $("btn-ai-send").addEventListener("click", sendAi);
 $("ai-input").addEventListener("keydown", (e) => {
   if (e.isComposing || e.keyCode === 229) return;
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendAi(); }
+});
+// ① AI 输入框 Ctrl+V 粘贴文件（v1.0.2）：接聊天框同条剪贴板读取链
+// （clipboard_file_list 优先——资源管理器里复制的文件只有这条路能拿到）。
+// 文件按 AI 文本附件规则校验入队（stageAiFilePaths：文本类、单件与合计
+// 512KB、最多 5 个，超限/类型不符逐个 toast）；粘贴图片不走
+// clipboard_take_image 回落（那是聊天图片附件的路），明确提示 AI 附件
+// 只收文本文件。普通文字默认粘贴进框，不拦截。另：Linux 的 WebKitGTK
+// 不向页面暴露图片项，图片粘贴会落进「无文件对象」分支，彼处再以
+// clipboard_has_image 补判（只查存在性，不落盘），否则图片会被静默忽略。
+$("ai-input").addEventListener("paste", async (e) => {
+  const cd = e.clipboardData;
+  if (!cd) return;
+  const text = cd.getData("text/plain") || "";
+  const fileItems = Array.from(cd.items || []).filter((i) => i.kind === "file");
+  // 普通文字默认粘贴；但文字与文件同时在剪贴板时，文件不静默丢——
+  // 明确提示（第三方评审：旧版直接 return，文件无声消失）。
+  if (text.trim()) {
+    if (fileItems.length) showToast("已粘贴文字，文件未加入 AI 附件，请用附件按钮添加");
+    return;
+  }
+  if (!fileItems.length && !(cd.files && cd.files.length)) {
+    // 既无文字也无文件对象：WebKitGTK 可能什么都不暴露，仍向后端问
+    // 一次文件列表；文件路线落空时再问一次剪贴板有无图片——Linux 下
+    // 图片项根本不进 DataTransfer，不补这一问，粘贴图片会被静默忽略，
+    // 违背「明确提示 AI 附件只收文本」；空剪贴板则静默返回，不提示。
+    e.preventDefault();
+    let paths = null;
+    try { paths = await invoke("clipboard_file_list"); } catch (_) { paths = null; }
+    if (paths && paths.length) { await stageAiFilePaths(paths); return; }
+    try {
+      if (await invoke("clipboard_has_image")) {
+        showToast("AI 附件只收文本文件，图片不能作为 AI 附件");
+      }
+    } catch (_) { /* 探测失败按空剪贴板处理，不打扰 */ }
+    return;
+  }
+  e.preventDefault();
+  let paths = null;
+  try { paths = await invoke("clipboard_file_list"); } catch (_) { paths = null; }
+  if (paths && paths.length) { await stageAiFilePaths(paths); return; }
+  const img = fileItems.find((i) => i.type.startsWith("image/"));
+  if (img) {
+    showToast("AI 附件只收文本文件，图片不能作为 AI 附件");
+    return;
+  }
+  if (fileItems.length || (cd.files && cd.files.length)) {
+    showToast(paths === null ? "此系统暂未支持粘贴文件，请用附件按钮选择" : "未能读取粘贴的文件，已忽略");
+  }
+});
+
+// ---------- ⑦ 窗口重获焦点时把焦点还给输入框（v1.0.2） ----------
+// 病根：最小化时 WebView2 把键盘焦点从输入框摘掉、落到页面空白处；
+// 恢复时后端只做了窗口级 show+set_focus，前端没有任何还焦点逻辑。
+// 口径：只记主输入框（聊天 #input / AI #ai-input）；失焦前最后停在
+// 别处控件（改名框、设置字段等）时不抢——那些是瞬态控件，焦点还回去
+// 可能撞上它们自己的关闭/校验流程。有对话框/菜单/查看器打开时不抢；
+// 焦点已经在某个输入处时不抢。没记录或记录的输入框不在当前页时，按
+// 当前页回落到主输入框（聊天页→#input、AI 页→#ai-input）。
+let lastComposerId = null; // 最后聚焦的主输入框 id（"input" | "ai-input"）
+let lastComposerAt = 0;
+let lastOtherInputAt = 0; // 最后一次聚焦别处控件的时间戳（判定先后用）
+document.addEventListener("focusin", (e) => {
+  const t = e.target;
+  if (!t || (t.tagName !== "INPUT" && t.tagName !== "TEXTAREA")) return;
+  if (t.id === "input" || t.id === "ai-input") {
+    lastComposerId = t.id;
+    lastComposerAt = Date.now();
+  } else {
+    lastOtherInputAt = Date.now();
+  }
+});
+window.addEventListener("focus", () => {
+  if (document.querySelector("#modal:not(.hidden), #clear-modal:not(.hidden), #update-modal:not(.hidden), #viewer:not(.hidden), #file-menu:not(.hidden), #viewer-fmt-menu:not(.hidden), #ai-source-menu:not(.hidden)")) return;
+  const active = document.activeElement;
+  if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
+  if (lastOtherInputAt > lastComposerAt) return; // 失焦前最后停在别处控件
+  let el = lastComposerId ? $(lastComposerId) : null;
+  if (!el || el.offsetParent === null) {
+    el = state.view === "ai" ? $("ai-input") : state.view === "chat" ? $("input") : null;
+  }
+  if (el && el.offsetParent !== null) el.focus();
 });
 $("btn-ai-stop").addEventListener("click", () => invoke("ai_stop"));
 // ⑥ AI 页「回到最新」：上滑后出现，点按回底并恢复跟随
@@ -3830,6 +3961,13 @@ $("store-dir-change").addEventListener("click", async () => {
     if (!path) return;
     const eff = await invoke("set_download_dir", { path });
     showToast("保存目录已改为：" + eff);
+    // ⑤ v1.0.2：改完立即同步两处显示与身份缓存——旧版只刷了存储区
+    // 的 loadStorageStats()，本机信息卡的 #set-dl 要切页重进设置页
+    // 跑 loadSettings() 才更新（用户实报）。
+    if (state.identity) state.identity.download_dir = eff;
+    $("set-dl").textContent = eff;
+    $("store-dir").textContent = eff;
+    $("store-dir").title = eff;
     loadStorageStats();
   } catch (e) { showToast("更改保存目录失败：" + e); }
 });
@@ -3837,6 +3975,11 @@ $("store-dir-reset").addEventListener("click", async () => {
   try {
     const eff = await invoke("set_download_dir", { path: null });
     showToast("保存目录已恢复默认：" + eff);
+    // ⑤ v1.0.2：同上，恢复默认也要同步两处显示与身份缓存。
+    if (state.identity) state.identity.download_dir = eff;
+    $("set-dl").textContent = eff;
+    $("store-dir").textContent = eff;
+    $("store-dir").title = eff;
     loadStorageStats();
   } catch (e) { showToast("恢复默认失败：" + e); }
 });
@@ -3918,13 +4061,38 @@ $("btn-clean-cache").addEventListener("click", async () => {
 });
 // #14 清空聊天记录可选范围（v2.6.5）：先选范围（近 24 小时/近 7 天/
 // 近 30 天/全部），再二次确认；后端只删范围内的消息及其彩签/收藏/
-// 置顶标记，范围外一条不动；磁盘上的文件本体不删（与旧全清口径一致）。
+// 置顶标记，范围外一条不动。
+// v1.0.2 ④：对话框加独立勾选「同时删除相关文件」（默认不勾；勾上才删，
+// 且只删所选范围内消息关联的、位于应用下载目录里的实体文件——后端
+// 命令带 deleteFiles 参数执行，前端只传开关）；单会话清空（AI 会话
+// 菜单的「清空聊天记录」）复用同一对话框（会话模式），口径一致。
 const CLEAR_RANGES = {
   "24h": "近 24 小时",
   "7d": "近 7 天",
   "30d": "近 30 天",
   "all": "全部时间",
 };
+let clearMode = { kind: "range" }; // 或 { kind: "conversation", convId, title }
+/** 打开清空对话框：range=设置页按范围清；conversation=只清指定 AI 会话。
+ * 勾选每次打开都复位为不勾（默认不删文件，用户每回显式决定）。 */
+function openClearModal(mode) {
+  clearMode = mode;
+  const conv = mode.kind === "conversation";
+  $("clear-title").textContent = conv ? `清空「${mode.title}」的聊天记录` : "清空聊天记录";
+  $("clear-desc").textContent = conv
+    ? "只清除本会话的消息，会话本身保留。此操作不可恢复。"
+    : "只清除所选范围内的消息，范围外的记录不动。此操作不可恢复。";
+  document.querySelector("#clear-modal .clear-range-list").classList.toggle("hidden", conv);
+  $("clear-conv-go").classList.toggle("hidden", !conv);
+  $("clear-delete-files").checked = false;
+  $("clear-modal").classList.remove("hidden");
+}
+/** 二次确认文案里的删文件说明（按当前模式写清作用域）。 */
+function clearFilesSuffix() {
+  if (!$("clear-delete-files").checked) return "";
+  const scope = clearMode.kind === "conversation" ? "本会话消息关联的" : "所选范围内消息关联的";
+  return `已勾选「同时删除相关文件」：${scope}、应用下载目录里的文件也会一并删除，目录外的文件不受影响。`;
+}
 $("btn-clear-history").addEventListener("click", () => {
   // 流式进行中不许清（第三方评审采纳）：清完重拉会把正在写的流式
   // 气泡从文档上摘掉，后续分片写进脱离文档的节点、状态错乱
@@ -3932,7 +4100,7 @@ $("btn-clear-history").addEventListener("click", () => {
     showToast("AI 正在回复中，请等回复完成后再清空");
     return;
   }
-  $("clear-modal").classList.remove("hidden");
+  openClearModal({ kind: "range" });
 });
 $("clear-cancel").addEventListener("click", () => $("clear-modal").classList.add("hidden"));
 $("clear-modal").addEventListener("click", (e) => {
@@ -3941,15 +4109,17 @@ $("clear-modal").addEventListener("click", (e) => {
 document.querySelectorAll("#clear-modal .clear-range").forEach((b) => {
   b.addEventListener("click", async () => {
     const range = b.dataset.range;
+    const deleteFiles = $("clear-delete-files").checked;
     $("clear-modal").classList.add("hidden");
     const ok = await showConfirm(
-      `确定要清空${CLEAR_RANGES[range]}的聊天记录吗？范围内的消息、彩签归属、收藏与置顶都会一并清除，范围外的记录不受影响，此操作不可恢复。`,
+      `确定要清空${CLEAR_RANGES[range]}的聊天记录吗？范围内的消息、彩签归属、收藏与置顶都会一并清除，范围外的记录不受影响，此操作不可恢复。${clearFilesSuffix()}`,
       "清空"
     );
     if (!ok) return;
     try {
-      const n = await invoke("clear_chat_history", { range });
-      $("store-result").textContent = `已清空 ${n} 条聊天记录（${CLEAR_RANGES[range]}）`;
+      const r = await invoke("clear_chat_history", { range, deleteFiles });
+      const filesNote = r.files_deleted ? `，并删除 ${r.files_deleted} 个相关文件` : "";
+      $("store-result").textContent = `已清空 ${r.messages} 条聊天记录（${CLEAR_RANGES[range]}）${filesNote}`;
       // 列表按当前会话重新拉取（范围清理后旧渲染集必然过期）
       state.renderedChat.clear();
       state.renderedAi.clear();
@@ -3957,9 +4127,37 @@ document.querySelectorAll("#clear-modal .clear-range").forEach((b) => {
       await loadAiMessages();
       refreshRibbon();
       loadStorageStats();
-      showToast(`已清空 ${n} 条聊天记录`);
+      showToast(`已清空 ${r.messages} 条聊天记录${filesNote}`);
     } catch (e) { showToast("清空失败：" + e); }
   });
+});
+// 会话模式：只清指定 AI 会话（菜单入口复用同一对话框与同一勾选）
+$("clear-conv-go").addEventListener("click", async () => {
+  if (clearMode.kind !== "conversation") return;
+  // 与菜单入口同一守卫：执行瞬间仍在生成就拦下（清完重拉会把正在写的
+  // 流式气泡从文档上摘掉；旧版菜单两步武装在第二下时复查，本处等效）
+  if (state.aiGenerating || chatAiBusy || state.streamEl) {
+    showToast("AI 正在回复中，请等回复完成后再清空");
+    return;
+  }
+  const { convId } = clearMode;
+  const deleteFiles = $("clear-delete-files").checked;
+  $("clear-modal").classList.add("hidden");
+  const ok = await showConfirm(
+    `确定要清空「${clearMode.title}」的聊天记录吗？本会话的消息、彩签归属、收藏与置顶都会一并清除，会话本身保留，此操作不可恢复。${clearFilesSuffix()}`,
+    "清空"
+  );
+  if (!ok) return;
+  try {
+    const r = await invoke("clear_ai_conversation_messages", { conversationId: convId, deleteFiles });
+    const filesNote = r.files_deleted ? `，并删除 ${r.files_deleted} 个相关文件` : "";
+    if (state.aiConvId === convId) {
+      state.renderedAi.clear();
+      await loadAiMessages();
+      refreshPinBar();
+    }
+    showToast(`已清空 ${r.messages} 条聊天记录${filesNote}`);
+  } catch (e) { showToast("清空失败：" + e); }
 });
 
 // ---------- 导出 ----------
@@ -4728,10 +4926,20 @@ function buildGroupBubble(bubble, m, row) {
     }
   });
   // #2 回放：组气泡迟建时按 groupProgress 记账补画聚合进度与终态
+  // ⑥ v1.0.2：图组同病同修——全员已终态时不画聚合进度，终态用 replay
+  // 口径同步落定（不闪「已完成」、不等 400ms）；仍有成员在飞时照旧
+  // 画聚合进度（终态成员的已传字节已在账里，合计口径不变）。
   const gp0 = state.groupProgress[m.id];
   if (gp0) {
-    for (const [mid2, v] of gp0.members) updateGroupProgress(m.id, mid2, v.received, v.total, bubble);
-    for (const [mid2, st] of gp0.states) updateGroupTransferState(m.id, mid2, st, bubble);
+    // 全员已终态才跳过聚合进度：须 states 与 members 一一对应（第三方
+    // 评审：旧版只看 states 全终态，某成员有进度、无状态事件时会被漏画）。
+    const allTerminal = gp0.members.size > 0
+      && gp0.states.size === gp0.members.size
+      && [...gp0.states.values()].every((s) => TRANSFER_TERMINAL.includes(s));
+    for (const [mid2, v] of gp0.members) {
+      if (!allTerminal) updateGroupProgress(m.id, mid2, v.received, v.total, bubble);
+    }
+    for (const [mid2, st] of gp0.states) updateGroupTransferState(m.id, mid2, st, bubble, true);
   }
   bubble.querySelector(".transfer-retry").addEventListener("click", async () => {
     try {
@@ -4774,7 +4982,7 @@ function updateGroupProgress(gid, memberMsgId, received, total, bEl) {
   const cancel = b.querySelector(".progress-cancel");
   if (cancel && r < t) cancel.classList.remove("hidden");
 }
-function updateGroupTransferState(gid, memberMsgId, tstate, bEl) {
+function updateGroupTransferState(gid, memberMsgId, tstate, bEl, replay) {
   const gp = groupProg(gid);
   gp.states.set(memberMsgId, tstate);
   const b = bEl || groupBubbleOf(gid);
@@ -4790,11 +4998,18 @@ function updateGroupTransferState(gid, memberMsgId, tstate, bEl) {
     let done = 0;
     for (const s of gp.states.values()) if (s === "done") done++;
     if (done >= total) {
-      if (meta) { meta.classList.remove("hidden"); meta.textContent = "已完成"; }
-      setTimeout(() => {
+      // ⑥ v1.0.2：回放时同步落定（不闪「已完成」、不等 400ms）；
+      // 实时事件路径保留「已完成」一闪而过的反馈。
+      if (replay) {
         if (bar) bar.classList.add("hidden");
         if (meta) meta.classList.add("hidden");
-      }, 400);
+      } else {
+        if (meta) { meta.classList.remove("hidden"); meta.textContent = "已完成"; }
+        setTimeout(() => {
+          if (bar) bar.classList.add("hidden");
+          if (meta) meta.classList.add("hidden");
+        }, 400);
+      }
     } else if (meta) {
       meta.classList.remove("hidden");
       meta.textContent = `已完成 ${done} / ${total} 张`;

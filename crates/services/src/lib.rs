@@ -434,6 +434,18 @@ pub fn clipboard_image_png() -> Result<Option<Vec<u8>>, ServiceError> {
     Ok(Some(buf.into_inner()))
 }
 
+/// 剪贴板里是否有图片（只查存在性，不解码、不编码、不落盘）：供 AI 框
+/// 粘贴图片时补判。旧命令曾复用 clipboard_image_png 的完整 PNG 编码，
+/// 只为判存在性白白编一次大图（第三方评审）；这里只读一次 get_image
+/// 的成败，图大也不编码。
+pub fn clipboard_has_image() -> Result<bool, ServiceError> {
+    let mut cb = match arboard::Clipboard::new() {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
+    };
+    Ok(cb.get_image().is_ok())
+}
+
 /// 当前分片压缩算法名（发送完成日志用；与协议层压缩标志对应）。
 const COMPRESSION_LABEL: &str = "zstd";
 /// zstd 压缩级别：3 级是速度/压缩率的平衡点（空中带宽才是瓶颈，
@@ -3886,11 +3898,20 @@ impl Node {
         Ok(())
     }
 
-    /// 按范围清空聊天记录（v2.6.5，#14）：range = "24h" | "7d" | "30d"
-    /// | "all"。只清范围内的消息，范围外不动；附件口径见 storage
-    /// clear_messages_range 的注释（只清记录、不删接收目录实体文件）。
-    /// 返回实际删除条数供界面如实反馈。
-    pub fn clear_chat_history_range(&self, range: &str) -> Result<u64, ServiceError> {
+    /// 按范围清空聊天记录（v2.6.5，#14；v1.0.2 ④ 加删文件选项）：range
+    /// = "24h" | "7d" | "30d" | "all"。只清范围内的消息，范围外不动。
+    /// delete_files=true 时，先按托管边界删磁盘文件、再清消息记录：
+    /// 只删范围内消息关联的、位于应用托管边界内的实体文件——数据目录
+    /// （默认下载目录的父目录，含 downloads/ 与 ai-att/）或当前下载
+    /// 目录内；数据目录外的用户自有文件绝不碰（与改名功能的托管边界
+    /// 同口径，并多认当前下载目录——用户改过保存目录后收到的文件也
+    /// 在托管内）。同一份文件记录若还被范围外的消息引用，跳过不删。
+    /// 返回（删除消息条数，删除文件个数）。
+    pub fn clear_chat_history_range(
+        &self,
+        range: &str,
+        delete_files: bool,
+    ) -> Result<(u64, u64), ServiceError> {
         let now = now_ms();
         let cutoff = match range {
             "all" => None,
@@ -3899,12 +3920,170 @@ impl Node {
             "30d" => Some(now - 30 * 24 * 3600 * 1000),
             other => return Err(ServiceError::Other(format!("未知的清理范围：{other}"))),
         };
+        let deleted_files = if delete_files {
+            self.delete_files_in_range(cutoff)?
+        } else {
+            0
+        };
         let n = self.storage.clear_messages_range(cutoff)?;
         log::log_line(
             "storage",
-            &format!("已按范围清空聊天记录（范围 {range}，共删除 {n} 条消息）"),
+            &format!(
+                "已按范围清空聊天记录（范围 {range}，共删除 {n} 条消息，相关文件 {deleted_files} 个）"
+            ),
         );
-        Ok(n)
+        Ok((n, deleted_files))
+    }
+
+    /// 托管边界（v1.0.2 ④）：数据目录与当前下载目录，规范化后去重。
+    /// 收到文件、AI 附件副本、暂存文档都在数据目录内；用户改过保存
+    /// 目录后，当前下载目录也可能在数据目录外，两处都认。
+    fn managed_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.download_dir()];
+        // 数据目录（默认下载目录的父目录）也认；但父目录若是文件系统根
+        // （如 "/" 或盘符根），starts_with 恒真等于无边界，直接跳过
+        // （第三方评审：default_download_dir 为 "/x" 时 parent 是 "/"）。
+        if let Some(parent) = self
+            .default_download_dir
+            .parent()
+            .filter(|p| p.parent().is_some())
+        {
+            roots.push(parent.to_path_buf());
+        }
+        let mut canon: Vec<PathBuf> = roots
+            .into_iter()
+            .map(|p| {
+                std::fs::canonicalize(&p).unwrap_or_else(|_| {
+                    // 目录不存在时按词法规范化（去掉 . 与多余分隔符）
+                    let mut out = PathBuf::new();
+                    for c in p.components() {
+                        use std::path::Component;
+                        match c {
+                            Component::CurDir => {}
+                            Component::ParentDir => {
+                                out.pop();
+                            }
+                            other => out.push(other.as_os_str()),
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+        canon.sort();
+        canon.dedup();
+        canon
+    }
+
+    /// 路径是否在托管边界内（v1.0.2 ④）：存在的文件规范化后比对；
+    /// 已不在磁盘的按词法绝对路径比对（记录路径失效时仍按边界判定）。
+    fn path_is_managed(&self, path: &str, roots: &[PathBuf]) -> bool {
+        let p = PathBuf::from(path);
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        };
+        let norm = std::fs::canonicalize(&abs).unwrap_or(abs);
+        roots.iter().any(|r| norm.starts_with(r))
+    }
+
+    /// 删范围内的关联文件（v1.0.2 ④）：先收集候选、逐项过托管边界与
+    /// 范围外引用检查，磁盘删完再回删记录；边界外、被范围外消息引用、
+    /// 磁盘删除失败的一律跳过（只记日志，不让单文件失败拖垮整次清理）。
+    /// 返回实际删除的文件个数。
+    fn delete_files_in_range(&self, cutoff_ms: Option<i64>) -> Result<u64, ServiceError> {
+        let roots = self.managed_roots();
+        let cands = self.storage.clear_file_candidates_range(cutoff_ms)?;
+        let mut file_ids = Vec::new();
+        let mut ai_att_files: Vec<(String, String)> = Vec::new();
+        let mut deleted = 0u64;
+        // 同一份文件可能被两条消息引用（直发 + 图片组各挂一次），
+        // 候选里会出现两次——只删、只计一次，不虚增 toast 里的个数。
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (fid, path, mid) in &cands {
+            if !self.path_is_managed(path, &roots) {
+                continue;
+            }
+            if let Some(id) = fid {
+                if !seen.insert(id.as_str()) {
+                    continue;
+                }
+                if self.storage.file_referenced_outside_range(id, cutoff_ms)? {
+                    continue;
+                }
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    log::log_line(
+                        "storage",
+                        &format!("清理相关文件失败（已跳过）：{path} {e}"),
+                    );
+                    continue;
+                }
+            }
+            deleted += 1;
+            if let Some(id) = fid {
+                file_ids.push(id.clone());
+            } else {
+                // AI 附件按 (message_id, path) 回删（第三方评审）：只登记
+                // 磁盘确已删除的那一份，同消息其他附件的登记行不受影响。
+                ai_att_files.push((mid.clone(), path.clone()));
+            }
+        }
+        self.storage
+            .delete_cleared_files(&file_ids, &ai_att_files)?;
+        Ok(deleted)
+    }
+
+    /// 删单会话内的关联文件（v1.0.2 ④）：口径与范围版一致，作用域改为
+    /// 整个会话（不分时间）。返回实际删除的文件个数。
+    fn delete_files_in_conversation(&self, conv_id: &str) -> Result<u64, ServiceError> {
+        let roots = self.managed_roots();
+        let cands = self.storage.clear_file_candidates_conversation(conv_id)?;
+        let mut file_ids = Vec::new();
+        let mut ai_att_files: Vec<(String, String)> = Vec::new();
+        let mut deleted = 0u64;
+        // 同上：同一 file_id 在候选里出现多次时只删、只计一次。
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (fid, path, mid) in &cands {
+            if !self.path_is_managed(path, &roots) {
+                continue;
+            }
+            if let Some(id) = fid {
+                if !seen.insert(id.as_str()) {
+                    continue;
+                }
+                if self
+                    .storage
+                    .file_referenced_outside_conversation(id, conv_id)?
+                {
+                    continue;
+                }
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    log::log_line(
+                        "storage",
+                        &format!("清理相关文件失败（已跳过）：{path} {e}"),
+                    );
+                    continue;
+                }
+            }
+            deleted += 1;
+            if let Some(id) = fid {
+                file_ids.push(id.clone());
+            } else {
+                ai_att_files.push((mid.clone(), path.clone()));
+            }
+        }
+        self.storage
+            .delete_cleared_files(&file_ids, &ai_att_files)?;
+        Ok(deleted)
     }
 
     /// #8（v2.6.6）：查看器内手动改名——用户给出的文件名+后缀即该
@@ -4257,10 +4436,17 @@ impl Node {
         Ok(())
     }
 
-    /// 清空一条 AI 会话的全部聊天记录（v2.6.6，#10②）：会话保留、
-    /// 只清消息。默认会话「AI 助手」**放行**——这是它唯一允许的编辑
-    /// 操作（不可删/不可改名/不可移动，记录可清）。
-    pub fn clear_ai_conversation_messages(&self, conv_id: &str) -> Result<u64, ServiceError> {
+    /// 清空一条 AI 会话的全部聊天记录（v2.6.6，#10②；v1.0.2 ④ 加删
+    /// 文件选项，与设置页范围清空同口径）：会话保留、只清消息。默认会
+    /// 话「AI 助手」**放行**——这是它唯一允许的编辑操作（不可删/不可
+    /// 改名/不可移动，记录可清）。delete_files=true 时连同本会话消息
+    /// 关联的托管边界内实体文件（主要是 ai-att/ 下的附件副本）一并删除。
+    /// 返回（删除消息条数，删除文件个数）。
+    pub fn clear_ai_conversation_messages(
+        &self,
+        conv_id: &str,
+        delete_files: bool,
+    ) -> Result<(u64, u64), ServiceError> {
         let conv = self
             .storage
             .list_conversations()?
@@ -4270,12 +4456,20 @@ impl Node {
         if conv.kind != ConversationKind::Ai {
             return Err(ServiceError::Other("只能清空 AI 会话的记录".into()));
         }
+        let deleted_files = if delete_files {
+            self.delete_files_in_conversation(conv_id)?
+        } else {
+            0
+        };
         let n = self.storage.clear_conversation_messages(conv_id)?;
         log::log_line(
             "ai",
-            &format!("已清空 AI 会话「{}」的聊天记录 {n} 条", conv.title),
+            &format!(
+                "已清空 AI 会话「{}」的聊天记录 {n} 条，相关文件 {deleted_files} 个",
+                conv.title
+            ),
         );
-        Ok(n)
+        Ok((n, deleted_files))
     }
 
     /// ㉕ 解析 AI 页当前打开的会话：前端传了就校验必须是已存在的 Ai
@@ -5480,6 +5674,347 @@ mod group_save_tests {
             "data-2",
             "序号与内容对应组内顺序"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod clear_files_tests {
+    use super::*;
+
+    fn temp_node(name: &str) -> (Arc<Node>, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("bl-clear-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let node = Node::new(&base, name).expect("建节点");
+        (node, base)
+    }
+
+    fn add_file_msg(node: &Node, conv: &str, mid: &str, fid: &str, path: &Path, created_at: i64) {
+        node.storage
+            .save_file(&FileMeta {
+                id: fid.to_string(),
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                size: 4,
+                sha256: String::new(),
+                path: path.to_string_lossy().to_string(),
+                mime: None,
+            })
+            .unwrap();
+        node.storage
+            .insert_message(&Message {
+                id: mid.to_string(),
+                conversation_id: conv.to_string(),
+                sender: Sender::Peer,
+                kind: MessageKind::File,
+                body: "文件.txt".to_string(),
+                file_id: Some(fid.to_string()),
+                reply_to: None,
+                status: MessageStatus::Received,
+                created_at,
+                seq: 0,
+            })
+            .unwrap();
+    }
+
+    fn add_conv(node: &Node, id: &str, kind: ConversationKind) {
+        node.storage
+            .create_conversation(&Conversation {
+                id: id.to_string(),
+                kind,
+                peer_device_id: None,
+                title: "会话".to_string(),
+                draft: String::new(),
+                last_read_id: None,
+                created_at: 0,
+            })
+            .unwrap();
+    }
+
+    /// ④ 范围清空 + 删文件：下载目录内的删磁盘+删记录，数据目录外的
+    /// 用户文件不动，范围外的消息及其文件不动；不勾删文件时磁盘全不动。
+    #[test]
+    fn 范围清空删文件只动托管内且只动范围内() {
+        let (node, base) = temp_node("范围");
+        let dl = node.download_dir();
+        std::fs::create_dir_all(&dl).unwrap();
+        // 数据目录外的用户文件（与 base 同级、另一棵树）
+        let outside = std::env::temp_dir().join(format!("bl-clear-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("用户自有.txt");
+        std::fs::write(&outside_file, "别碰我").unwrap();
+        add_conv(&node, "c1", ConversationKind::Peer);
+        let now = now_ms();
+        // 范围内（近 24h）：托管内文件 + 目录外文件各一
+        let in_file = dl.join("在内.txt");
+        std::fs::write(&in_file, "删我").unwrap();
+        add_file_msg(&node, "c1", "m-in", "f-in", &in_file, now);
+        add_file_msg(&node, "c1", "m-out", "f-out", &outside_file, now);
+        // 范围外（30 天前）：托管内文件，应保留
+        let old_file = dl.join("旧文件.txt");
+        std::fs::write(&old_file, "留我").unwrap();
+        add_file_msg(
+            &node,
+            "c1",
+            "m-old",
+            "f-old",
+            &old_file,
+            now - 30 * 24 * 3600 * 1000,
+        );
+        // 不勾：只清记录、不动磁盘
+        let (n, f) = node.clear_chat_history_range("24h", false).unwrap();
+        assert_eq!((n, f), (2, 0));
+        assert!(in_file.exists(), "不勾删文件时磁盘文件必须保留");
+        // 勾上：范围内的托管内文件删、目录外文件留、范围外文件留
+        // 注意：上一轮已把 m-in/m-out 的消息删掉，需重建一轮再测勾选
+        add_file_msg(&node, "c1", "m-in2", "f-in", &in_file, now);
+        add_file_msg(&node, "c1", "m-out2", "f-out", &outside_file, now);
+        let (n, f) = node.clear_chat_history_range("24h", true).unwrap();
+        assert_eq!((n, f), (2, 1), "只删 1 个托管内文件");
+        assert!(!in_file.exists(), "托管内文件应已删除");
+        assert!(outside_file.exists(), "数据目录外的用户文件绝不碰");
+        assert!(old_file.exists(), "范围外的文件不动");
+        assert!(
+            node.storage.get_file("f-in").unwrap().is_none(),
+            "已删文件的记录应回删"
+        );
+        assert!(
+            node.storage.get_file("f-out").unwrap().is_some(),
+            "未删文件的记录保留"
+        );
+        assert!(
+            node.storage.get_file("f-old").unwrap().is_some(),
+            "范围外文件的记录保留"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    fn add_group_msg(
+        node: &Node,
+        conv: &str,
+        mid: &str,
+        items: &[(String, String)],
+        shared_fid: &str,
+        created_at: i64,
+    ) {
+        // items: (file_id, msg_id)；shared_fid 非空时追加为最后一项。
+        let mut arr: Vec<serde_json::Value> = items
+            .iter()
+            .enumerate()
+            .map(|(idx, (fid, mid2))| {
+                serde_json::json!({"msg_id": mid2, "file_id": fid, "name": "图.png", "size": 2, "sha256": "", "idx": idx})
+            })
+            .collect();
+        if !shared_fid.is_empty() {
+            let idx = arr.len();
+            arr.push(serde_json::json!({"msg_id": format!("{mid}-shared"), "file_id": shared_fid, "name": "共享.png", "size": 2, "sha256": "", "idx": idx}));
+        }
+        let body = serde_json::json!({"v": 1, "items": arr}).to_string();
+        node.storage
+            .insert_message(&Message {
+                id: mid.to_string(),
+                conversation_id: conv.to_string(),
+                sender: Sender::Peer,
+                kind: MessageKind::ImageGroup,
+                body,
+                file_id: None,
+                reply_to: None,
+                status: MessageStatus::Received,
+                created_at,
+                seq: 0,
+            })
+            .unwrap();
+    }
+
+    /// ④ 图片组补漏：组消息 file_id 为 NULL，图在 body JSON 的 items
+    /// 里——范围清空勾选删文件时整组图都要删；范围外组里的图、
+    /// 被范围外组共享的图不动（守卫同样要认组 JSON 里的引用）。
+    #[test]
+    fn 范围清空删文件含图片组() {
+        let (node, base) = temp_node("图片组");
+        let dl = node.download_dir();
+        std::fs::create_dir_all(&dl).unwrap();
+        add_conv(&node, "c1", ConversationKind::Peer);
+        let now = now_ms();
+        let mut items: Vec<(String, String)> = Vec::new();
+        for i in 0..4 {
+            let p = dl.join(format!("g{i}.png"));
+            std::fs::write(&p, "图").unwrap();
+            let fid = format!("gf-{i}");
+            node.storage
+                .save_file(&FileMeta {
+                    id: fid.clone(),
+                    name: format!("g{i}.png"),
+                    size: 2,
+                    sha256: String::new(),
+                    path: p.to_string_lossy().to_string(),
+                    mime: None,
+                })
+                .unwrap();
+            items.push((fid, format!("gm-{i}")));
+        }
+        let shared = dl.join("共享.png");
+        std::fs::write(&shared, "共享").unwrap();
+        node.storage
+            .save_file(&FileMeta {
+                id: "gf-shared".to_string(),
+                name: "共享.png".to_string(),
+                size: 2,
+                sha256: String::new(),
+                path: shared.to_string_lossy().to_string(),
+                mime: None,
+            })
+            .unwrap();
+        // 范围内的组（含 4 张图 + 共享图）；范围外的组（30 天前）同样挂着共享图
+        add_group_msg(&node, "c1", "g-now", &items, "gf-shared", now);
+        add_group_msg(
+            &node,
+            "c1",
+            "g-old",
+            &[],
+            "gf-shared",
+            now - 30 * 24 * 3600 * 1000,
+        );
+        let (n, f) = node.clear_chat_history_range("24h", true).unwrap();
+        assert_eq!(
+            (n, f),
+            (1, 4),
+            "只删范围内组的 4 张图，共享图因范围外引用保留"
+        );
+        for i in 0..4 {
+            assert!(!dl.join(format!("g{i}.png")).exists(), "组内图应已删除");
+            assert!(
+                node.storage.get_file(&format!("gf-{i}")).unwrap().is_none(),
+                "组内图记录应回删"
+            );
+        }
+        assert!(shared.exists(), "被范围外组共享的图不动");
+        assert!(
+            node.storage.get_file("gf-shared").unwrap().is_some(),
+            "共享图记录保留"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ④ 单会话清空 + 删文件：AI 会话的 ai-att 副本（数据目录内）
+    /// 随清空删除；另一会话的附件不动。
+    #[test]
+    fn 单会话清空删文件只动本会话附件() {
+        let (node, base) = temp_node("单会话");
+        add_conv(&node, "ai-1", ConversationKind::Ai);
+        add_conv(&node, "ai-2", ConversationKind::Ai);
+        for (conv, mid) in [("ai-1", "am-1"), ("ai-2", "am-2")] {
+            node.storage
+                .insert_message(&Message {
+                    id: mid.to_string(),
+                    conversation_id: conv.to_string(),
+                    sender: Sender::Me,
+                    kind: MessageKind::Text,
+                    body: "问题".to_string(),
+                    file_id: None,
+                    reply_to: None,
+                    status: MessageStatus::Sent,
+                    created_at: now_ms(),
+                    seq: 0,
+                })
+                .unwrap();
+            let dir = base.join("ai-att").join(mid);
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("附件.txt");
+            std::fs::write(&p, "附件内容").unwrap();
+            node.storage
+                .insert_ai_attachment(mid, "附件.txt", 12, &p.to_string_lossy())
+                .unwrap();
+        }
+        let (n, f) = node.clear_ai_conversation_messages("ai-1", true).unwrap();
+        assert_eq!((n, f), (1, 1));
+        assert!(
+            !base.join("ai-att").join("am-1").join("附件.txt").exists(),
+            "本会话附件副本应删除"
+        );
+        assert!(
+            base.join("ai-att").join("am-2").join("附件.txt").exists(),
+            "另一会话附件不动"
+        );
+        assert_eq!(
+            node.storage.list_ai_attachments("am-1").unwrap().len(),
+            0,
+            "已删附件的登记行应回删"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ④ 回归（第三方评审，严重）：「全部」清空 + 删文件曾几乎一个文件
+    /// 都删不掉——范围外引用守卫在 cutoff=None 时恒真。修后守卫直接
+    /// 返回 false（全部消息都会被删，不存在范围外引用）。
+    #[test]
+    fn 全部清空删文件不再被守卫挡住() {
+        let (node, base) = temp_node("全部");
+        let dl = node.download_dir();
+        std::fs::create_dir_all(&dl).unwrap();
+        add_conv(&node, "c1", ConversationKind::Peer);
+        let now = now_ms();
+        let f1 = dl.join("全1.txt");
+        let f2 = dl.join("全2.txt");
+        std::fs::write(&f1, "一").unwrap();
+        std::fs::write(&f2, "二").unwrap();
+        add_file_msg(&node, "c1", "m-1", "f-1", &f1, now);
+        add_file_msg(&node, "c1", "m-2", "f-2", &f2, now);
+        let (n, f) = node.clear_chat_history_range("all", true).unwrap();
+        assert_eq!((n, f), (2, 2), "全部清空应删掉两个托管内文件");
+        assert!(!f1.exists() && !f2.exists(), "磁盘文件应已删除");
+        assert!(node.storage.get_file("f-1").unwrap().is_none());
+        assert!(node.storage.get_file("f-2").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ④ 回归（第三方评审，严重）：一条消息挂两个 AI 附件，其中一个
+    /// 磁盘删除失败时，登记行须按 (message_id, path) 精确回删——旧版
+    /// 按 message_id 整行删会把失败那个附件的登记行也删掉，留下孤儿文件。
+    /// 用「附件路径是个目录」模拟删除失败（remove_file 删不动目录）。
+    #[test]
+    fn 同消息多附件其一删失败时登记行按路径回删() {
+        let (node, base) = temp_node("多附件");
+        add_conv(&node, "ai-1", ConversationKind::Ai);
+        node.storage
+            .insert_message(&Message {
+                id: "am-1".to_string(),
+                conversation_id: "ai-1".to_string(),
+                sender: Sender::Me,
+                kind: MessageKind::Text,
+                body: "问题".to_string(),
+                file_id: None,
+                reply_to: None,
+                status: MessageStatus::Sent,
+                created_at: now_ms(),
+                seq: 0,
+            })
+            .unwrap();
+        let dir = base.join("ai-att").join("am-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("好附件.txt");
+        std::fs::write(&good, "附件内容").unwrap();
+        let bad = dir.join("坏目录");
+        std::fs::create_dir_all(&bad).unwrap();
+        node.storage
+            .insert_ai_attachment("am-1", "好附件.txt", 12, &good.to_string_lossy())
+            .unwrap();
+        node.storage
+            .insert_ai_attachment("am-1", "坏目录", 0, &bad.to_string_lossy())
+            .unwrap();
+        let (n, f) = node.clear_ai_conversation_messages("ai-1", true).unwrap();
+        assert_eq!((n, f), (1, 1), "只计一次成功删除");
+        assert!(!good.exists(), "能删的附件应删除");
+        assert!(bad.exists(), "删不动的目录原样保留");
+        let left = node.storage.list_ai_attachments("am-1").unwrap();
+        assert_eq!(left.len(), 1, "只回删成功那份的登记行");
+        assert_eq!(left[0].path, bad.to_string_lossy(), "失败附件的登记行保留");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

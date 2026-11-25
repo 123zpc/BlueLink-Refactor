@@ -748,6 +748,212 @@ impl Storage {
         Ok(deleted)
     }
 
+    /// 「同时删除相关文件」的候选（v1.0.2 ④）：范围/会话内消息关联的
+    /// 实体文件——(a) 消息 file_id 指向的 files 记录；(b) 该消息的 AI
+    /// 附件副本（ai_attachments 行，file_id 为空，路径在数据目录
+    /// ai-att/ 下）；(c) 图片组消息 body JSON 的 items 里的 file_id
+    /// （组消息本身 file_id 为 NULL，只查 (a) 会把整组漏掉）。
+    /// 返回 (files.id 或 None, 磁盘路径, 消息 id)。只做收集、不删磁盘、
+    /// 不删记录：托管边界过滤与落盘删除在 services 层做，删完再调
+    /// delete_cleared_files 回删记录。
+    pub fn clear_file_candidates_range(
+        &self,
+        cutoff_ms: Option<i64>,
+    ) -> Result<Vec<(Option<String>, String, String)>, StorageError> {
+        let conn = self.lock();
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT m.file_id, f.path, m.id FROM messages m JOIN files f ON f.id = m.file_id
+             WHERE (?1 IS NULL OR m.created_at >= ?1) AND f.path <> ''",
+        )?;
+        let rows = stmt.query_map(params![cutoff_ms], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        out.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        let mut stmt = conn.prepare(
+            "SELECT a.path, a.message_id FROM ai_attachments a JOIN messages m ON m.id = a.message_id
+             WHERE (?1 IS NULL OR m.created_at >= ?1) AND a.path <> ''",
+        )?;
+        let rows = stmt.query_map(params![cutoff_ms], |r| {
+            Ok((None, r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        out.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        // (c) 图片组：组消息 file_id 为 NULL，图的 file_id 在 body JSON 里。
+        let mut stmt = conn.prepare(
+            "SELECT body, id FROM messages
+             WHERE kind = 'imagegroup' AND (?1 IS NULL OR created_at >= ?1)",
+        )?;
+        let rows = stmt.query_map(params![cutoff_ms], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (body, mid) = row?;
+            Self::push_group_items(&conn, &body, &mid, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// 解析一条图片组消息的 body，把 items 里的 file_id 解析成候选
+    /// （路径查 files 表；体脏或无此记录时跳过该项，不报错、不拖垮整次清理）。
+    fn push_group_items(
+        conn: &Connection,
+        body: &str,
+        mid: &str,
+        out: &mut Vec<(Option<String>, String, String)>,
+    ) -> Result<(), StorageError> {
+        let v: serde_json::Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let Some(items) = v.get("items").and_then(|i| i.as_array()) else {
+            return Ok(());
+        };
+        for it in items {
+            let Some(fid) = it.get("file_id").and_then(|f| f.as_str()) else {
+                continue;
+            };
+            let path: String = match conn.query_row(
+                "SELECT path FROM files WHERE id = ?1 AND path <> ''",
+                params![fid],
+                |r| r.get(0),
+            ) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            out.push((Some(fid.to_string()), path, mid.to_string()));
+        }
+        Ok(())
+    }
+
+    /// 同上，会话口径（AI 会话菜单的单会话清空用）。
+    pub fn clear_file_candidates_conversation(
+        &self,
+        conv_id: &str,
+    ) -> Result<Vec<(Option<String>, String, String)>, StorageError> {
+        let conn = self.lock();
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT m.file_id, f.path, m.id FROM messages m JOIN files f ON f.id = m.file_id
+             WHERE m.conversation_id = ?1 AND f.path <> ''",
+        )?;
+        let rows = stmt.query_map(params![conv_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        out.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        let mut stmt = conn.prepare(
+            "SELECT a.path, a.message_id FROM ai_attachments a JOIN messages m ON m.id = a.message_id
+             WHERE m.conversation_id = ?1 AND a.path <> ''",
+        )?;
+        let rows = stmt.query_map(params![conv_id], |r| {
+            Ok((None, r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        out.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        // (c) 图片组：与范围版同理，作用域改为本会话。
+        let mut stmt = conn.prepare(
+            "SELECT body, id FROM messages
+             WHERE kind = 'imagegroup' AND conversation_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![conv_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (body, mid) = row?;
+            Self::push_group_items(&conn, &body, &mid, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// 回删已从磁盘删除的文件记录与对应消息的 AI 附件行（v1.0.2 ④）。
+    /// 只删调用方确认已落盘删除的条目——磁盘删不动/边界外的记录原样保留。
+    /// AI 附件按 (message_id, path) 精确删：一条消息可挂多个附件，旧版
+    /// 按 message_id 整行删会把同消息里磁盘未删成功的附件登记行也删掉，
+    /// 留下磁盘有文件、库里无登记的孤儿文件（第三方评审，严重）。
+    pub fn delete_cleared_files(
+        &self,
+        file_ids: &[String],
+        ai_attachments: &[(String, String)],
+    ) -> Result<(), StorageError> {
+        let conn = self.lock();
+        for id in file_ids {
+            conn.execute("DELETE FROM files WHERE id = ?1", params![id])?;
+        }
+        for (mid, path) in ai_attachments {
+            conn.execute(
+                "DELETE FROM ai_attachments WHERE message_id = ?1 AND path = ?2",
+                params![mid, path],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 指定文件是否仍被范围外的消息引用（v1.0.2 ④）：同一份 files 记录
+    /// 若还挂在一条不会被本次清理删掉的消息上，磁盘文件不许删。
+    /// 图片组 JSON 里的引用同样算引用（file_id 只在 body 里，不在
+    /// messages.file_id 列；UUID 不含 LIKE 通配符，可直接拼进模式串）。
+    pub fn file_referenced_outside_range(
+        &self,
+        file_id: &str,
+        cutoff_ms: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        // 「全部」没有范围外：所有消息都会被本次清理删掉，守卫恒为 false。
+        // （第三方评审，严重：旧实现在 cutoff=None 时 (?2 IS NULL OR …)
+        // 恒真，导致「全部+删文件」几乎一个文件都删不掉。）
+        if cutoff_ms.is_none() {
+            return Ok(false);
+        }
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE file_id = ?1 AND (?2 IS NULL OR created_at < ?2)",
+            params![file_id, cutoff_ms],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            return Ok(true);
+        }
+        // 图片组引用按 JSON 字段精确匹配（第三方评审：旧版 LIKE 子串会把
+        // "name":"abc.png" 之类的正文也算成引用，该删的不删）。
+        let n2: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE kind = 'imagegroup'
+             AND body LIKE '%\"file_id\":\"' || ?1 || '\"%' AND (?2 IS NULL OR created_at < ?2)",
+            params![file_id, cutoff_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n2 > 0)
+    }
+
+    /// 同上，会话口径：文件是否仍被本会话外的消息引用。
+    pub fn file_referenced_outside_conversation(
+        &self,
+        file_id: &str,
+        conv_id: &str,
+    ) -> Result<bool, StorageError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE file_id = ?1 AND conversation_id <> ?2",
+            params![file_id, conv_id],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            return Ok(true);
+        }
+        // 图片组引用按 JSON 字段精确匹配（与范围版同口径，见上）。
+        let n2: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE kind = 'imagegroup'
+             AND body LIKE '%\"file_id\":\"' || ?1 || '\"%' AND conversation_id <> ?2",
+            params![file_id, conv_id],
+            |r| r.get(0),
+        )?;
+        Ok(n2 > 0)
+    }
+
     // 参数与 transfers 表字段一一对应，拆参数结构体反而更绕，这里豁免参数个数检查
     #[allow(clippy::too_many_arguments)]
     pub fn save_transfer(

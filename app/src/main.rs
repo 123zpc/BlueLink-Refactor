@@ -1209,15 +1209,21 @@ fn delete_ai_conversation(
 }
 
 /// v2.6.6 #10②：清空一条 AI 会话的聊天记录（默认会话唯一放行的编辑操作）。
+/// v1.0.2 ④：delete_files=true 时连同本会话关联的托管边界内实体文件一并删除。
 #[tauri::command]
 fn clear_ai_conversation_messages(
     state: State<'_, AppState>,
     conversation_id: String,
-) -> Result<u64, String> {
-    state
+    delete_files: Option<bool>,
+) -> Result<ClearHistoryResult, String> {
+    let (messages, files_deleted) = state
         .node
-        .clear_ai_conversation_messages(&conversation_id)
-        .map_err(|e| e.to_string())
+        .clear_ai_conversation_messages(&conversation_id, delete_files.unwrap_or(false))
+        .map_err(|e| e.to_string())?;
+    Ok(ClearHistoryResult {
+        messages,
+        files_deleted,
+    })
 }
 
 /// 确保默认会话「AI 助手」（ai-default）的行存在（v2.6.2 补）：它原先
@@ -1681,21 +1687,38 @@ async fn clean_cache(state: State<'_, AppState>) -> Result<u64, String> {
     Ok(state.node.clean_cache().await)
 }
 
+/// 清空聊天记录的结果（v1.0.2 ④）：消息条数与一并删除的文件个数。
+#[derive(Serialize)]
+struct ClearHistoryResult {
+    messages: u64,
+    files_deleted: u64,
+}
+
 #[tauri::command]
-fn clear_chat_history(state: State<'_, AppState>, range: Option<String>) -> Result<u64, String> {
+fn clear_chat_history(
+    state: State<'_, AppState>,
+    range: Option<String>,
+    delete_files: Option<bool>,
+) -> Result<ClearHistoryResult, String> {
     // #14：带范围参数走按范围清理（24h/7d/30d/all），缺省 = 全部（旧调用兼容）
-    match range {
+    // v1.0.2 ④：delete_files=true 时连同范围内消息关联的托管边界内
+    // 实体文件一并删除（后端执行，前端只传开关）。
+    let (messages, files_deleted) = match range {
         Some(r) => state
             .node
-            .clear_chat_history_range(&r)
-            .map_err(|e| e.to_string()),
+            .clear_chat_history_range(&r, delete_files.unwrap_or(false))
+            .map_err(|e| e.to_string())?,
         None => state
             .node
             // 缺省（旧调用）也走范围口径的「全部」，如实返回删除条数
             // （第三方评审采纳：旧实现硬编码返回 0，界面会误报）
-            .clear_chat_history_range("all")
-            .map_err(|e| e.to_string()),
-    }
+            .clear_chat_history_range("all", delete_files.unwrap_or(false))
+            .map_err(|e| e.to_string())?,
+    };
+    Ok(ClearHistoryResult {
+        messages,
+        files_deleted,
+    })
 }
 
 #[derive(Serialize)]
@@ -1842,6 +1865,17 @@ fn copy_file_to_clipboard(path: String) -> Result<(), String> {
 #[tauri::command]
 fn clipboard_file_list() -> Result<Vec<String>, String> {
     win_clipboard::get_file_list()
+}
+
+/// 剪贴板里是否有图片（只查存在性，不落盘、不返回数据）：AI 框粘贴
+/// 图片时，WebKitGTK 不向页面暴露图片项（DataTransfer 里什么都没有），
+/// 文件路线也落空，前端用它补判，给「只收文本」的明确提示；有图片才
+/// 返回 true，空剪贴板直接 false。只在既无文字又无文件对象时调用，
+/// 不影响正常粘贴路径。存在性由 services 的轻量检查完成（不走 PNG
+/// 编码，第三方评审）。
+#[tauri::command]
+fn clipboard_has_image() -> Result<bool, String> {
+    bluelink_services::clipboard_has_image().map_err(|e| e.to_string())
 }
 
 /// 待发附件的一条入队信息（路径 + 大小）。
@@ -2919,6 +2953,7 @@ fn main() {
             copy_file_to_clipboard,
             clipboard_file_list,
             clipboard_take_image,
+            clipboard_has_image,
             file_attach_info,
             stage_pasted_image,
             stage_text_document,

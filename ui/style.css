@@ -296,20 +296,20 @@ section { display: flex; flex-direction: column; height: 100%; }
 #btn-local-api::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
   background: var(--text-2); margin-right: 6px; vertical-align: 1px; }
 #btn-local-api.api-on::before { background: var(--ok); }
-/* 默认AI 来源下拉：与相邻 .btn.small-btn 同款（同高、同圆角/边框/底色、令牌色），
-   去掉原生控件外观与生硬边框，自带下拉箭头（明暗双主题各一份箭头色）。 */
+/* 默认AI 来源自绘下拉（v1.0.2 ③）：与查看器「格式化 ▾」同款实现——
+   按钮 + 应用内菜单，不用原生 select（展开列表由系统绘制、样式管不到）。
+   菜单与 #viewer-fmt-menu 同一套视觉令牌（面色/边框/圆角/阴影/条目悬停）。 */
 .ai-source-label { display: inline-flex; align-items: center; gap: 6px; }
-#ai-source { appearance: none; -webkit-appearance: none; height: 32px; padding: 0 26px 0 11px;
-  font-size: 12.5px; font-weight: 500; color: var(--text); background-color: var(--panel);
-  border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236B7280' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat; background-position: right 8px center; }
-#ai-source:hover { border-color: var(--border-strong); background-color: var(--panel-2); }
-/* v2.6.6 #12/#20 口径统一：下拉聚焦改柔影环，与查看器改名框同口径，
-   不再用 2px 硬 outline（与边框叠成双层粗框） */
-#ai-source:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-:root[data-theme="dark"] #ai-source { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239BA1A6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); }
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) #ai-source { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239BA1A6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); } }
+#ai-source-wrap { position: relative; display: inline-flex; flex: none; }
+#ai-source-btn { white-space: nowrap; }
+#ai-source-menu { position: absolute; right: 0; top: calc(100% + 6px); min-width: 132px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18); z-index: 5; padding: 4px; }
+#ai-source-menu.hidden { display: none; }
+#ai-source-menu button { display: block; width: 100%; text-align: left; padding: 7px 10px;
+  border: none; background: none; color: var(--text); font-size: 13px; border-radius: 6px;
+  cursor: pointer; white-space: nowrap; }
+#ai-source-menu button:hover { background: var(--hover); }
 .chat-title { font-size: 15.5px; font-weight: 600; line-height: 1.3; }
 #pin-bar, #ai-pin-bar { background: var(--panel); border-bottom: 1px solid var(--border); padding: 7px 16px;
   font-size: 12.5px; color: var(--text-2); cursor: pointer; display: flex; gap: 7px; align-items: center; }
@@ -1012,7 +1012,7 @@ section { display: flex; flex-direction: column; height: 100%; }
   object-fit: cover; border-radius: 8px; margin-bottom: 6px; cursor: pointer;
   background: var(--panel-2); }
 /* ㉚ 来源下拉收窄到内容宽度 */
-#ai-source { max-width: 118px; }
+#ai-source-btn { max-width: 118px; overflow: hidden; text-overflow: ellipsis; }
 
 /* ================= v2.6.2 修复轮 ================= */
 /* #1 图片消息行上下间距收紧（明显小于文本消息的 16px） */
@@ -1167,6 +1167,12 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 #clear-modal h3 { font-size: 15px; margin-bottom: 6px; }
 .clear-range-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0 16px; }
 .clear-range-list .btn { width: 100%; }
+/* v1.0.2 ④：删文件独立勾选（默认不勾）+ 会话模式的单按钮 */
+.clear-files-opt { display: flex; gap: 8px; align-items: flex-start; font-size: 13px;
+  margin: 4px 0 16px; cursor: pointer; line-height: 1.5; }
+.clear-files-opt input { margin-top: 2px; flex: none; accent-color: var(--accent); }
+#clear-conv-go { width: 100%; margin-bottom: 12px; }
+#clear-conv-go.hidden { display: none; }
 
 /* v2.6.6 #12 续：数字输入框去掉原生步进钮（暗色下是白色小盒、浅色下是系统箭头，
    都与应用控件口径不一致）；键盘上下键步进不受影响。 */

@@ -30,6 +30,27 @@ jobs:
       - name: 校验 Windows 构建包含 SimpleBLE
         if: runner.os == 'Windows'
         run: cargo tree -p bluelink-app --features simpleble -i simplersble
+      # ②(a) 防再犯（v1.0.2）：latest.json 的 notes 由 tauri-action 在
+      # 创建 Release 时按当时正文生成——v1.0.1 那次正文是事后在网页
+      # 补的，静态文件里的 notes 一直是空串，应用内更新说明显示
+      # 「未附更新说明」。此后每版：先把 docs/releases/vX.Y.Z.md
+      # 的全文读出来，以 releaseBody 传入，让正文在生成 latest.json
+      # 之前就已就位。注意 tauri-action v0 只有字符串入参
+      # releaseBody（无 releaseBodyIsPath），必须先读文件再传值；
+      # 文件缺失直接红灯，不许静默出空正文包。
+      - name: 读取发布说明
+        id: notes
+        run: |
+          f="docs/releases/${{ github.ref_name }}.md"
+          test -f "$f" || { echo "缺少发布说明 $f"; exit 1; }
+          # 分隔符带时间戳+进程号+随机数：正文是人工写的 Markdown，固定
+          # 分隔符若恰好出现在正文里会提前截断 heredoc（第三方评审）。
+          d="BLUELINK_NOTES_$(date +%s)_$$_$RANDOM"
+          {
+            echo "body<<$d"
+            cat "$f"
+            echo "$d"
+          } >> "$GITHUB_OUTPUT"
       - name: 打包并上传到 Release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -41,6 +62,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "BlueLink ${{ github.ref_name }}"
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
