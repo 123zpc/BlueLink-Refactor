@@ -644,10 +644,12 @@ section { display: flex; flex-direction: column; height: 100%; }
    按钮的显隐会撑高缩回气泡、观感闪烁）。环与气泡本体垂直居中（不含
    下方时间行）；接收气泡环在右、发送气泡环在左（朝会话中线）。
    状态语言：绿弧走百分比=传输中；灰弧慢转（2.4s）=排队等待；绿弧
-   快转（1.1s）=校验中；红环+「!」=失败（点环重试）；完成=弧走满后
-   对号描画+停留+淡出（.tx-done 一组动画，总约 1.3s）。可调参数都
-   集中在这里：环尺寸/线宽在 .tx-ring 与 SVG 的 r/ stroke-width、
-   转速在两条 animation、完成节奏在 .tx-done 三条 animation。 */
+   快转（1.1s）=校验中；红环+「!」=失败（点环重试）；完成=「吸管
+   液体」流转（满格瞬间绿液从左上管口沿对号第一笔的延长线流入对
+   号、灰环随液尾分段消失，只剩对号停留后渐隐，全程约 2.3s，时
+   序在 completeTxRing）。可调参数：环尺寸/线宽在 .tx-ring 与
+   SVG 的 r/ stroke-width、转速在两条 animation、完成节奏在
+   completeTxRing 的 FLOW/HOLD/FADE 三个常量。 */
 .bubble-line { display: flex; align-items: center; gap: 9px; }
 .msg-row.me .bubble-line { flex-direction: row-reverse; }
 .tx-ring { position: relative; width: 32px; height: 32px; flex: none; cursor: pointer; }
@@ -668,14 +670,15 @@ section { display: flex; flex-direction: column; height: 100%; }
 .tx-ring.tx-failed .tx-sym { opacity: 1; color: var(--err); }
 .tx-ring.tx-progress:hover .tx-num { opacity: 0; }
 .tx-ring.tx-progress:hover .tx-sym { opacity: 1; color: var(--ok); }
-.tx-check { stroke: var(--ok); stroke-width: 2.4; fill: none; stroke-linecap: round;
-  stroke-linejoin: round; stroke-dasharray: 26; stroke-dashoffset: 26; }
+/* 完成流转（吸管液体）：两条与流转路径同形的线，绿色液段由 JS 按
+   dash 窗口推进，灰色段是尚未流完的环——窗口右界钉在环长、左界跟
+   随液尾，液尾过处灰色立即消失。时序在 completeTxRing 的 rAF 里。 */
+.tx-grayflow { stroke: var(--border); stroke-width: 3; fill: none; stroke-linecap: round;
+  stroke-linejoin: round; }
+.tx-flow { stroke: var(--ok); stroke-width: 3; fill: none; stroke-linecap: round;
+  stroke-linejoin: round; }
 .tx-ring.tx-done .tx-num { animation: txfadeout 0.18s ease-out forwards; }
-.tx-ring.tx-done .tx-check { animation: txdraw 0.38s ease-out 0.05s forwards; }
-.tx-ring.tx-done { animation: txpop 0.45s ease-out, txfadeout 0.3s ease-in 1.05s forwards; }
-@keyframes txdraw { to { stroke-dashoffset: 0; } }
 @keyframes txfadeout { to { opacity: 0; } }
-@keyframes txpop { 0% { transform: scale(1); } 40% { transform: scale(1.08); } 100% { transform: scale(1); } }
 /* 传输状态小字行：挂在气泡行下方、气泡之外（已取消/校验失败的说明
    与重试入口），显隐不影响气泡本体尺寸 */
 .tx-note { font-size: 11.5px; color: var(--muted); margin-top: 5px; display: flex; align-items: center; gap: 2px; }

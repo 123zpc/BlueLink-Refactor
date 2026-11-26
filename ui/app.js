@@ -291,6 +291,43 @@ const TRANSFER_TERMINAL = ["done", "cancelled", "verify_failed"];
 // 取消）/ queue 排队等待（灰弧慢转）/ verify 校验中（绿弧快转）/
 // failed 失败（红环+!，点环重试）/ done 完成动效中（对号描画→淡出）。
 const TX_CIRC = 84.82; // 环周长：2π×13.5
+/* 完成流转路径（用户定版「吸管液体」）：圆环在左上方（约十点半）开
+ * 管口，连接段落在对号第一笔的延长线上（45°、与第一笔同线）直达
+ * 左尖，再顺对号走到右尖。路径顺序 = 液体流向：自管口顺时针绕环
+ * 一周回管口 → 连接段 → 对号。管口坐标 (3.84,10.14) 是第一笔延长
+ * 线与环的交点（解圆方程得），连接段与第一笔同线、入口零拐弯。 */
+const TX_FLOW_D = "M3.84 10.14 A13.5 13.5 0 0 1 29.5 16 A13.5 13.5 0 1 1 3.84 10.14 L10.5 16.8 L14.2 20.5 L21.8 12.2";
+const TX_CHECK_D = "M10.5 16.8 L14.2 20.5 L21.8 12.2";
+let TX_FLOW_LEN = 0, TX_CHECK_LEN = 0;
+/** 流转路径总长与对号段长（实测优先；几何 API 不可用时用计算值兜底：
+ * 环 84.82 + 连接段 9.42 + 对号 16.49 ≈ 110.73，对号段 16.49）。 */
+function txFlowLens(flowEl) {
+  if (!TX_FLOW_LEN) {
+    try {
+      const probe = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      probe.setAttribute("d", TX_CHECK_D);
+      TX_FLOW_LEN = flowEl.getTotalLength();
+      TX_CHECK_LEN = probe.getTotalLength();
+      if (!TX_FLOW_LEN || !TX_CHECK_LEN) throw new Error("len0");
+    } catch {
+      TX_FLOW_LEN = 110.73; TX_CHECK_LEN = 16.49;
+    }
+  }
+  return [TX_FLOW_LEN, TX_CHECK_LEN];
+}
+/** 停掉完成流转动画并把环元素复位（新状态绘制/收起前调用）。 */
+function stopTxFlow(b) {
+  if (b._flowRAF) { cancelAnimationFrame(b._flowRAF); b._flowRAF = 0; }
+  const ring = b._txRing;
+  if (!ring) return;
+  const f = ring.querySelector(".tx-flow"), g = ring.querySelector(".tx-grayflow");
+  if (f) { f.style.display = "none"; f.style.opacity = ""; }
+  if (g) g.style.display = "none";
+  const track = ring.querySelector(".tx-track");
+  if (track) track.style.display = "";
+  const arc = ring.querySelector(".tx-arc");
+  if (arc) arc.style.display = "";
+}
 let txRingSeq = 0; // 等待环相位错开用（相邻环错半圈，不齐步走）
 function makeTxRing() {
   const el = document.createElement("div");
@@ -299,7 +336,8 @@ function makeTxRing() {
   el.innerHTML = `<svg class="tx-svg" width="32" height="32" viewBox="0 0 32 32">
     <circle class="tx-track" cx="16" cy="16" r="13.5" fill="none" stroke-width="3"/>
     <g transform="rotate(-90 16 16)"><g class="tx-spin"><circle class="tx-arc" cx="16" cy="16" r="13.5" fill="none" stroke-width="3" stroke-dasharray="${TX_CIRC}" stroke-dashoffset="${TX_CIRC}"/></g></g>
-    <path class="tx-check" d="M10.5 16.8 L14.2 20.5 L21.8 12.2"/>
+    <path class="tx-grayflow" d="${TX_FLOW_D}" style="display:none"/>
+    <path class="tx-flow" d="${TX_FLOW_D}" style="display:none"/>
   </svg><span class="tx-num"></span><span class="tx-sym"></span>`;
   // 等待/校验的旋转相位按创建序错开（等待周期 2.4s，错半圈 = -1.2s）
   el.querySelector(".tx-spin").style.animationDelay = `${-(txRingSeq++ % 2) * 1.2}s`;
@@ -327,6 +365,7 @@ function paintTxRing(b, mode, pct) {
   if (!ring) return;
   if (b._ringHideTimer) { clearTimeout(b._ringHideTimer); b._ringHideTimer = 0; }
   if (b._ringWaitTimer) { clearTimeout(b._ringWaitTimer); b._ringWaitTimer = 0; }
+  if (b._flowRAF || ring.dataset.mode === "done") stopTxFlow(b);
   const arc = ring.querySelector(".tx-arc");
   const num = ring.querySelector(".tx-num");
   const sym = ring.querySelector(".tx-sym");
@@ -366,14 +405,18 @@ function hideTxRing(b) {
   if (!ring) return;
   if (b._ringHideTimer) { clearTimeout(b._ringHideTimer); b._ringHideTimer = 0; }
   if (b._ringWaitTimer) { clearTimeout(b._ringWaitTimer); b._ringWaitTimer = 0; }
+  stopTxFlow(b);
   ring.classList.add("hidden");
   ring.classList.remove("tx-done");
   ring.dataset.mode = "";
   b._ringShownAt = 0;
 }
-/** 完成动效（用户定）：弧走满→百分比淡出→对号描画→停留→整环淡出，
- * 总约 1.3s，纯视觉不阻塞后续传输；小文件传得太快时先补足最小展示
- * 时长（450ms）再播，防一闪而过；回放（翻历史/重渲染）不播、直接收起。 */
+/** 完成动效（用户定版「吸管液体」）：满格瞬间，绿色液体从圆环左上方
+ * 管口沿与对号第一笔同线的连接段流入对号（流转 780ms、起步即全速，
+ * 液体尾巴扫过哪段、哪段灰环随即消失，环被一段段抽空）；只剩对号
+ * 停留 870ms 后渐隐 600ms，全程约 2.3s，纯视觉不阻塞后续传输。
+ * 小文件传得太快时先补足最小展示时长（450ms）再播，防一闪而过；
+ * 回放（翻历史/重渲染）不播、直接收起。 */
 function completeTxRing(b, replay) {
   const ring = b._txRing;
   if (!ring) return;
@@ -386,14 +429,57 @@ function completeTxRing(b, replay) {
     // 已被 hideTxRing 收尾（取消/重发竞态）就不再强行播动效
     if (!ring.isConnected || !b._ringShownAt) return;
     const arc = ring.querySelector(".tx-arc");
-    arc.style.strokeDasharray = `${TX_CIRC}`;
-    arc.style.strokeDashoffset = "0";
+    const track = ring.querySelector(".tx-track");
+    const flow = ring.querySelector(".tx-flow");
+    const gray = ring.querySelector(".tx-grayflow");
     ring.querySelector(".tx-num").textContent = "100%";
     ring.classList.remove("tx-progress", "tx-queue", "tx-verify", "tx-failed");
     ring.classList.add("tx-done");
     ring.dataset.mode = "done";
     ring.title = "";
-    b._ringHideTimer = setTimeout(() => hideTxRing(b), 1450);
+    if (!flow || !gray) { // 兜底：流转路径缺失时按时收起，不留残环
+      b._ringHideTimer = setTimeout(() => hideTxRing(b), 1450);
+      return;
+    }
+    const [LTOT, LCHK] = txFlowLens(flow);
+    const LC = TX_CIRC;
+    // 切换到流转路径：液段先铺满整环（与满格弧同像素，无缝衔接），
+    // 灰环改由流转路径的窗口呈现，随液尾推进分段消失
+    arc.style.display = "none";
+    track.style.display = "none";
+    flow.style.display = "";
+    gray.style.display = "";
+    flow.style.opacity = "1";
+    const setSlug = (tl, h) => {
+      flow.style.strokeDasharray = `${Math.max(h - tl, 0.01)} ${LTOT}`;
+      flow.style.strokeDashoffset = `${-tl}`;
+      const gl = Math.max(LC - tl, 0);
+      gray.style.strokeDasharray = `${gl} ${LTOT}`;
+      gray.style.strokeDashoffset = `${-tl}`;
+    };
+    setSlug(0, LC);
+    const FLOW_MS = 780, HOLD_MS = 870, FADE_MS = 600;
+    const t0 = performance.now();
+    const step = (now) => {
+      const t = now - t0;
+      if (t < FLOW_MS) {
+        const e = 1 - Math.pow(1 - t / FLOW_MS, 3); // easeOut：起步即全速
+        setSlug((LTOT - LCHK) * e, LC + (LTOT - LC) * e);
+      } else if (t < FLOW_MS + HOLD_MS) {
+        setSlug(LTOT - LCHK, LTOT);
+      } else if (t < FLOW_MS + HOLD_MS + FADE_MS) {
+        setSlug(LTOT - LCHK, LTOT);
+        flow.style.opacity = `${1 - (t - FLOW_MS - HOLD_MS) / FADE_MS}`;
+      } else {
+        b._flowRAF = 0;
+        hideTxRing(b);
+        return;
+      }
+      b._flowRAF = requestAnimationFrame(step);
+    };
+    // 兜底：窗口隐藏等场景 rAF 被节流时，到点由定时器收尾
+    b._ringHideTimer = setTimeout(() => hideTxRing(b), FLOW_MS + HOLD_MS + FADE_MS + 400);
+    b._flowRAF = requestAnimationFrame(step);
   };
   const wait = Math.max(0, 450 - (Date.now() - b._ringShownAt));
   if (wait) b._ringWaitTimer = setTimeout(start, wait);
