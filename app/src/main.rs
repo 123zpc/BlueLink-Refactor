@@ -2367,6 +2367,222 @@ fn restart_app(app: AppHandle) {
     app.restart();
 }
 
+/// 中继更新要取的安装包平台键（与 latest.json 的 platforms 键一致）：
+/// 按本机平台取本机要装的那一份，对端只按键代取、不做判断。
+fn relay_update_platform() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "windows-x86_64-nsis"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "linux-x86_64-appimage"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "darwin-aarch64-app"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        "windows-x86_64-nsis"
+    }
+}
+
+/// 中继更新分流状态：前端点「检查更新」直连失败后据此决定走中继
+/// 还是给提示（未连接→提示先连对端；对端太旧不支持中继→如实提示）。
+#[derive(serde::Serialize)]
+struct RelayUpdateStatus {
+    connected: bool,
+    peer_name: String,
+    peer_version: String,
+    peer_relay: bool,
+}
+
+#[tauri::command]
+async fn relay_update_status(state: State<'_, AppState>) -> Result<RelayUpdateStatus, String> {
+    match state.node.peer_update_caps().await {
+        Some((name, version, relay)) => Ok(RelayUpdateStatus {
+            connected: true,
+            peer_name: name,
+            peer_version: version,
+            peer_relay: relay,
+        }),
+        None => Ok(RelayUpdateStatus {
+            connected: false,
+            peer_name: String::new(),
+            peer_version: String::new(),
+            peer_relay: false,
+        }),
+    }
+}
+
+/// 中继查版本：请当前对端代取最新版信息（版本/说明/签名）。
+#[tauri::command]
+async fn relay_update_check(
+    state: State<'_, AppState>,
+) -> Result<bluelink_services::RelayUpdateInfo, String> {
+    state
+        .node
+        .relay_update_check(relay_update_platform())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 中继取包的受理结果：请求 ID + 对端本次取包实际所据的版本与签名
+/// （与下载同一次快照，前端据此核对所示版本、并以这份签名验包）。
+#[derive(serde::Serialize)]
+struct RelayFetchOutcome {
+    req_id: String,
+    version: Option<String>,
+    signature: Option<String>,
+}
+
+/// 中继取包：请对端下载安装包并经蓝牙回传（进度与到达走传输/专用
+/// 事件，前端按 update:{req_id} 对账）。
+#[tauri::command]
+async fn relay_update_fetch(state: State<'_, AppState>) -> Result<RelayFetchOutcome, String> {
+    let (req_id, version, signature) = state
+        .node
+        .relay_update_fetch(relay_update_platform())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(RelayFetchOutcome {
+        req_id,
+        version,
+        signature,
+    })
+}
+
+/// 从应用配置里读 updater 公钥（tauri.conf.json 的
+/// plugins.updater.pubkey，与插件读的是同一份——单一来源，不再在
+/// 代码里硬编码第二份靠注释同步）。
+fn updater_pubkey(app: &AppHandle) -> Result<String, String> {
+    let cfg = serde_json::to_value(app.config()).map_err(|e| format!("读应用配置失败：{e}"))?;
+    cfg.pointer("/plugins/updater/pubkey")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "应用配置缺少更新公钥".to_string())
+}
+
+/// 中继更新包验签本体（与 updater 插件同口径）：minisign 验签 +
+/// 签名可信注释里的版本必须等于用户确认过的预期版本——可信注释被
+/// 签名覆盖、伪造不了，这一步把「所示版本—签名—包」钉成同一份，
+/// 对端回传旧版包/错位签名都过不去。公钥是公开信息、非秘密。
+fn do_verify_update_package(
+    pubkey_b64: &str,
+    path: &str,
+    signature: &str,
+    expected_version: &str,
+) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use minisign_verify::{PublicKey, Signature};
+    let data = std::fs::read(path).map_err(|e| format!("读取更新包失败：{e}"))?;
+    let pk_text = String::from_utf8(
+        STANDARD
+            .decode(pubkey_b64)
+            .map_err(|e| format!("公钥解码失败：{e}"))?,
+    )
+    .map_err(|e| format!("公钥格式异常：{e}"))?;
+    let public_key = PublicKey::decode(&pk_text).map_err(|e| format!("公钥解析失败：{e}"))?;
+    let sig_text = String::from_utf8(
+        STANDARD
+            .decode(signature.trim())
+            .map_err(|e| format!("签名解码失败：{e}"))?,
+    )
+    .map_err(|e| format!("签名格式异常：{e}"))?;
+    let sig = Signature::decode(&sig_text).map_err(|e| format!("签名解析失败：{e}"))?;
+    public_key
+        .verify(&data, &sig, true)
+        .map_err(|_| "更新包签名校验未通过，已取消更新".to_string())?;
+    // 可信注释形如 timestamp:…\tfile:…\tversion:1.0.4（制表符分隔）
+    let signed_version = sig
+        .trusted_comment()
+        .split('\t')
+        .find_map(|kv| kv.strip_prefix("version:"))
+        .map(|v| v.trim().trim_start_matches('v'));
+    match signed_version {
+        Some(v) if v == expected_version.trim_start_matches('v') => Ok(()),
+        Some(v) => Err(format!(
+            "更新包版本（{v}）与所示版本（{expected_version}）不一致，已取消更新"
+        )),
+        None => Err("更新包签名缺少版本信息，已取消更新".to_string()),
+    }
+}
+
+/// 中继收到的更新包验签（前端在呈现「下载完成」前调用）：验不过
+/// 直接报错，绝不进入安装。
+#[tauri::command]
+fn verify_update_package(
+    app: AppHandle,
+    path: String,
+    signature: String,
+    expected_version: String,
+) -> Result<(), String> {
+    let pubkey = updater_pubkey(&app)?;
+    do_verify_update_package(&pubkey, &path, &signature, &expected_version)
+}
+
+/// 待装包路径守门：规范化后必须位于更新暂存目录内（防前端传来的
+/// 路径被替换成任意文件执行）。返回规范化后的路径。
+fn checked_update_package_path(state: &AppState, path: &str) -> Result<std::path::PathBuf, String> {
+    let dir = state
+        .node
+        .updates_dir()
+        .canonicalize()
+        .map_err(|e| format!("更新暂存目录不可用：{e}"))?;
+    let p = std::path::Path::new(path)
+        .canonicalize()
+        .map_err(|e| format!("更新包不存在：{e}"))?;
+    if !p.starts_with(&dir) {
+        return Err("更新包不在暂存目录内，已拒绝".into());
+    }
+    Ok(p)
+}
+
+/// 清理无主的中继更新包（用户中途取消、包随后才到时由前端调用）：
+/// 只删更新暂存目录内的文件，其余路径一概不动。
+#[tauri::command]
+fn discard_update_package(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let p = checked_update_package_path(&state, &path)?;
+    std::fs::remove_file(&p).map_err(|e| format!("清理更新包失败：{e}"))
+}
+
+/// 中继更新包安装（仅 Windows）：先过路径守门、再对当前文件字节
+/// 重验一次签（防验签后文件被替换），然后拉起安装包并退出本进程
+/// 让安装器覆盖（与手动双击覆盖安装同一条路）。其余平台暂不支持。
+#[tauri::command]
+fn install_update_package(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    signature: String,
+    expected_version: String,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let p = checked_update_package_path(&state, &path)?;
+        if p.extension().and_then(|s| s.to_str()) != Some("exe") {
+            return Err("更新包不是 .exe 安装包，已拒绝".into());
+        }
+        let pubkey = updater_pubkey(&app)?;
+        do_verify_update_package(&pubkey, &p.to_string_lossy(), &signature, &expected_version)?;
+        std::process::Command::new(&p)
+            .spawn()
+            .map_err(|e| format!("启动安装包失败：{e}"))?;
+        // 稍等安装器起步再退出，免得它发现旧版还在运行
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            app.exit(0);
+        });
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, state, path, signature, expected_version);
+        Err("本平台暂不支持中继更新的安装".into())
+    }
+}
+
 /// 原生窗口标题栏主题跟随应用主题（v2.5.2）：Windows 用原生标题栏，
 /// 应用切深色时标题栏默认仍是白色，需经此命令同步（Window::set_theme
 /// 需 tauri 的 unstable 特性）。"dark" → 深色、"light" → 浅色、
@@ -2528,6 +2744,17 @@ fn forward_events(app: AppHandle, node: Arc<Node>) {
                     let _ = app.emit(
                         "transfer_state",
                         serde_json::json!({"transfer_id": transfer_id, "state": state, "msg_id": msg_id}),
+                    );
+                }
+                Ok(Event::UpdatePackageReady {
+                    transfer_id,
+                    path,
+                    name,
+                    size,
+                }) => {
+                    let _ = app.emit(
+                        "update_package_ready",
+                        serde_json::json!({"transfer_id": transfer_id, "path": path, "name": name, "size": size}),
                     );
                 }
                 Ok(Event::AiChunk {
@@ -3218,6 +3445,12 @@ fn main() {
             get_sys_notify,
             set_sys_notify,
             restart_app,
+            relay_update_status,
+            relay_update_check,
+            relay_update_fetch,
+            verify_update_package,
+            install_update_package,
+            discard_update_package,
             set_window_theme,
             clean_cache,
             clear_chat_history,

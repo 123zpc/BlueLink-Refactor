@@ -396,11 +396,13 @@ dependencies = [
 name = "bluelink-app"
 version = "1.0.4"
 dependencies = [
+ "base64 0.22.1",
  "bluelink-ai",
  "bluelink-domain",
  "bluelink-services",
  "bluelink-storage",
  "bluelink-transport",
+ "minisign-verify",
  "serde",
  "serde_json",
  "tauri",
@@ -455,12 +457,15 @@ name = "bluelink-services"
 version = "1.0.4"
 dependencies = [
  "arboard",
+ "base64 0.22.1",
  "bluelink-ai",
  "bluelink-domain",
  "bluelink-protocol",
  "bluelink-storage",
  "bluelink-transport",
  "image",
+ "minisign-verify",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2266,6 +2271,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -3987,6 +3993,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",

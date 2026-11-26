@@ -16,11 +16,20 @@ arboard = "3"
 # 图片解码（查看器「复制图片」把文件解码为 RGBA 写剪贴板用，⑱）：
 # 只开锁文件里已有的纯 Rust 解码器（png/jpeg/bmp），不新增传递依赖
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+# rustls-tls-native-roots：让中继代取的 HTTPS 除内置根证书外还能用
+# 系统证书库（企业代理签发的证书只在系统库里）；与工作区已启用的
+# webpki 根证书并存，取并集
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 bluelink-domain = { path = "../domain" }
 bluelink-protocol = { path = "../protocol" }
 bluelink-storage = { path = "../storage" }
 bluelink-transport = { path = "../transport" }
 bluelink-ai = { path = "../ai" }
+
+[dev-dependencies]
+# 中继更新端到端测试里复刻应用层验签（与应用内更新同一把公钥）
+minisign-verify = "0.3"
+base64 = "0.22"
 
 # Windows 机器标识（MachineGuid）读取：设备 ID 机器绑定用，仅 Windows 目标
 [target.'cfg(windows)'.dependencies]

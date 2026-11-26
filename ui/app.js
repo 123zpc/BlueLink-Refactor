@@ -4884,6 +4884,8 @@ async function wireEvents() {
   // 字段注释的真机定案）。
   await listen("transfer_progress", (e) => {
     const { transfer_id, msg_id, received, total } = e.payload;
+    // 中继更新包的传输不进聊天传输账，只喂更新框进度
+    if (msg_id && msg_id.startsWith("update:")) { relayOnProgress(transfer_id, msg_id, received, total); return; }
     const rec = noteTransferProgress(transfer_id, msg_id, received, total);
     // 图片组成员的进度按组聚合显示在组气泡上（成员 msg_id → 组 id）
     const gid = msg_id ? (state.groupMemberOf || {})[msg_id] : null;
@@ -4893,6 +4895,8 @@ async function wireEvents() {
   });
   await listen("transfer_state", (e) => {
     const { transfer_id, state: tstate, msg_id } = e.payload;
+    // 中继更新包同上：只喂更新框状态
+    if (msg_id && msg_id.startsWith("update:")) { relayOnState(transfer_id, msg_id, tstate); return; }
     const rec = noteTransferState(transfer_id, tstate, msg_id);
     const mid = rec.msgId;
     // 图片组成员的状态同样按组聚合（完成时顺带刷新组气泡缩略图）
@@ -4901,6 +4905,7 @@ async function wireEvents() {
     const b = bubbleOfMsg(mid);
     if (b) paintTransferState(b, rec);
   });
+  await listen("update_package_ready", (e) => { relayOnPackageReady(e.payload || {}); });
   await listen("ai_chunk", (e) => {
     const container = $("ai-messages");
     // #3：只渲染当前打开会话的流——其他会话（问AI 落 ai-default 等）
@@ -4994,6 +4999,10 @@ document.querySelectorAll("#theme-seg button").forEach((b) =>
 let updHandle = null;   // check() 返回的 Update 对象
 let updPhase = "idle";  // idle | found | downloading | downloaded | installing
 let updAbandoned = false;
+// 中继更新上下文（经蓝牙对端代下安装包）：非空时更新框走中继流程，
+// 与直连的 updHandle 互斥。reqId/transferId 用于对账传输事件，
+// signature 是查版本时对端回传的签名、收包后验签用。
+let relayCtx = null;
 
 /** 更新说明 Markdown 子集 → HTML（v1.0.2 换包修复）：发布说明原文是
  *  Markdown，旧实现用 textContent 原样贴出，# / ** 标记裸显，还被
@@ -5049,6 +5058,230 @@ function friendlyUpdError(e) {
   return s.slice(0, 80) || "未知错误";
 }
 
+/** 版本号比较：a 比 b 新返回 true（按点分数字段逐段比，缺段补 0）。 */
+function isNewerVersion(a, b) {
+  const pa = String(a || "").split(".").map((x) => parseInt(x, 10) || 0);
+  const pb = String(b || "").split(".").map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d > 0;
+  }
+  return false;
+}
+
+/** 直连检查的错误是否属于「连不上服务器」一类（与 friendlyUpdError
+ * 的网络类判定同口径）：只有这类失败才有资格转蓝牙中继，其余失败
+ * （无更新文件、签名问题等）转中继也没用、照旧提示。 */
+function isNetworkUpdError(e) {
+  const s = String((e && e.message) || e || "");
+  return /network|error sending request|dns|connect|timed out|timeout|unreachable|offline/i.test(s);
+}
+
+/** 发现新版后的弹窗呈现（直连/中继共用）：版本号 + 说明全文渲染。
+ * viaRelay 时状态行按用户定案只写「正在通过蓝牙通道中继更新」。 */
+function presentUpdateFound(version, notes, viaRelay) {
+  updPhase = "found";
+  updAbandoned = false;
+  $("update-title").textContent = `发现新版本 v${version}`;
+  const notesEl = $("update-notes");
+  // 说明全文呈现（Markdown 子集渲染，见 renderReleaseNotes），不再截断
+  const n = (notes || "").trim();
+  if (n) notesEl.innerHTML = renderReleaseNotes(n);
+  else notesEl.textContent = "（此版本未附更新说明）";
+  notesEl.scrollTop = 0;
+  $("update-progress-wrap").classList.add("hidden");
+  $("update-action").textContent = "立即更新";
+  $("update-action").disabled = false;
+  $("update-cancel").textContent = "以后再说";
+  $("update-cancel").disabled = false;
+  $("update-modal").classList.remove("hidden");
+  updSetStatus(viaRelay ? "正在通过蓝牙通道中继更新" : `发现新版本 v${version}`);
+}
+
+/** 直连失败后的中继分流（用户定案）：连着对端且对端支持中继 →
+ * 请对端代查；没连对端 → 直接提示；对端太旧 → 如实提示不支持。 */
+async function relayCheckFallback() {
+  let st = null;
+  try { st = await invoke("relay_update_status"); } catch (_) { /* 状态拿不到按未连接处理 */ }
+  if (!st || !st.connected) {
+    updSetStatus("检查失败，请稍后再试");
+    showToast("检查更新失败：无网络且未连接对端，无法检查更新；连接外网机后可通过蓝牙中继更新");
+    return;
+  }
+  if (!st.peer_relay) {
+    updSetStatus("检查失败，请稍后再试");
+    showToast("对端版本过旧，不支持中继更新");
+    return;
+  }
+  updSetStatus("正在通过蓝牙通道中继更新");
+  let info;
+  try {
+    info = await invoke("relay_update_check");
+  } catch (e) {
+    updSetStatus("检查失败，请稍后再试");
+    invoke("log_frontend", { msg: "中继检查更新失败：" + String((e && e.message) || e || "") }).catch(() => {});
+    showToast("中继检查更新失败：" + String((e && e.message) || e || "").slice(0, 80));
+    return;
+  }
+  let cur = "";
+  try { cur = await window.__TAURI__.app.getVersion(); } catch (_) { /* 拿不到版本按有新版呈现，不误判已最新 */ }
+  if (cur && !isNewerVersion(info.version, cur)) {
+    updSetStatus("已是最新版本");
+    showToast("已是最新版本");
+    return;
+  }
+  relayCtx = {
+    version: info.version,
+    signature: info.signature,
+    reqId: null,
+    transferId: null,
+    path: null,
+    abandoned: false,
+    pendingEv: null,
+  };
+  presentUpdateFound(info.version, info.notes, true);
+}
+
+/** 中继流程的「立即更新 / 安装并重启」按钮动作（与直连共用一个按钮，
+ * 靠 relayCtx 分流）：found → 请对端下载回传（受理后进度与到达由
+ * 传输事件推进）；downloaded → 拉起安装包并退出本进程。 */
+async function relayUpdateAction() {
+  const ctx = relayCtx;
+  if (!ctx) return;
+  if (updPhase === "found") {
+    updPhase = "downloading";
+    ctx.abandoned = false;
+    $("update-action").disabled = true;
+    $("update-cancel").textContent = "取消";
+    $("update-cancel").disabled = false;
+    $("update-progress-wrap").classList.remove("hidden");
+    $("update-progress-bar").style.width = "0%";
+    $("update-progress-text").textContent = "正在通过蓝牙通道中继更新…";
+    updSetStatus("正在通过蓝牙通道中继更新");
+    try {
+      // 此调用等对端下完包并开始回传才返回（对端下载慢时这里久等，
+      // 界面文案已写明走蓝牙中继，不会让用户误以为卡死）
+      const res = await invoke("relay_update_fetch");
+      if (relayCtx !== ctx) return;
+      ctx.reqId = res.req_id;
+      // 对端本次取包实际所据的版本与所示不一致：整个更新取消
+      // （包随后到达也会被当无主包清掉，不会装错版本）
+      if (res.version && res.version !== ctx.version) {
+        relayCtx = null;
+        updPhase = "idle";
+        $("update-modal").classList.add("hidden");
+        updSetStatus("检查失败，请稍后再试");
+        showToast("对端取回的更新版本与所示版本不一致，已取消更新");
+        return;
+      }
+      // 验签改用与包同一次快照的签名（防两次请求间发布变化错位）
+      if (res.signature) ctx.signature = res.signature;
+      // reqId 未知期间积压的最后一个传输事件现在补喂（防串台又不丢尾）
+      const pe = ctx.pendingEv;
+      ctx.pendingEv = null;
+      if (pe && pe.kind === "progress") relayOnProgress(pe.transferId, "update:" + ctx.reqId, pe.received, pe.total);
+      if (pe && pe.kind === "state") relayOnState(pe.transferId, "update:" + ctx.reqId, pe.tstate);
+    } catch (e) {
+      if (relayCtx !== ctx) return;
+      updPhase = "found";
+      $("update-action").disabled = false;
+      $("update-progress-wrap").classList.add("hidden");
+      showToast("中继下载失败：" + String((e && e.message) || e || "").slice(0, 80));
+    }
+  } else if (updPhase === "downloaded") {
+    updPhase = "installing";
+    $("update-action").disabled = true;
+    $("update-cancel").disabled = true;
+    $("update-action").textContent = "正在安装…";
+    try {
+      await invoke("install_update_package", { path: ctx.path, signature: ctx.signature, expectedVersion: ctx.version });
+      // 成功时本进程随即退出，不会走到这里之后
+    } catch (e) {
+      updPhase = "downloaded";
+      $("update-action").disabled = false;
+      $("update-cancel").disabled = false;
+      $("update-action").textContent = "安装并重启";
+      showToast("安装失败：" + String((e && e.message) || e || "").slice(0, 80));
+    }
+  }
+}
+
+/** 中继传输进度（传输事件按 update:{reqId} 对账后转发到这里）：
+ * 只更新更新框的进度条，不进聊天传输账。reqId 未知（取包调用还没
+ * 返回）时只留最后一个事件待补喂——本轮的包不可能在这个窗口里
+ * 先到，先到的只会是上一轮残留事件，绝不能喂进本轮更新框。 */
+function relayOnProgress(transferId, msgId, received, total) {
+  if (!relayCtx || relayCtx.abandoned) return;
+  if (!relayCtx.reqId) {
+    relayCtx.pendingEv = { kind: "progress", transferId, received, total };
+    return;
+  }
+  if (msgId !== "update:" + relayCtx.reqId) return;
+  relayCtx.transferId = transferId;
+  if (updPhase !== "downloading") return;
+  if (total > 0) {
+    const pct = Math.min(100, Math.round((received / total) * 100));
+    $("update-progress-bar").style.width = pct + "%";
+    $("update-progress-text").textContent = `正在通过蓝牙通道中继更新… ${pct}%`;
+  }
+}
+
+/** 中继传输状态：校验中给文案；失败/被取消回到 found 态可重试。 */
+function relayOnState(transferId, msgId, tstate) {
+  if (!relayCtx || relayCtx.abandoned) return;
+  if (!relayCtx.reqId) {
+    relayCtx.pendingEv = { kind: "state", transferId, tstate };
+    return;
+  }
+  if (msgId !== "update:" + relayCtx.reqId) return;
+  relayCtx.transferId = transferId;
+  if (updPhase !== "downloading") return;
+  if (tstate === "verifying") {
+    $("update-progress-text").textContent = "正在校验更新包…";
+  } else if (tstate === "verify_failed" || tstate === "cancelled") {
+    updPhase = "found";
+    $("update-action").disabled = false;
+    $("update-progress-wrap").classList.add("hidden");
+    showToast(tstate === "cancelled" ? "中继传输已取消" : "中继传输校验失败，请重试");
+  }
+}
+
+/** 中继更新包到达（已过传输层哈希校验）：先验签，验过才呈现
+ * 「下载完成」；验不过直接取消更新——绝不给安装入口。 */
+async function relayOnPackageReady(p) {
+  const ctx = relayCtx;
+  if (!ctx || ctx.abandoned) {
+    // 无主包（用户已取消/流程已易主）：清掉暂存文件，不留垃圾
+    if (p && p.path) invoke("discard_update_package", { path: p.path }).catch(() => {});
+    return;
+  }
+  if (updPhase !== "downloading") return;
+  ctx.path = p.path;
+  $("update-progress-text").textContent = "正在校验更新包签名…";
+  try {
+    await invoke("verify_update_package", { path: p.path, signature: ctx.signature, expectedVersion: ctx.version });
+  } catch (err) {
+    if (relayCtx !== ctx) return;
+    relayCtx = null;
+    updPhase = "idle";
+    $("update-modal").classList.add("hidden");
+    updSetStatus("更新包签名校验未通过，已取消更新");
+    invoke("log_frontend", { msg: "中继更新包验签失败：" + String((err && err.message) || err || "") }).catch(() => {});
+    showToast("更新包签名校验未通过，已取消更新");
+    return;
+  }
+  if (relayCtx !== ctx || ctx.abandoned) return;
+  updPhase = "downloaded";
+  $("update-title").textContent = "下载完成";
+  $("update-notes").textContent = "新版本已通过蓝牙中继接收并校验通过。点「安装并重启」将自动完成安装并重新打开 BlueLink。";
+  $("update-progress-wrap").classList.add("hidden");
+  $("update-action").textContent = "安装并重启";
+  $("update-action").disabled = false;
+  $("update-cancel").textContent = "以后再说";
+  $("update-cancel").disabled = false;
+  updSetStatus("新版本已下载，待安装");
+}
+
 $("btn-check-update").addEventListener("click", async () => {
   const btn = $("btn-check-update");
   if (btn.disabled) return;
@@ -5064,27 +5297,19 @@ $("btn-check-update").addEventListener("click", async () => {
       return;
     }
     updHandle = update;
-    updPhase = "found";
-    updAbandoned = false;
-    $("update-title").textContent = `发现新版本 v${update.version}`;
-    const notes = (update.body || "").trim();
-    const notesEl = $("update-notes");
-    // 说明全文呈现（Markdown 子集渲染，见 renderReleaseNotes），不再截断
-    if (notes) notesEl.innerHTML = renderReleaseNotes(notes);
-    else notesEl.textContent = "（此版本未附更新说明）";
-    notesEl.scrollTop = 0;
-    $("update-progress-wrap").classList.add("hidden");
-    $("update-action").textContent = "立即更新";
-    $("update-action").disabled = false;
-    $("update-cancel").textContent = "以后再说";
-    $("update-cancel").disabled = false;
-    $("update-modal").classList.remove("hidden");
-    updSetStatus(`发现新版本 v${update.version}`);
+    relayCtx = null;
+    presentUpdateFound(update.version, update.body, false);
   } catch (e) {
-    updSetStatus("检查失败，请稍后再试");
     // ① 原始错误（含插件英文原文）记进运行日志，界面只给人话版
     invoke("log_frontend", { msg: "检查更新失败，原始错误：" + String((e && e.message) || e || "") }).catch(() => {});
-    showToast("检查更新失败：" + friendlyUpdError(e));
+    // 直连失败且属网络类：转蓝牙中继分流（用户定案：有网走网络、
+    // 无网有对端走中继、无网无对端直接提示）；其余失败照旧提示。
+    if (isNetworkUpdError(e)) {
+      await relayCheckFallback();
+    } else {
+      updSetStatus("检查失败，请稍后再试");
+      showToast("检查更新失败：" + friendlyUpdError(e));
+    }
   } finally {
     btn.disabled = false;
   }
@@ -5106,12 +5331,27 @@ $("project-link").addEventListener("click", async (e) => {
 });
 
 $("update-cancel").addEventListener("click", () => {
+  if (relayCtx) {
+    // 中继取消：传输已开始就真取消（走现成的传输取消命令），还在
+    // 等对端下载就只置放弃标记——取包调用返回后 relayUpdateAction
+    // 会发现上下文已易主、静默收尾；未落定的上下文直接清掉。
+    relayCtx.abandoned = true;
+    if (updPhase === "downloading" && relayCtx.transferId) {
+      invoke("cancel_transfer", { transferId: relayCtx.transferId }).catch(() => {});
+    }
+    if (updPhase === "downloading") updSetStatus("已取消更新");
+    if (updPhase === "found") updSetStatus("仅手动检查，不会自动联网");
+    relayCtx = null;
+    $("update-modal").classList.add("hidden");
+    return;
+  }
   if (updPhase === "downloading") { updAbandoned = true; updSetStatus("已取消更新"); }
   if (updPhase === "found") updSetStatus("仅手动检查，不会自动联网");
   $("update-modal").classList.add("hidden");
 });
 
 $("update-action").addEventListener("click", async () => {
+  if (relayCtx) { await relayUpdateAction(); return; }
   if (!updHandle) return;
   if (updPhase === "found") {
     updPhase = "downloading";

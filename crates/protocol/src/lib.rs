@@ -108,12 +108,25 @@ pub enum Control {
         device_name: String,
         protocol: u32,
         code: String,
+        /// 本机应用版本（中继更新功能起）：对端据此判断本机版本新旧。
+        /// serde default：旧版本不发此字段、读旧帧得空串，混版不破。
+        #[serde(default)]
+        app_version: String,
+        /// 本机是否支持「经对端中继更新」（内网机请外网机代下安装包）。
+        /// 能力位而非版本号推断：同版本号的不同构建（如同号换包）靠它区分。
+        #[serde(default)]
+        relay_update: bool,
     },
     HelloAck {
         device_id: String,
         device_name: String,
         accepted: bool,
         reason: Option<String>,
+        /// 同 Hello：回执方的应用版本与中继更新能力位。
+        #[serde(default)]
+        app_version: String,
+        #[serde(default)]
+        relay_update: bool,
     },
     ChatText {
         msg_id: String,
@@ -140,6 +153,11 @@ pub enum Control {
         /// 新版本据此把成员收进同一条组消息而不是逐张建消息。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<GroupRef>,
+        /// 中继更新的安装包（中继更新功能起）：true 时接收方不当聊天
+        /// 文件处理——不建消息、不进接收目录，落到更新暂存目录后以
+        /// 专用事件通知应用层验签安装。serde default：旧帧恒 false。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        update_pkg: bool,
     },
     FileAccept {
         transfer_id: String,
@@ -186,6 +204,46 @@ pub enum Control {
         #[serde(default)]
         thinking_applied: Option<bool>,
     },
+    /// 中继更新·查版本请求（内网机→外网机）：请对端代取更新信息
+    /// （latest.json），platform 是请求方需要的安装包平台键
+    /// （如 windows-x86_64-nsis），对端按此键取对应的下载地址与签名。
+    UpdateCheckRequest {
+        req_id: String,
+        platform: String,
+    },
+    /// 中继更新·查版本应答（外网机→内网机）：ok 时带最新版本、更新
+    /// 说明与该平台安装包的签名（请求方收包后据此验签）；失败带原因。
+    UpdateCheckResult {
+        req_id: String,
+        ok: bool,
+        version: Option<String>,
+        notes: Option<String>,
+        signature: Option<String>,
+        error: Option<String>,
+    },
+    /// 中继更新·取包请求（内网机→外网机）：请对端下载安装包并经
+    /// 文件通道（FileOffer 带 update_pkg 标记）传回。platform 同查
+    /// 版本请求，对端按同一口径重新取址，避免两次请求间发布变化
+    /// 导致版本与包不一致。
+    UpdateFetchRequest {
+        req_id: String,
+        platform: String,
+    },
+    /// 中继更新·取包应答：ok=true 只表示对端已下好包、即将经文件
+    /// 通道发出（包的到达与完整性走文件传输自身的进度/校验事件）；
+    /// ok=false 表示下载阶段就失败了、不会有文件过来，error 带原因。
+    /// ok 时附带对端本次取包实际所据的版本号与签名（与下载同一次
+    /// latest.json 快照）：请求方据此与查版本时所示版本核对、并以
+    /// 这份签名为收包后的验签依据，保证「所示版本—签名—包」同源。
+    UpdateFetchResult {
+        req_id: String,
+        ok: bool,
+        error: Option<String>,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
+    },
     /// 剪贴板同步开关状态通告：连接建立后双方互发，开关被切换时再发。
     /// 只有双方都开启才真正同步内容。
     ClipboardState {
@@ -223,6 +281,10 @@ impl Control {
             Control::AiProxyRequest { .. } => 0x20,
             Control::AiProxyChunk { .. } => 0x21,
             Control::AiProxyDone { .. } => 0x22,
+            Control::UpdateCheckRequest { .. } => 0x23,
+            Control::UpdateCheckResult { .. } => 0x24,
+            Control::UpdateFetchRequest { .. } => 0x25,
+            Control::UpdateFetchResult { .. } => 0x26,
             Control::ClipboardState { .. } => 0x06,
             Control::ClipboardText { .. } => 0x07,
             Control::Ping => 0x30,
@@ -560,6 +622,8 @@ mod tests {
                 device_name: "甲".into(),
                 protocol: 2,
                 code: "123456".into(),
+                app_version: "1.0.4".into(),
+                relay_update: true,
             }),
             Frame::Control(Control::ChatText {
                 msg_id: "m1".into(),
@@ -644,6 +708,7 @@ mod tests {
                 index: 2,
                 total: 5,
             }),
+            update_pkg: false,
         });
         let bytes = encode(&f).unwrap();
         let mut cursor = std::io::Cursor::new(bytes);
@@ -658,6 +723,7 @@ mod tests {
             sha256: "ab".into(),
             mime: None,
             group: None,
+            update_pkg: false,
         });
         let bytes = encode(&plain).unwrap();
         assert!(
@@ -696,6 +762,7 @@ mod tests {
                 index: 0,
                 total: 4,
             }),
+            update_pkg: false,
         };
         let json = serde_json::to_vec(&new).unwrap();
         let old: OldControl = serde_json::from_slice(&json).unwrap();
@@ -880,5 +947,152 @@ mod tests {
             got.extend(drain(&mut dec));
         }
         assert_eq!(got, vec![chat("逐字节"), ping()]);
+    }
+
+    /// 中继更新控制帧往返一致（类型码 0x23–0x26 不与既有帧冲突）。
+    #[tokio::test]
+    async fn 中继更新帧往返一致() {
+        assert_eq!(
+            Control::UpdateCheckRequest {
+                req_id: "r".into(),
+                platform: "p".into()
+            }
+            .type_code(),
+            0x23
+        );
+        assert_eq!(
+            Control::UpdateFetchResult {
+                req_id: "r".into(),
+                ok: true,
+                error: None,
+                version: None,
+                signature: None
+            }
+            .type_code(),
+            0x26
+        );
+        let frames = vec![
+            Frame::Control(Control::UpdateCheckRequest {
+                req_id: "r1".into(),
+                platform: "windows-x86_64-nsis".into(),
+            }),
+            Frame::Control(Control::UpdateCheckResult {
+                req_id: "r1".into(),
+                ok: true,
+                version: Some("1.0.4".into()),
+                notes: Some("说明".into()),
+                signature: Some("c2ln".into()),
+                error: None,
+            }),
+            Frame::Control(Control::UpdateFetchRequest {
+                req_id: "r2".into(),
+                platform: "windows-x86_64-nsis".into(),
+            }),
+            Frame::Control(Control::UpdateFetchResult {
+                req_id: "r2".into(),
+                ok: false,
+                error: Some("下载失败".into()),
+                version: None,
+                signature: None,
+            }),
+        ];
+        for f in frames {
+            let bytes = encode(&f).unwrap();
+            let mut cursor = std::io::Cursor::new(bytes);
+            let got = read_frame(&mut cursor).await.unwrap().unwrap();
+            assert_eq!(got, f);
+        }
+    }
+
+    /// 混版锚点：旧版本发出的 Hello/HelloAck（无 app_version 与
+    /// relay_update 字段）必须能被新版解析、且两字段取默认值
+    /// （版本空串、不支持中继）——中继分流靠这个默认判「对端太旧」。
+    #[test]
+    fn 旧版握手帧缺省解析() {
+        let old_hello = serde_json::json!({
+            "t": "hello",
+            "device_id": "d1",
+            "device_name": "旧机",
+            "protocol": 3,
+            "code": "000000"
+        });
+        let c: Control = serde_json::from_value(old_hello).unwrap();
+        match c {
+            Control::Hello {
+                app_version,
+                relay_update,
+                ..
+            } => {
+                assert_eq!(app_version, "");
+                assert!(!relay_update);
+            }
+            _ => panic!("解析出的不是 Hello"),
+        }
+        let old_ack = serde_json::json!({
+            "t": "hello_ack",
+            "device_id": "d1",
+            "device_name": "旧机",
+            "accepted": true,
+            "reason": null
+        });
+        let c: Control = serde_json::from_value(old_ack).unwrap();
+        match c {
+            Control::HelloAck {
+                app_version,
+                relay_update,
+                ..
+            } => {
+                assert_eq!(app_version, "");
+                assert!(!relay_update);
+            }
+            _ => panic!("解析出的不是 HelloAck"),
+        }
+    }
+
+    /// 更新包要约标记往返：update_pkg=true 必须原样到达；老形态要约
+    /// （无此字段）解析得 false（普通文件），普通要约编码不带此字段。
+    #[test]
+    fn 更新包要约标记() {
+        let pkg = Control::FileOffer {
+            transfer_id: "t1".into(),
+            msg_id: "update:r1".into(),
+            name: "setup.exe".into(),
+            size: 10,
+            sha256: "ab".into(),
+            mime: None,
+            group: None,
+            update_pkg: true,
+        };
+        let json = serde_json::to_vec(&pkg).unwrap();
+        let back: Control = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back, pkg);
+        let old = serde_json::json!({
+            "t": "file_offer",
+            "transfer_id": "t1",
+            "msg_id": "m1",
+            "name": "a.txt",
+            "size": 1,
+            "sha256": "ab",
+            "mime": null
+        });
+        match serde_json::from_value::<Control>(old).unwrap() {
+            Control::FileOffer { update_pkg, .. } => assert!(!update_pkg),
+            _ => panic!("解析出的不是 FileOffer"),
+        }
+        let plain = Control::FileOffer {
+            transfer_id: "t1".into(),
+            msg_id: "m1".into(),
+            name: "a.txt".into(),
+            size: 1,
+            sha256: "ab".into(),
+            mime: None,
+            group: None,
+            update_pkg: false,
+        };
+        let bytes = serde_json::to_vec(&plain).unwrap();
+        assert!(
+            !bytes.windows(10).any(|w| w == b"update_pkg"),
+            "普通要约不应出现 update_pkg 字段"
+        );
     }
 }

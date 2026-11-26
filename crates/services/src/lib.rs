@@ -108,7 +108,28 @@ pub enum Event {
         attempt: u32,
         state: String,
     },
+    /// 中继更新的安装包已收齐并通过传输层哈希校验、落入更新暂存
+    /// 目录（中继更新功能起）：应用层据此做签名校验并走安装确认。
+    /// 注意：此事件只证明字节完整，签名未验——绝不可跳过验签直接装。
+    UpdatePackageReady {
+        transfer_id: String,
+        path: String,
+        name: String,
+        size: u64,
+    },
 }
+
+/// 中继更新查到的最新版信息（对端代取 latest.json 后回传）：版本号、
+/// 更新说明原文与本平台安装包的签名（收包后验签用）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelayUpdateInfo {
+    pub version: String,
+    pub notes: String,
+    pub signature: String,
+}
+
+/// 中继取包等待者的应答：（对端本次取包实际所据的版本, 签名）。
+type UpdateFetchReply = Result<(Option<String>, Option<String>), String>;
 
 /// 自动重连目标：一次成功出站连接留下的回拨信息（route 是应用层
 /// 的拨号路线，如 "bt:ble:<扫描id>" 或 "tcp:<addr>"，服务层不解读、
@@ -1213,6 +1234,8 @@ struct RecvState {
     since_save: u32,
     /// ⑳ .part 文件常驻句柄（首片时打开）：免逐片 open/close。
     file: Option<std::fs::File>,
+    /// 中继更新安装包：收齐后落更新暂存目录、不建消息不进接收目录。
+    update_pkg: bool,
 }
 
 /// 对端代理应答通道的消息（v2.6.1 起）：增量与完成分开建模，
@@ -1300,6 +1323,10 @@ struct PeerSession {
     /// 对方已发来 Goodbye 告别帧（#17）：本会话无论从哪条路径收尾
     /// （接收循环 EOF/心跳判死），都按「对方主动断开」分类、不重连。
     peer_goodbye: AtomicBool,
+    /// 握手时对端自报的应用版本（旧版本为空串）。
+    peer_app_version: String,
+    /// 握手时对端自报的中继更新能力位（旧版本恒 false）。
+    peer_relay_update: bool,
 }
 
 /// 心跳节奏：每 5 秒发一帧 Ping（协议控制帧，对端现成回 Pong，任何
@@ -1324,6 +1351,13 @@ pub struct Node {
     ai_cfg: Mutex<Option<AiConfig>>,
     accept_waiters: Mutex<HashMap<String, oneshot::Sender<Ranges>>>,
     verify_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// 中继更新等待者：查版本（req_id → 一次性应答通道）与取包
+    /// （req_id → 对端下载成败通道；包本体走文件传输事件，不经此表）。
+    update_check_waiters: Mutex<HashMap<String, oneshot::Sender<Result<RelayUpdateInfo, String>>>>,
+    update_fetch_waiters: Mutex<HashMap<String, oneshot::Sender<UpdateFetchReply>>>,
+    /// 更新暂存目录（数据目录下 updates）：中继收到的安装包落点与
+    /// 本机中继下载时的临时落点（传完即删，不留缓存——用户定案）。
+    updates_dir: PathBuf,
     recv_files: Mutex<HashMap<String, RecvState>>,
     proxy_waiters: Mutex<HashMap<String, tokio::sync::mpsc::Sender<ProxyRecv>>>,
     /// 双边同连仲裁（v2.6.1，见 begin_outbound_attempt）：出站尝试登记的
@@ -1478,6 +1512,9 @@ impl Node {
             ai_cfg: Mutex::new(None),
             accept_waiters: Mutex::new(HashMap::new()),
             verify_waiters: Mutex::new(HashMap::new()),
+            update_check_waiters: Mutex::new(HashMap::new()),
+            update_fetch_waiters: Mutex::new(HashMap::new()),
+            updates_dir: data_dir.join("updates"),
             recv_files: Mutex::new(HashMap::new()),
             proxy_waiters: Mutex::new(HashMap::new()),
             outbound_mark: Mutex::new(None),
@@ -1616,8 +1653,8 @@ impl Node {
         conn: &Conn,
         host: bool,
         code_from_peer_or_target: &str,
-    ) -> Result<Device, ServiceError> {
-        let peer = if host {
+    ) -> Result<(Device, String, bool), ServiceError> {
+        let (peer, peer_app_version, peer_relay_update) = if host {
             // 宿主侧：等对方 Hello，校验连接码
             log::log_verbose("conn", "握手步骤5/6：等待对方 Hello");
             match conn.recv().await? {
@@ -1625,6 +1662,8 @@ impl Node {
                     device_id,
                     device_name,
                     code,
+                    app_version,
+                    relay_update,
                     ..
                 }) => {
                     log::log_verbose(
@@ -1665,6 +1704,8 @@ impl Node {
                                 device_name: self.device_name.clone(),
                                 accepted: false,
                                 reason: Some("连接码不正确".into()),
+                                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                                relay_update: true,
                             }))
                             .await;
                         return Err(ServiceError::BadCode);
@@ -1674,18 +1715,24 @@ impl Node {
                         device_name: self.device_name.clone(),
                         accepted: true,
                         reason: None,
+                        app_version: env!("CARGO_PKG_VERSION").to_string(),
+                        relay_update: true,
                     }))
                     .await?;
                     log::log_verbose(
                         "conn",
                         &format!("握手步骤6/6：连接码校验通过，已回 HelloAck，握手完成（对方 {device_name}）"),
                     );
-                    Device {
-                        device_id,
-                        name: device_name,
-                        code: String::new(),
-                        last_seen: now_ms(),
-                    }
+                    (
+                        Device {
+                            device_id,
+                            name: device_name,
+                            code: String::new(),
+                            last_seen: now_ms(),
+                        },
+                        app_version,
+                        relay_update,
+                    )
                 }
                 _ => return Err(ServiceError::Other("握手失败：未收到 Hello".into())),
             }
@@ -1700,6 +1747,8 @@ impl Node {
                 device_name: self.device_name.clone(),
                 protocol: 3,
                 code: code_from_peer_or_target.to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                relay_update: true,
             }))
             .await?;
             // 双边同连仲裁：登记过出站尝试时，让行裁决与等 Ack 赛跑——
@@ -1724,6 +1773,8 @@ impl Node {
                     device_id,
                     device_name,
                     accepted,
+                    app_version,
+                    relay_update,
                     ..
                 }) => {
                     if !accepted {
@@ -1734,17 +1785,21 @@ impl Node {
                         "conn",
                         &format!("握手步骤6/6：收到 HelloAck，握手完成（对方 {device_name}）"),
                     );
-                    Device {
-                        device_id,
-                        name: device_name,
-                        code: String::new(),
-                        last_seen: now_ms(),
-                    }
+                    (
+                        Device {
+                            device_id,
+                            name: device_name,
+                            code: String::new(),
+                            last_seen: now_ms(),
+                        },
+                        app_version,
+                        relay_update,
+                    )
                 }
                 _ => return Err(ServiceError::Other("握手失败：未收到 HelloAck".into())),
             }
         };
-        Ok(peer)
+        Ok((peer, peer_app_version, peer_relay_update))
     }
 
     /// 在已建立的字节流上完成握手并接管连接（宿主侧 host=true 时校验对方给出的连接码）。
@@ -1757,7 +1812,7 @@ impl Node {
         let conn = Arc::new(conn);
         // 握手限时：连上不应答的端点（接受连接但不说协议）时 recv 会无限等，
         // 20 秒未完成握手即判失败（连接侧的取消也依赖尝试能自己收尾）。
-        let peer = tokio::time::timeout(
+        let (peer, peer_app_version, peer_relay_update) = tokio::time::timeout(
             std::time::Duration::from_secs(20),
             self.handshake(&conn, host, code_from_peer_or_target),
         )
@@ -1794,6 +1849,8 @@ impl Node {
             conversation_id,
             last_inbound_ms: AtomicU64::new(now_ms() as u64),
             peer_goodbye: AtomicBool::new(false),
+            peer_app_version,
+            peer_relay_update,
         });
         // #17：手动/自动连上即解除该对端的重连抑制（抑制只管自动重连）
         self.reconnect_suppress
@@ -2356,6 +2413,7 @@ impl Node {
                 sha256,
                 mime,
                 group,
+                update_pkg,
             }) => {
                 self.on_file_offer(
                     session,
@@ -2366,6 +2424,7 @@ impl Node {
                     sha256,
                     mime,
                     group,
+                    update_pkg,
                 )
                 .await?;
             }
@@ -2448,6 +2507,61 @@ impl Node {
                     thinking_applied,
                 })
                 .await;
+            }
+            Frame::Control(Control::UpdateCheckRequest { req_id, platform }) => {
+                // 中继更新·被请求方：代取更新信息后回结果（慢操作，
+                // 独立任务跑，不堵接收循环——与 AI 代理同口径）。
+                let node = self.clone();
+                let session2 = session.clone();
+                tokio::spawn(async move {
+                    let _ = node.serve_update_check(session2, req_id, platform).await;
+                });
+            }
+            Frame::Control(Control::UpdateCheckResult {
+                req_id,
+                ok,
+                version,
+                notes,
+                signature,
+                error,
+            }) => {
+                if let Some(tx) = self.update_check_waiters.lock().await.remove(&req_id) {
+                    let res = if ok {
+                        Ok(RelayUpdateInfo {
+                            version: version.unwrap_or_default(),
+                            notes: notes.unwrap_or_default(),
+                            signature: signature.unwrap_or_default(),
+                        })
+                    } else {
+                        Err(error.unwrap_or_else(|| "对端取更新信息失败".to_string()))
+                    };
+                    let _ = tx.send(res);
+                }
+            }
+            Frame::Control(Control::UpdateFetchRequest { req_id, platform }) => {
+                // 中继更新·被请求方：下载安装包并经文件通道回传，
+                // 传完即删本地临时包（不留缓存，用户定案）。
+                let node = self.clone();
+                let session2 = session.clone();
+                tokio::spawn(async move {
+                    let _ = node.serve_update_fetch(session2, req_id, platform).await;
+                });
+            }
+            Frame::Control(Control::UpdateFetchResult {
+                req_id,
+                ok,
+                error,
+                version,
+                signature,
+            }) => {
+                if let Some(tx) = self.update_fetch_waiters.lock().await.remove(&req_id) {
+                    let res = if ok {
+                        Ok((version, signature))
+                    } else {
+                        Err(error.unwrap_or_else(|| "对端下载更新包失败".to_string()))
+                    };
+                    let _ = tx.send(res);
+                }
             }
         }
         Ok(())
@@ -3455,6 +3569,7 @@ impl Node {
                 prep.transfer_id.clone(),
                 prep.msg_id.clone(),
                 None,
+                false,
             )
             .await?;
         let tid = prep.transfer_id.clone();
@@ -3519,6 +3634,7 @@ impl Node {
                     prep.transfer_id.clone(),
                     prep.msg_id.clone(),
                     None,
+                    false,
                 )
                 .await
             {
@@ -3663,6 +3779,7 @@ impl Node {
         transfer_id: String,
         msg_id: String,
         group: Option<GroupRef>,
+        update_pkg: bool,
     ) -> Result<TransferRun, ServiceError> {
         // 等待对方的已收区间（续传）
         let (tx, rx) = oneshot::channel();
@@ -3680,6 +3797,7 @@ impl Node {
                 sha256: sha,
                 mime: None,
                 group,
+                update_pkg,
             }))
             .await?;
         let received = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
@@ -3974,6 +4092,7 @@ impl Node {
                         index: i as u32,
                         total,
                     }),
+                    false,
                 )
                 .await;
             match run {
@@ -4017,6 +4136,7 @@ impl Node {
         sha256: String,
         _mime: Option<String>,
         group: Option<GroupRef>,
+        update_pkg: bool,
     ) -> Result<(), ServiceError> {
         // 恢复已有进度：传输记录 + .part 文件都在才算数
         let part_path = self.download_dir().join(format!("{transfer_id}.part"));
@@ -4055,17 +4175,24 @@ impl Node {
                 process_ms: 0.0,
                 since_save: 0,
                 file: None,
+                update_pkg,
             },
         );
-        self.storage.save_file(&FileMeta {
-            id: file_id.clone(),
-            name: name.clone(),
-            size,
-            sha256: sha256.clone(),
-            path: String::new(),
-            mime: None,
-        })?;
+        // 更新包不进文件库、不建消息：只走传输账与专用落地（on_file_done）。
+        if !update_pkg {
+            self.storage.save_file(&FileMeta {
+                id: file_id.clone(),
+                name: name.clone(),
+                size,
+                sha256: sha256.clone(),
+                path: String::new(),
+                mime: None,
+            })?;
+        }
         match &group {
+            // 更新包：无组、无消息，收齐后由 on_file_done 发专用事件
+            _ if update_pkg => {}
+            // 图片组成员：不单独建消息行，并入组消息清单（首个成员建组）
             // 图片组成员：不单独建消息行，并入组消息清单（首个成员建组）
             Some(g) => {
                 self.upsert_group_member(
@@ -4441,27 +4568,56 @@ impl Node {
         drop(st.file.take());
         // #13 按日分夹：落地进接收目录下以接收日期命名的子文件夹
         // （自动创建）；半成品 .part 仍留在接收目录根下不挪窝。
-        let date_dir = self.download_dir().join(receive_date_dir_name(now_ms()));
-        let final_path = date_dir.join(&st.name);
+        // 中继更新包例外：落更新暂存目录、文件名只取末段（防对端给的
+        // 名字带路径穿越），且不走消息/文件库回写，只把传输账收尾。
+        let (land_dir, final_path) = if st.update_pkg {
+            let fname = Path::new(&st.name)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "update-package.bin".to_string());
+            let dir = self.updates_dir.clone();
+            let p = dir.join(fname);
+            (dir, p)
+        } else {
+            let dir = self.download_dir().join(receive_date_dir_name(now_ms()));
+            let p = dir.join(&st.name);
+            (dir, p)
+        };
         // rename/落库失败同判该文件失败（不冒泡挂死发送端）。
         let mut ok = ok;
         if ok {
-            let landed = std::fs::create_dir_all(&date_dir)
+            let landed = std::fs::create_dir_all(&land_dir)
                 .and_then(|_| std::fs::rename(&st.part_path, &final_path))
                 .and_then(|_| {
-                    // ⑳ 三笔回写（消息状态/落地路径/传输收尾）合并成一个
-                    // 事务，只剩一次提交落盘——文件菜单靠落地路径定位。
-                    self.storage
-                        .finish_received_file(
-                            &st.msg_id,
-                            &st.file_id,
-                            &final_path.to_string_lossy(),
-                            &transfer_id,
-                            &session.peer.device_id,
-                            st.total,
-                            &st.ranges,
-                        )
-                        .map_err(std::io::Error::other)
+                    if st.update_pkg {
+                        // 更新包：传输账标完成即可（无消息/文件记录可回写）
+                        self.storage
+                            .save_transfer(
+                                &transfer_id,
+                                "",
+                                "in",
+                                &session.peer.device_id,
+                                st.total,
+                                &vec![(0, st.total)],
+                                "done",
+                            )
+                            .map_err(std::io::Error::other)
+                    } else {
+                        // ⑳ 三笔回写（消息状态/落地路径/传输收尾）合并成一个
+                        // 事务，只剩一次提交落盘——文件菜单靠落地路径定位。
+                        self.storage
+                            .finish_received_file(
+                                &st.msg_id,
+                                &st.file_id,
+                                &final_path.to_string_lossy(),
+                                &transfer_id,
+                                &session.peer.device_id,
+                                st.total,
+                                &st.ranges,
+                            )
+                            .map_err(std::io::Error::other)
+                    }
                 });
             if let Err(e) = landed {
                 log::log_line(
@@ -4477,6 +4633,16 @@ impl Node {
                 state: "done".into(),
                 msg_id: st.msg_id.clone(),
             });
+            if st.update_pkg {
+                // 更新包就位：应用层接手验签与安装确认（签名未验，
+                // 事件注释已写明，应用层绝不可跳过验签直接装）。
+                self.emit(Event::UpdatePackageReady {
+                    transfer_id: transfer_id.clone(),
+                    path: final_path.to_string_lossy().to_string(),
+                    name: st.name.clone(),
+                    size: st.total,
+                });
+            }
             log::log_line(
                 "files",
                 &format!(
@@ -4522,6 +4688,342 @@ impl Node {
             .send(&Frame::Control(Control::FileVerify { transfer_id, ok }))
             .await?;
         Ok(())
+    }
+
+    // ---------- 中继更新（内网机经外网机代下安装包） ----------
+
+    /// 中继代取/代下用的 HTTP 客户端：若环境里设了 HTTPS_PROXY 则
+    /// 显式沿用（部分网络环境只能经代理出网，reqwest 默认构建不读
+    /// 环境变量）；没设则直连，与普通机器上的行为一致。根证书除
+    /// 内置集外再并入系统证书库——经企业代理出网时对端证书常由
+    /// 企业 CA 签发，只认内置集会误判连不上。
+    fn update_http_client() -> reqwest::Client {
+        let mut builder = reqwest::Client::builder()
+            .tls_built_in_native_certs(true)
+            // 总超时与取包等待者（十分钟）对齐，防慢速连接无限挂起
+            .timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(std::time::Duration::from_secs(30));
+        if let Ok(p) = std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("https_proxy")) {
+            if let Ok(proxy) = reqwest::Proxy::all(&p) {
+                builder = builder.proxy(proxy);
+            }
+        }
+        builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// 代取最新版更新信息：拉更新端点的 latest.json，按平台键取出
+    /// 版本号、说明、下载地址与签名。端点与应用内更新（updater 插件）
+    /// 同一地址——GitHub 最新正式版，草稿不会被推送到这里。
+    async fn fetch_latest_update(platform: &str) -> Result<(RelayUpdateInfo, String), String> {
+        const ENDPOINT: &str =
+            "https://github.com/123zpc/BlueLink-Refactor/releases/latest/download/latest.json";
+        let client = Self::update_http_client();
+        let resp = client
+            .get(ENDPOINT)
+            .send()
+            .await
+            .map_err(|e| format!("连不上更新服务器：{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("更新服务器返回 {}", resp.status()));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("更新信息解析失败：{e}"))?;
+        let version = v
+            .get("version")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if version.is_empty() {
+            return Err("更新信息缺少版本号".into());
+        }
+        let notes = v
+            .get("notes")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let entry = v
+            .get("platforms")
+            .and_then(|p| p.get(platform))
+            .ok_or_else(|| format!("更新信息里没有本平台（{platform}）的安装包"))?;
+        let dl = entry
+            .get("url")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let signature = entry
+            .get("signature")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if dl.is_empty() || signature.is_empty() {
+            return Err("更新信息不完整（缺下载地址或签名）".into());
+        }
+        // 下载地址只认官方仓库域名：更新信息虽经 HTTPS 取回，多一道
+        // 前缀校验防将来端点/内容被篡改时把下载引去别处（终局还有验签）
+        if !dl.starts_with("https://github.com/") {
+            return Err("更新信息里的下载地址不是官方地址，已拒绝".into());
+        }
+        Ok((
+            RelayUpdateInfo {
+                version,
+                notes,
+                signature,
+            },
+            dl,
+        ))
+    }
+
+    /// 把最新版安装包下载到更新暂存目录，返回本地路径与本次取包所据
+    /// 的更新信息（文件名取下载地址末段）。整体读入内存再落盘：安装
+    /// 包十几 MB 可接受，换来失败时不留半截文件；落盘先写临时名再
+    /// 改名，防半写文件被当完整包。大小上限 200 MB：官方包远小于此，
+    /// 超限视为异常来源、直接拒绝（防异常响应打爆内存/磁盘）。
+    async fn download_update_package(
+        &self,
+        platform: &str,
+        req_id: &str,
+    ) -> Result<(PathBuf, RelayUpdateInfo), String> {
+        const MAX_PKG_BYTES: u64 = 200 * 1024 * 1024;
+        let (info, dl) = Self::fetch_latest_update(platform).await?;
+        let fname = dl
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("update-package.bin")
+            .to_string();
+        let client = Self::update_http_client();
+        let resp = client
+            .get(&dl)
+            .send()
+            .await
+            .map_err(|e| format!("下载更新包失败：{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("下载更新包失败：服务器返回 {}", resp.status()));
+        }
+        if let Some(n) = resp.content_length() {
+            if n > MAX_PKG_BYTES {
+                return Err("更新包大小异常（超过 200 MB），已拒绝下载".into());
+            }
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("下载更新包中断：{e}"))?;
+        if bytes.len() as u64 > MAX_PKG_BYTES {
+            return Err("更新包大小异常（超过 200 MB），已拒绝".into());
+        }
+        std::fs::create_dir_all(&self.updates_dir)
+            .map_err(|e| format!("建更新暂存目录失败：{e}"))?;
+        let path = self.updates_dir.join(&fname);
+        let tmp = self.updates_dir.join(format!(".relay-{req_id}.tmp"));
+        std::fs::write(&tmp, &bytes).map_err(|e| format!("写更新包失败：{e}"))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("落更新包失败：{e}"))?;
+        Ok((path, info))
+    }
+
+    /// 中继更新·被请求方处理查版本：代取最新版信息后回给请求方。
+    async fn serve_update_check(
+        &self,
+        session: Arc<PeerSession>,
+        req_id: String,
+        platform: String,
+    ) -> Result<(), ServiceError> {
+        let (ok, version, notes, signature, error) =
+            match Self::fetch_latest_update(&platform).await {
+                Ok((info, _url)) => (
+                    true,
+                    Some(info.version),
+                    Some(info.notes),
+                    Some(info.signature),
+                    None,
+                ),
+                Err(e) => (false, None, None, None, Some(e)),
+            };
+        session
+            .conn
+            .send(&Frame::Control(Control::UpdateCheckResult {
+                req_id,
+                ok,
+                version,
+                notes,
+                signature,
+                error,
+            }))
+            .await?;
+        Ok(())
+    }
+
+    /// 中继更新·被请求方处理取包：下载安装包 → 回「已就绪」→ 经文件
+    /// 通道（update_pkg 标记）发给请求方 → 无论成败删本地临时包
+    /// （外网机不留缓存，用户定案）。包本体的到达与完整性由文件传输
+    /// 自身的进度/校验事件负责，本函数只管下载阶段的成败回执。
+    async fn serve_update_fetch(
+        &self,
+        session: Arc<PeerSession>,
+        req_id: String,
+        platform: String,
+    ) -> Result<(), ServiceError> {
+        let (tmp, info) = match self.download_update_package(&platform, &req_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::log_line("update", &format!("中继代下更新包失败：{e}"));
+                let _ = session
+                    .conn
+                    .send(&Frame::Control(Control::UpdateFetchResult {
+                        req_id,
+                        ok: false,
+                        error: Some(e),
+                        version: None,
+                        signature: None,
+                    }))
+                    .await;
+                return Ok(());
+            }
+        };
+        log::log_line(
+            "update",
+            &format!("中继代下更新包完成：{}，开始经蓝牙回传", tmp.display()),
+        );
+        if let Err(e) = session
+            .conn
+            .send(&Frame::Control(Control::UpdateFetchResult {
+                req_id: req_id.clone(),
+                ok: true,
+                error: None,
+                // 与下载同一次快照的版本与签名随应答回传，请求方据此
+                // 核对所示版本、并以这份签名验包（评审补强：防两次
+                // 请求间发布变化导致签名与包错位）
+                version: Some(info.version.clone()),
+                signature: Some(info.signature.clone()),
+            }))
+            .await
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ServiceError::Other(format!("回取包应答失败：{e}")));
+        }
+        let name = tmp
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        let sha = sha256_file(&tmp)?;
+        let transfer_id = derive_transfer_id(&sha, &session.peer.device_id);
+        let msg_id = format!("update:{req_id}");
+        let run = self
+            .run_file_transfer(
+                &session,
+                &tmp,
+                name,
+                size,
+                sha,
+                transfer_id,
+                msg_id,
+                None,
+                true,
+            )
+            .await;
+        // 传完即删：成功、失败、被取消都删，不在本机留缓存包
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = run {
+            log::log_line("update", &format!("中继回传更新包失败：{e}"));
+        }
+        Ok(())
+    }
+
+    /// 当前对端的中继更新能力：（对端名、对端版本、是否支持中继）。
+    /// 未连接时返回 None。应用层据此做检查更新的分流提示。
+    pub async fn peer_update_caps(&self) -> Option<(String, String, bool)> {
+        let session = self.peer.lock().await.clone()?;
+        Some((
+            session.peer.name.clone(),
+            session.peer_app_version.clone(),
+            session.peer_relay_update,
+        ))
+    }
+
+    /// 中继更新·请求方查版本：请当前对端代取最新版信息。
+    pub async fn relay_update_check(
+        &self,
+        platform: &str,
+    ) -> Result<RelayUpdateInfo, ServiceError> {
+        let session = self.session().await?;
+        let req_id = new_id();
+        let (tx, rx) = oneshot::channel();
+        self.update_check_waiters
+            .lock()
+            .await
+            .insert(req_id.clone(), tx);
+        if let Err(e) = session
+            .conn
+            .send(&Frame::Control(Control::UpdateCheckRequest {
+                req_id: req_id.clone(),
+                platform: platform.to_string(),
+            }))
+            .await
+        {
+            self.update_check_waiters.lock().await.remove(&req_id);
+            return Err(ServiceError::Other(format!("发送中继查版本请求失败：{e}")));
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+            Ok(Ok(Ok(info))) => Ok(info),
+            Ok(Ok(Err(msg))) => Err(ServiceError::Other(msg)),
+            Ok(Err(_)) => {
+                self.update_check_waiters.lock().await.remove(&req_id);
+                Err(ServiceError::Other("对端连接已断开".into()))
+            }
+            Err(_) => {
+                self.update_check_waiters.lock().await.remove(&req_id);
+                Err(ServiceError::Other("对端取更新信息超时".into()))
+            }
+        }
+    }
+
+    /// 中继更新·请求方取包：请对端下载安装包并经文件通道回传。
+    /// 返回（req_id, 对端本次取包实际所据的版本, 签名）；包的进度走
+    /// 传输事件（msg_id 为 update:{req_id}），到达走
+    /// UpdatePackageReady 事件，应用层据此推进更新框。
+    pub async fn relay_update_fetch(
+        &self,
+        platform: &str,
+    ) -> Result<(String, Option<String>, Option<String>), ServiceError> {
+        let session = self.session().await?;
+        let req_id = new_id();
+        let (tx, rx) = oneshot::channel();
+        self.update_fetch_waiters
+            .lock()
+            .await
+            .insert(req_id.clone(), tx);
+        if let Err(e) = session
+            .conn
+            .send(&Frame::Control(Control::UpdateFetchRequest {
+                req_id: req_id.clone(),
+                platform: platform.to_string(),
+            }))
+            .await
+        {
+            self.update_fetch_waiters.lock().await.remove(&req_id);
+            return Err(ServiceError::Other(format!("发送中继取包请求失败：{e}")));
+        }
+        // 对端下载十几 MB 需要时间：给足十分钟，超时按失败处理
+        match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+            Ok(Ok(Ok((version, signature)))) => Ok((req_id, version, signature)),
+            Ok(Ok(Err(msg))) => Err(ServiceError::Other(msg)),
+            Ok(Err(_)) => {
+                self.update_fetch_waiters.lock().await.remove(&req_id);
+                Err(ServiceError::Other("对端连接已断开".into()))
+            }
+            Err(_) => {
+                self.update_fetch_waiters.lock().await.remove(&req_id);
+                Err(ServiceError::Other("对端下载更新包超时".into()))
+            }
+        }
+    }
+
+    /// 更新暂存目录（应用层校验待装包路径、清理无主包时用）。
+    pub fn updates_dir(&self) -> PathBuf {
+        self.updates_dir.clone()
     }
 
     // ---------- 存储与文件 ----------

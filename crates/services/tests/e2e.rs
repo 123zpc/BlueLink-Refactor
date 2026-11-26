@@ -267,3 +267,99 @@ async fn 复制图片失败口径() {
     let err = a.copy_image_blocking(&bad).unwrap_err().to_string();
     assert!(err.contains("解码失败"), "实际：{err}");
 }
+
+/// 中继更新全链（需真实外网，默认忽略，手动以 --ignored 跑）：乙
+/// （外网机）代查 latest.json → 甲（内网机）拿到版本与签名；乙代下
+/// Windows 安装包经环回传给甲 → 甲收到 UpdatePackageReady；用发布
+/// 公钥验签必须通过；乙侧暂存目录传完即删不留包；甲侧不产生任何
+/// 聊天文件消息。依赖线上当前正式版存在，只断言结构不断言版本号。
+#[tokio::test]
+#[ignore = "需要真实访问 GitHub 更新端点"]
+async fn 中继更新全链() {
+    use bluelink_services::Event;
+    let dir_a = 临时目录("upd-a");
+    let dir_b = 临时目录("upd-b");
+    let a = Node::new(&dir_a, "内网机").unwrap();
+    let b = Node::new(&dir_b, "外网机").unwrap();
+    连接两节点(&a, &b).await;
+
+    // 握手能力位：甲眼中的乙应自报版本且支持中继
+    let (name, ver, relay) = a.peer_update_caps().await.expect("应已连接");
+    assert_eq!(name, "外网机");
+    assert_eq!(ver, env!("CARGO_PKG_VERSION"));
+    assert!(relay, "新版对端应支持中继");
+
+    // 查版本：乙代取真实 latest.json
+    let info = a.relay_update_check("windows-x86_64-nsis").await.unwrap();
+    assert!(!info.version.is_empty(), "应查到版本号");
+    assert!(!info.signature.is_empty(), "应带安装包签名");
+
+    // 取包：先起事件收集任务再发请求，等包到达（下载+传输给足十分钟）
+    let (tx, rx) = tokio::sync::oneshot::channel::<(String, String, u64)>();
+    let mut ev = a.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match ev.recv().await {
+                Ok(Event::UpdatePackageReady {
+                    path, name, size, ..
+                }) => {
+                    let _ = tx.send((path, name, size));
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    let (_req_id, fetch_version, fetch_signature) =
+        a.relay_update_fetch("windows-x86_64-nsis").await.unwrap();
+    // 取包快照应与查版本同源（两次请求间无新发布时必然一致）
+    assert_eq!(fetch_version.as_deref(), Some(info.version.as_str()));
+    let fetch_signature = fetch_signature.expect("取包应答应带签名");
+    let (path, name, size) = tokio::time::timeout(Duration::from_secs(600), rx)
+        .await
+        .expect("等更新包到达超时")
+        .expect("事件收集任务提前结束");
+    assert!(name.ends_with(".exe"), "应为 Windows 安装包：{name}");
+    assert!(size > 1_000_000, "安装包大小异常：{size}");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        size,
+        "落地文件大小应与事件一致"
+    );
+
+    // 验签：发布公钥（与应用内更新同一把）必须验过
+    {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use minisign_verify::{PublicKey, Signature};
+        const PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ2RjhGRjhCRUMwNDJGRDMKUldUVEx3VHNpLy80MXJTRzRpbkFsajlzTElqUXpZNTczTWxxQmhNRHMybXZ2b1hMTWl0Zzc3U0UK";
+        let data = std::fs::read(&path).unwrap();
+        let pk_text = String::from_utf8(STANDARD.decode(PUBKEY).unwrap()).unwrap();
+        let pk = PublicKey::decode(&pk_text).unwrap();
+        let sig_text = String::from_utf8(STANDARD.decode(fetch_signature.trim()).unwrap()).unwrap();
+        let sig = Signature::decode(&sig_text).unwrap();
+        pk.verify(&data, &sig, true).expect("更新包验签应通过");
+    }
+
+    // 乙侧不留缓存：其更新暂存目录下不应残留安装包
+    let b_updates = dir_b.join("updates");
+    if b_updates.exists() {
+        for e in std::fs::read_dir(&b_updates).unwrap() {
+            let p = e.unwrap().path();
+            assert!(
+                !p.to_string_lossy().ends_with(".exe"),
+                "外网机不应留缓存包：{}",
+                p.display()
+            );
+        }
+    }
+
+    // 甲侧聊天里不应多出任何消息（更新包不走聊天文件通道的呈现）
+    for c in a.storage.list_conversations().unwrap() {
+        assert!(
+            a.storage.list_messages(&c.id, None, 50).unwrap().is_empty(),
+            "更新包不应产生聊天消息"
+        );
+    }
+}
