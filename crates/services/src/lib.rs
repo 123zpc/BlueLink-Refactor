@@ -550,6 +550,17 @@ enum TransferRun {
     Cancelled,
 }
 
+/// 已备好的待发文件（消息已落库上屏、尚未开传）：prepare_file_send
+/// 的产物，send_file / send_files_batch 据此跑传输并收尾。
+struct PreparedFileSend {
+    msg_id: String,
+    name: String,
+    size: u64,
+    sha: String,
+    transfer_id: String,
+    path: PathBuf,
+}
+
 pub fn derive_transfer_id(file_sha: &str, peer_id: &str) -> String {
     let d = Sha256::digest(format!("{file_sha}:{peer_id}").as_bytes());
     format!(
@@ -739,6 +750,52 @@ fn clip_write_with(cb: &mut arboard::Clipboard, content: &ClipContent) -> Result
             })
             .map_err(|e| e.to_string()),
     }
+}
+
+/// 剪贴板当前所有者所属进程的可执行文件名（仅 Windows 实现）：
+/// 读到「被占用」时点名占用者，省得再靠猜（v1.0.4 #6 诊断）。
+/// 注意 GetClipboardOwner 给的是「最后往剪贴板放数据的窗口」，
+/// 与「此刻正打开剪贴板读写的进程」不完全是一回事——日志措辞
+/// 按「占用者」记，定性时留有余地；拿不到就返回 None 不硬凑。
+#[cfg(windows)]
+fn clipboard_owner_desc() -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::DataExchange::GetClipboardOwner;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    unsafe {
+        let hwnd = GetClipboardOwner();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if proc.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(proc, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(proc);
+        if ok == 0 || len == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        let name = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+        Some(format!("{name}（PID {pid}）"))
+    }
+}
+
+/// 非 Windows 平台暂无所有者查询实现。
+#[cfg(not(windows))]
+fn clipboard_owner_desc() -> Option<String> {
+    None
 }
 
 /// 远端内容写入本机剪贴板的结果（v2.6.5，#8 定案）。
@@ -942,6 +999,9 @@ pub enum ManualSyncOutcome {
     PeerOff,
     /// 没攒到可同步的内容（或全部超限/发送失败）。
     Empty,
+    /// 手动触发时现读剪贴板被其他程序占用：这次没读到新内容、
+    /// 也没拿旧存货冒充（v1.0.4 #6）。
+    Occupied,
 }
 
 /// poll 一次读到本机内容后的裁决（#16 状态机，纯逻辑可单测）。
@@ -2853,6 +2913,49 @@ impl Node {
             log::log_line("clipboard", "手动同步未发出：对方未开启剪贴板同步");
             return ManualSyncOutcome::PeerOff;
         }
+        // v1.0.4 #6：触发时先现读一次剪贴板（500ms 截止、读不到不硬
+        // 等），读到的新内容以它为准——旧行为只发历史存货，剪贴板被
+        // 占用期间复制的内容进不了历史，按快捷键只能发旧货、观感像
+        // 没触发。现读被占用则明确 Occupied，绝不静默发旧货装样子；
+        // 现读走与监视同一套裁决（poll_decide），回声不回发、无变化
+        // 不重复记。读超时/任务失败 = 这次没读到（多半正是被占用卡
+        // 住），同样按 Occupied 收尾、绝不回落历史发旧货（第三方评审
+        // 采纳：回落发旧货正是 #6 投诉的形态本身）。
+        {
+            let node = self.clone();
+            let fresh = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::task::spawn_blocking(move || node.with_clipboard(clip_read_with)),
+            )
+            .await;
+            if !matches!(fresh, Ok(Ok(_))) {
+                log::log_line(
+                    "clipboard",
+                    "手动同步未发出：现读剪贴板超时（500ms 内没读到，可能被其他程序占用），这次没读到新内容",
+                );
+                return ManualSyncOutcome::Occupied;
+            }
+            if let Ok(Ok(Some(read))) = fresh {
+                if read.occupied && read.content.is_none() {
+                    let owner = clipboard_owner_desc()
+                        .map(|o| format!("（占用者：{o}）"))
+                        .unwrap_or_default();
+                    log::log_line(
+                        "clipboard",
+                        &format!(
+                            "手动同步未发出：现读剪贴板被其他程序占用{owner}，这次没读到新内容"
+                        ),
+                    );
+                    return ManualSyncOutcome::Occupied;
+                }
+                if let Some(content) = read.content {
+                    let mut g = self.clip_guard.lock().await;
+                    if matches!(g.poll_decide(&content), ClipPollDecision::Send) {
+                        g.note_history(content);
+                    }
+                }
+            }
+        }
         let items = {
             let g = self.clip_guard.lock().await;
             g.history_latest(self.clipboard_sync_count())
@@ -2960,9 +3063,12 @@ impl Node {
             if due {
                 g.last_read_fail_log = Some(std::time::Instant::now());
                 drop(g);
+                let owner = clipboard_owner_desc()
+                    .map(|o| format!("（占用者：{o}）"))
+                    .unwrap_or_default();
                 log::log_line(
                     "clipboard",
-                    "读取本机剪贴板失败：剪贴板被其他程序占用，本轮跳过（不重试）",
+                    &format!("读取本机剪贴板失败：剪贴板被其他程序占用{owner}，本轮跳过（不重试）"),
                 );
             }
             return;
@@ -3338,6 +3444,114 @@ impl Node {
     /// 发送文件：流式分片、断点续传、选择性压缩。返回传输 ID。
     pub async fn send_file(&self, path: &Path) -> Result<String, ServiceError> {
         let session = self.session().await?;
+        let prep = self.prepare_file_send(&session, path).await?;
+        let run = self
+            .run_file_transfer(
+                &session,
+                &prep.path,
+                prep.name.clone(),
+                prep.size,
+                prep.sha.clone(),
+                prep.transfer_id.clone(),
+                prep.msg_id.clone(),
+                None,
+            )
+            .await?;
+        let tid = prep.transfer_id.clone();
+        self.finish_file_send(&prep, run).await;
+        Ok(tid)
+    }
+
+    /// 批量发送文件（v1.0.4 #8 排队环）：先把整批消息全部落库上屏、
+    /// 逐个发「排队中」状态（前端据此给每个气泡挂灰色等待环），然后
+    /// 按序逐个真传——与旧前端逐个 invoke 的语义一致：单个失败记入
+    /// 返回的说明列表、不堵后面。返回逐个的失败说明（空 = 全部发出）。
+    pub async fn send_files_batch(&self, paths: &[PathBuf]) -> Vec<String> {
+        let mut errors = Vec::new();
+        let session = match self.session().await {
+            Ok(s) => s,
+            Err(e) => {
+                return paths
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "文件「{}」发送失败：{e}",
+                            p.file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| p.to_string_lossy().to_string())
+                        )
+                    })
+                    .collect();
+            }
+        };
+        let mut prepared: Vec<PreparedFileSend> = Vec::with_capacity(paths.len());
+        for p in paths {
+            match self.prepare_file_send(&session, p).await {
+                Ok(prep) => {
+                    self.emit(Event::TransferState {
+                        transfer_id: prep.transfer_id.clone(),
+                        state: "queued".into(),
+                        msg_id: prep.msg_id.clone(),
+                    });
+                    prepared.push(prep);
+                }
+                Err(e) => errors.push(format!(
+                    "文件「{}」发送失败：{e}",
+                    p.file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.to_string_lossy().to_string())
+                )),
+            }
+        }
+        for prep in &prepared {
+            // 排队期间被用户取消：不发要约、直接按取消收尾
+            if self.take_cancelled(&prep.transfer_id).await {
+                self.finish_cancelled(&prep.transfer_id, &prep.msg_id).await;
+                continue;
+            }
+            match self
+                .run_file_transfer(
+                    &session,
+                    &prep.path,
+                    prep.name.clone(),
+                    prep.size,
+                    prep.sha.clone(),
+                    prep.transfer_id.clone(),
+                    prep.msg_id.clone(),
+                    None,
+                )
+                .await
+            {
+                Ok(run) => self.finish_file_send(prep, run).await,
+                Err(e) => {
+                    // 传输主体出错（如会话中断）：消息标失败并清掉
+                    // 气泡上的环，失败记入说明；后面的照常逐个尝试
+                    let _ = self
+                        .storage
+                        .update_message_status(&prep.msg_id, MessageStatus::Failed);
+                    self.emit(Event::MessageStatus {
+                        id: prep.msg_id.clone(),
+                        status: MessageStatus::Failed,
+                    });
+                    self.emit(Event::TransferState {
+                        transfer_id: prep.transfer_id.clone(),
+                        state: "cancelled".into(),
+                        msg_id: prep.msg_id.clone(),
+                    });
+                    errors.push(format!("文件「{}」发送失败：{e}", prep.name));
+                }
+            }
+        }
+        errors
+    }
+
+    /// 备好一个待发文件：读元数据、算哈希、落文件记录与消息并发
+    /// MessageNew。send_file 与 send_files_batch 共用。
+    async fn prepare_file_send(
+        &self,
+        session: &Arc<PeerSession>,
+        path: &Path,
+    ) -> Result<PreparedFileSend, ServiceError> {
         let meta = std::fs::metadata(path)?;
         let size = meta.len();
         let name = path
@@ -3369,21 +3583,24 @@ impl Node {
         };
         msg.seq = self.storage.insert_message(&msg)?;
         self.emit(Event::MessageNew(msg.clone()));
+        Ok(PreparedFileSend {
+            msg_id: msg.id,
+            name,
+            size,
+            sha,
+            transfer_id,
+            path: path.to_path_buf(),
+        })
+    }
 
-        match self
-            .run_file_transfer(
-                &session,
-                path,
-                name.clone(),
-                size,
-                sha.clone(),
-                transfer_id.clone(),
-                msg.id.clone(),
-                None,
-            )
-            .await?
-        {
-            TransferRun::Cancelled => Ok(transfer_id),
+    /// 一次文件发送跑完后按结果收尾（完成日志、消息状态、状态事件）：
+    /// send_file 与批量发送共用，口径与旧单发完全一致。Cancelled 时
+    /// run_file_transfer 内部已走 finish_cancelled，这里不重复处理。
+    async fn finish_file_send(&self, prep: &PreparedFileSend, run: TransferRun) {
+        let (name, size, transfer_id, msg_id) =
+            (&prep.name, prep.size, &prep.transfer_id, &prep.msg_id);
+        match run {
+            TransferRun::Cancelled => {}
             TransferRun::Done {
                 ok,
                 wire_bytes,
@@ -3396,36 +3613,37 @@ impl Node {
                         &format!(
                             "文件发送完成：{name}，原始 {size} 字节，空中 {wire_bytes} 字节，耗时 {} 毫秒，压缩 {}",
                             started.elapsed().as_millis(),
-                            if used_compression { COMPRESSION_LABEL } else { "无" },
+                            if used_compression { COMPRESSION_LABEL } else { "无" }
                         ),
                     );
-                    self.storage
-                        .update_message_status(&msg.id, MessageStatus::Delivered)?;
+                    let _ = self
+                        .storage
+                        .update_message_status(msg_id, MessageStatus::Delivered);
                     // 状态事件补发：文件消息没有 Delivered 控制帧回执，
                     // 不发事件前端气泡会一直停在「发送中」（v2.5.2 前的老缺口）
                     self.emit(Event::MessageStatus {
-                        id: msg.id.clone(),
+                        id: msg_id.clone(),
                         status: MessageStatus::Delivered,
                     });
                     self.emit(Event::TransferState {
                         transfer_id: transfer_id.clone(),
                         state: "done".into(),
-                        msg_id: msg.id.clone(),
+                        msg_id: msg_id.clone(),
                     });
                 } else {
-                    self.storage
-                        .update_message_status(&msg.id, MessageStatus::Failed)?;
+                    let _ = self
+                        .storage
+                        .update_message_status(msg_id, MessageStatus::Failed);
                     self.emit(Event::MessageStatus {
-                        id: msg.id.clone(),
+                        id: msg_id.clone(),
                         status: MessageStatus::Failed,
                     });
                     self.emit(Event::TransferState {
                         transfer_id: transfer_id.clone(),
                         state: "verify_failed".into(),
-                        msg_id: msg.id.clone(),
+                        msg_id: msg_id.clone(),
                     });
                 }
-                Ok(transfer_id)
             }
         }
     }
@@ -3486,6 +3704,65 @@ impl Node {
         let mut used_compression = false;
         let mut file = std::fs::File::open(path)?;
         let mut sent_total = covered_bytes(&received);
+        // v1.0.4 验后 #1：发送进度改报「已上空」估算，不再按已入队字节。
+        // conn.send 返回只代表帧进了出站队列（8 帧深、帧可达 256KB，
+        // 慢链路上队列里能堵住近四成文件），旧口径发送端虚高、接收端
+        // 按落盘真值走，两边对不上（真机实测发送 34% vs 接收 4%）。
+        // 新口径与排空段同一公式：进度 = 已发文件字节 × (1 − 出站滞留
+        // / 已发空中字节），由 120ms ticker 在发送全程持续发；ticker
+        // 与排空段共用 prog_last 做单调钳制，数字只许前进不许回退。
+        let covered0 = covered_bytes(&received);
+        let prog_sent = Arc::new(AtomicU64::new(sent_total));
+        let prog_wire = Arc::new(AtomicU64::new(0));
+        let prog_stop = Arc::new(AtomicBool::new(false));
+        let prog_last = Arc::new(AtomicU64::new(covered0));
+        struct ProgStopGuard(Arc<AtomicBool>);
+        impl Drop for ProgStopGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _prog_guard = ProgStopGuard(prog_stop.clone());
+        {
+            let events = self.events.clone();
+            let conn = session.conn.clone();
+            let sent_a = prog_sent.clone();
+            let wire_a = prog_wire.clone();
+            let stop_a = prog_stop.clone();
+            let last_a = prog_last.clone();
+            let tid = transfer_id.clone();
+            let mid = msg_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    if stop_a.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let wire = wire_a.load(Ordering::Relaxed);
+                    if wire == 0 {
+                        continue;
+                    }
+                    let sent = sent_a.load(Ordering::Relaxed);
+                    let lag = conn.outbound_lag();
+                    let frac = 1.0 - (lag as f64 / (wire + 256) as f64).min(1.0);
+                    let est = (((sent as f64) * frac) as u64).max(covered0).min(sent);
+                    // 发射前再查一次停标记：主流程若在本次计算期间已
+                    // 出错返回（断线等），不许抢在失败状态前补一发
+                    // 按最后成功值算出的假进度（第三方评审采纳）
+                    if stop_a.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if est > last_a.fetch_max(est, Ordering::Relaxed) {
+                        let _ = events.send(Event::TransferProgress {
+                            transfer_id: tid.clone(),
+                            msg_id: mid.clone(),
+                            received: est,
+                            total: size,
+                        });
+                    }
+                }
+            });
+        }
         for (start, end) in missing {
             let mut offset = start;
             file.seek(SeekFrom::Start(start))?;
@@ -3514,12 +3791,10 @@ impl Node {
                     .await?;
                 offset += want as u64;
                 sent_total += want as u64;
-                self.emit(Event::TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    msg_id: msg_id.clone(),
-                    received: sent_total,
-                    total: size,
-                });
+                // 进度不再在这里按已入队字节直发：ticker 按已上空
+                // 估算持续发（见发送段开头的 #1 口径），这里只喂数。
+                prog_sent.store(sent_total, Ordering::Relaxed);
+                prog_wire.store(wire_bytes, Ordering::Relaxed);
             }
         }
         // 等校验结果
@@ -3543,9 +3818,11 @@ impl Node {
         {
             let wire_total = (wire_bytes + 256) as f64; // 加控制帧的大致开销
             let drain_start = std::time::Instant::now();
+            let mut drained = false;
             loop {
                 let lag = session.conn.outbound_lag();
                 if lag == 0 {
+                    drained = true;
                     break;
                 }
                 // 会话已断开/被替换：别干等，交给下面的校验等待收尾报错
@@ -3565,13 +3842,28 @@ impl Node {
                 }
                 let frac = 1.0 - (lag as f64 / wire_total).min(1.0);
                 let aired_est = ((sent_total as f64) * frac) as u64;
+                let aired_est = aired_est.max(covered_bytes(&received));
+                // 与发送段 ticker 共用单调钳制：排空估算只许前进
+                if aired_est > prog_last.fetch_max(aired_est, Ordering::Relaxed) {
+                    self.emit(Event::TransferProgress {
+                        transfer_id: transfer_id.clone(),
+                        msg_id: msg_id.clone(),
+                        received: aired_est,
+                        total: size,
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
+            // 排空完成：进度如实落到已发总量（随后进「校验中」）；
+            // 会话死亡/超时跳出的不发满格假进度，交给校验等待收尾报错
+            if drained {
+                prog_last.store(sent_total, Ordering::Relaxed);
                 self.emit(Event::TransferProgress {
                     transfer_id: transfer_id.clone(),
                     msg_id: msg_id.clone(),
-                    received: aired_est.max(covered_bytes(&received)),
+                    received: sent_total,
                     total: size,
                 });
-                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             }
         }
         // 出站已真正排空：这才轮到对方校验，状态如实切「校验中」。

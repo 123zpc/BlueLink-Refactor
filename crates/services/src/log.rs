@@ -1,6 +1,8 @@
 //! 极简运行日志：关键事件按天写入日志目录 `bluelink-YYYY-MM-DD.log`，同时输出到 stderr。
 //! 应用从桌面图标启动时没有控制台，日志文件是排查蓝牙、传输、AI 问题的唯一依据。
-//! 时间统一记 UTC（文件头会注明），避免引入时区依赖。
+//! 时间记本地时区（UTC+8，与接收按日分夹、转发统计同口径——本应用以
+//! 国内时区为准）：v1.0.4 前曾统一记 UTC，用户读自己日志要心算 +8，
+//! 验后 #9 定案改回本地；文件名日期与跨零点切换同走这一口径。
 //!
 //! 分级（2026-11-20 v2.5.1 用户定）：两级即可——
 //! - essential（log_line）：两种模式都记：启动/退出、连接建立/断开结果、
@@ -154,11 +156,11 @@ pub fn install_panic_hook() {
     });
 }
 
-/// 写一行必要日志（两种模式都记）：`[YYYY-MM-DD HH:MM:SS UTC] [tag] 内容`。
+/// 写一行必要日志（两种模式都记）：`[YYYY-MM-DD HH:MM:SS UTC+8] [tag] 内容`。
 pub fn log_line(tag: &str, msg: &str) {
     rollover_if_needed();
     let (y, mo, d, h, mi, s) = now_parts();
-    let line = format!("[{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC] [{tag}] {msg}");
+    let line = format!("[{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC+8] [{tag}] {msg}");
     eprintln!("{line}");
     if let Ok(mut g) = LOG_FILE.lock() {
         if let Some(f) = g.as_mut() {
@@ -176,12 +178,17 @@ pub fn log_verbose(tag: &str, msg: &str) {
     }
 }
 
-/// 当前 UTC 时间分量（年月日时分秒），由 Unix 时间戳换算（Howard Hinnant 民用历算法）。
+/// 本地时区偏移（UTC+8，秒）：日志时间与文件名日期统一按本地读。
+const LOCAL_OFFSET_SECS: i64 = 8 * 3600;
+
+/// 当前本地时间分量（年月日时分秒），由 Unix 时间戳加本地偏移后
+/// 换算（Howard Hinnant 民用历算法）。
 fn now_parts() -> (i64, u32, u32, u32, u32, u32) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        + LOCAL_OFFSET_SECS;
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
     let (h, mi, s) = (

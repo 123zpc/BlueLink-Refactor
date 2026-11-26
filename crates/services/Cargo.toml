@@ -25,3 +25,10 @@ bluelink-ai = { path = "../ai" }
 # Windows 机器标识（MachineGuid）读取：设备 ID 机器绑定用，仅 Windows 目标
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+# 剪贴板所有者查询（#6 占用诊断）：GetClipboardOwner → 进程名，仅 Windows 目标
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

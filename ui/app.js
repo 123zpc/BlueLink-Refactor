@@ -285,11 +285,124 @@ function bubbleOfMsg(mid) {
 }
 const TRANSFER_TERMINAL = ["done", "cancelled", "verify_failed"];
 
+// ---------- #8 传输圆环（v1.0.4，用户定版） ----------
+// 进度从气泡内搬到气泡外侧的 32px 圆环：气泡本体尺寸全程不变。
+// 环的模式（dataset.mode）：progress 传输中（绿弧+环心百分比，点环
+// 取消）/ queue 排队等待（灰弧慢转）/ verify 校验中（绿弧快转）/
+// failed 失败（红环+!，点环重试）/ done 完成动效中（对号描画→淡出）。
+const TX_CIRC = 84.82; // 环周长：2π×13.5
+let txRingSeq = 0; // 等待环相位错开用（相邻环错半圈，不齐步走）
+function makeTxRing() {
+  const el = document.createElement("div");
+  el.className = "tx-ring hidden";
+  el.dataset.mode = "";
+  el.innerHTML = `<svg class="tx-svg" width="32" height="32" viewBox="0 0 32 32">
+    <circle class="tx-track" cx="16" cy="16" r="13.5" fill="none" stroke-width="3"/>
+    <g transform="rotate(-90 16 16)"><g class="tx-spin"><circle class="tx-arc" cx="16" cy="16" r="13.5" fill="none" stroke-width="3" stroke-dasharray="${TX_CIRC}" stroke-dashoffset="${TX_CIRC}"/></g></g>
+    <path class="tx-check" d="M10.5 16.8 L14.2 20.5 L21.8 12.2"/>
+  </svg><span class="tx-num"></span><span class="tx-sym"></span>`;
+  // 等待/校验的旋转相位按创建序错开（等待周期 2.4s，错半圈 = -1.2s）
+  el.querySelector(".tx-spin").style.animationDelay = `${-(txRingSeq++ % 2) * 1.2}s`;
+  return el;
+}
+/** 传输状态小字行（气泡之外）：已取消/校验失败的说明与重试入口。 */
+function makeTxNote() {
+  const el = document.createElement("div");
+  el.className = "tx-note hidden";
+  el.innerHTML = `<span class="tx-note-text"></span><button class="transfer-retry hidden">重试</button>`;
+  el._retryBtn = el.querySelector(".transfer-retry");
+  return el;
+}
+function paintTxNote(b, text, showRetry) {
+  const note = b._txNote;
+  if (!note) return;
+  if (!text && !showRetry) { note.classList.add("hidden"); return; }
+  note.classList.remove("hidden");
+  note.querySelector(".tx-note-text").textContent = text || "";
+  if (note._retryBtn) note._retryBtn.classList.toggle("hidden", !showRetry);
+}
+/** 把圆环切到某个模式并按需设百分比（progress 模式传 0..100）。 */
+function paintTxRing(b, mode, pct) {
+  const ring = b._txRing;
+  if (!ring) return;
+  if (b._ringHideTimer) { clearTimeout(b._ringHideTimer); b._ringHideTimer = 0; }
+  if (b._ringWaitTimer) { clearTimeout(b._ringWaitTimer); b._ringWaitTimer = 0; }
+  const arc = ring.querySelector(".tx-arc");
+  const num = ring.querySelector(".tx-num");
+  const sym = ring.querySelector(".tx-sym");
+  ring.classList.remove("hidden", "tx-progress", "tx-queue", "tx-verify", "tx-failed", "tx-done");
+  ring.classList.add("tx-" + mode);
+  ring.dataset.mode = mode;
+  if (!b._ringShownAt) b._ringShownAt = Date.now();
+  if (mode === "progress") {
+    const p = Math.max(0, Math.min(100, pct || 0));
+    arc.style.strokeDasharray = `${TX_CIRC}`;
+    arc.style.strokeDashoffset = `${TX_CIRC * (1 - p / 100)}`;
+    num.textContent = `${p}%`;
+    sym.textContent = "✕";
+    ring.title = "点击取消传输";
+  } else if (mode === "queue") {
+    arc.style.strokeDasharray = `${TX_CIRC * 0.25} ${TX_CIRC}`;
+    arc.style.strokeDashoffset = "0";
+    num.textContent = "";
+    sym.textContent = "";
+    ring.title = "排队等待发送";
+  } else if (mode === "verify") {
+    arc.style.strokeDasharray = `${TX_CIRC * 0.7} ${TX_CIRC}`;
+    arc.style.strokeDashoffset = "0";
+    num.textContent = "";
+    sym.textContent = "";
+    ring.title = "校验中";
+  } else if (mode === "failed") {
+    arc.style.strokeDasharray = `${TX_CIRC}`;
+    arc.style.strokeDashoffset = "0";
+    num.textContent = "";
+    sym.textContent = "!";
+    ring.title = "传输失败，点击重试";
+  }
+}
+function hideTxRing(b) {
+  const ring = b._txRing;
+  if (!ring) return;
+  if (b._ringHideTimer) { clearTimeout(b._ringHideTimer); b._ringHideTimer = 0; }
+  if (b._ringWaitTimer) { clearTimeout(b._ringWaitTimer); b._ringWaitTimer = 0; }
+  ring.classList.add("hidden");
+  ring.classList.remove("tx-done");
+  ring.dataset.mode = "";
+  b._ringShownAt = 0;
+}
+/** 完成动效（用户定）：弧走满→百分比淡出→对号描画→停留→整环淡出，
+ * 总约 1.3s，纯视觉不阻塞后续传输；小文件传得太快时先补足最小展示
+ * 时长（450ms）再播，防一闪而过；回放（翻历史/重渲染）不播、直接收起。 */
+function completeTxRing(b, replay) {
+  const ring = b._txRing;
+  if (!ring) return;
+  if (replay || !b._ringShownAt || ring.classList.contains("hidden")) {
+    hideTxRing(b);
+    return;
+  }
+  const start = () => {
+    b._ringWaitTimer = 0;
+    // 已被 hideTxRing 收尾（取消/重发竞态）就不再强行播动效
+    if (!ring.isConnected || !b._ringShownAt) return;
+    const arc = ring.querySelector(".tx-arc");
+    arc.style.strokeDasharray = `${TX_CIRC}`;
+    arc.style.strokeDashoffset = "0";
+    ring.querySelector(".tx-num").textContent = "100%";
+    ring.classList.remove("tx-progress", "tx-queue", "tx-verify", "tx-failed");
+    ring.classList.add("tx-done");
+    ring.dataset.mode = "done";
+    ring.title = "";
+    b._ringHideTimer = setTimeout(() => hideTxRing(b), 1450);
+  };
+  const wait = Math.max(0, 450 - (Date.now() - b._ringShownAt));
+  if (wait) b._ringWaitTimer = setTimeout(start, wait);
+  else start();
+}
+
 /** 把一条传输记录的进度画到气泡上（事件实时绘制与气泡迟建回放共用）。 */
 function paintTransferProgress(b, rec) {
   const { received, total } = rec;
-  const bar = b.querySelector(".progress");
-  const fill = b.querySelector(".progress > div");
   // #18 图片气泡：进度走贴底细条 + 胶囊明示「发送中/接收中」，
   // 与「校验中」严格分开（校验是传输完成后的独立状态）。
   if (b.classList.contains("img-bubble") && b._imgWrap) {
@@ -313,22 +426,13 @@ function paintTransferProgress(b, rec) {
     }
     return;
   }
-  if (bar && fill) {
-    bar.classList.remove("hidden");
-    const pct = total ? Math.floor((received / total) * 100) : 0;
-    fill.style.width = pct + "%";
-    const meta = b.querySelector(".progress-meta");
-    if (meta) {
-      meta.classList.remove("hidden");
-      meta.textContent = `${pct}% · ${fmtSize(received)} / ${fmtSize(total)}`;
-    }
-    const cancel = b.querySelector(".progress-cancel");
-    if (cancel && received < total) cancel.classList.remove("hidden");
-    if (received < total && !b.dataset.flowing) {
-      const side = b.closest(".msg-row")?.dataset.sender === "me" ? "me" : "peer";
-      b.dataset.flowing = side;
-      ringSet(side, true);
-    }
+  // #8：文件气泡进度改走气泡外圆环（旧气泡内进度条/百分比行/取消
+  // 按钮已全撤——它们的显隐就是气泡闪烁变尺寸的病根）
+  paintTxRing(b, "progress", total ? Math.floor((received / total) * 100) : 0);
+  if (received < total && !b.dataset.flowing) {
+    const side = b.closest(".msg-row")?.dataset.sender === "me" ? "me" : "peer";
+    b.dataset.flowing = side;
+    ringSet(side, true);
   }
 }
 
@@ -338,11 +442,13 @@ function paintTransferState(b, rec, replay) {
   const tstate = rec.state;
   const mid = rec.msgId;
   if (!tstate) return;
-  const bar = b.querySelector(".progress");
-  const meta = b.querySelector(".progress-meta");
-  const cancel = b.querySelector(".progress-cancel");
-  const retry = b.querySelector(".transfer-retry");
-  if (cancel) cancel.classList.add("hidden");
+  // 重试按钮已随 #8 挪到气泡外小字行（图片气泡的失败卡也用它）
+  const retry = b.querySelector(".transfer-retry") || (b._txNote ? b._txNote._retryBtn : null);
+  const showRetry = () => {
+    if (!retry) return;
+    retry.classList.remove("hidden");
+    if (b._txNote && retry === b._txNote._retryBtn) b._txNote.classList.remove("hidden");
+  };
   if (b.dataset.flowing) { ringSet(b.dataset.flowing, false); delete b.dataset.flowing; }
   // #1/#18 图片气泡的状态机：细条与胶囊承载全部状态，失败换失败卡
   if (b.classList.contains("img-bubble") && b._imgWrap) {
@@ -352,7 +458,9 @@ function paintTransferState(b, rec, replay) {
     const cap = wrap.querySelector(".img-cap");
     const fail = wrap.querySelector(".img-fail");
     const photo = wrap.querySelector(".img-photo");
-    if (tstate === "verifying") {
+    if (tstate === "queued") {
+      if (cap) { cap.classList.remove("hidden"); cap.textContent = "排队等待"; }
+    } else if (tstate === "verifying") {
       if (strip && sfill) { strip.classList.remove("hidden"); sfill.style.width = "100%"; }
       if (cap) { cap.classList.remove("hidden"); cap.textContent = "校验中"; }
     } else if (tstate === "done") {
@@ -373,48 +481,33 @@ function paintTransferState(b, rec, replay) {
       if (cap) cap.classList.add("hidden");
       if (photo) photo.classList.add("hidden");
       if (fail) fail.classList.remove("hidden");
-      if (retry) retry.classList.remove("hidden");
+      showRetry();
     } else if (tstate === "cancelled") {
       if (strip) strip.classList.add("hidden");
       if (cap) { cap.classList.remove("hidden"); cap.textContent = "已取消"; }
-      if (retry) retry.classList.remove("hidden");
+      showRetry();
     }
     return;
   }
-  if (tstate === "done") {
-    // 「已完成」只在气泡正显示着进度时闪现一下（实时事件路径）；
-    // 迟建回放时进度本就没露面，不许凭空闪一行字再消失。注意
-    // 回放顺序是先画进度（条会变可见）再画状态，必须靠 replay
-    // 标记区分，不能只看 bar 可见性（评审补强）。
-    if (!replay && meta && bar && !bar.classList.contains("hidden")) {
-      meta.classList.remove("hidden");
-      meta.textContent = "已完成";
-    }
+  // #8：文件气泡状态改走圆环 + 气泡外小字行（旧气泡内进度行/按钮全撤）
+  if (tstate === "queued") {
+    paintTxRing(b, "queue");
+    paintTxNote(b, "", false);
+  } else if (tstate === "done") {
+    // 接收到的单张图片：完成时补挂照片（照片出现本身即完成反馈，
+    // attachImagePhoto 会顺手收起圆环）；其余文件走完成对号动效
     const fname = b.querySelector(".file-name");
     if (mid && fname && isImageExt(fileExt(fname.textContent || ""))) attachImagePreview(b, mid);
-    // ⑥ v1.0.2：回放时同步隐藏、不用 400ms 延时
-    if (replay) {
-      if (bar) bar.classList.add("hidden");
-      if (meta) meta.classList.add("hidden");
-    } else {
-      setTimeout(() => {
-        if (bar) bar.classList.add("hidden");
-        if (meta) meta.classList.add("hidden");
-      }, 400);
-    }
+    completeTxRing(b, replay);
+    paintTxNote(b, "", false);
   } else if (tstate === "verifying") {
-    if (bar) bar.classList.remove("hidden");
-    if (meta) {
-      meta.classList.remove("hidden");
-      const mine = b.closest(".msg-row")?.dataset.sender === "me";
-      meta.textContent = mine ? "已发送，等待对方校验…" : "已收完，正在校验…";
-    }
+    paintTxRing(b, "verify");
   } else if (tstate === "cancelled") {
-    if (meta) { meta.classList.remove("hidden"); meta.textContent = "已取消"; }
-    if (retry) retry.classList.remove("hidden");
+    hideTxRing(b);
+    paintTxNote(b, "已取消", true);
   } else if (tstate === "verify_failed") {
-    if (meta) { meta.classList.remove("hidden"); meta.textContent = "校验失败，文件不完整"; }
-    if (retry) retry.classList.remove("hidden");
+    paintTxRing(b, "failed");
+    paintTxNote(b, "校验失败，文件不完整", true);
   }
 }
 
@@ -428,6 +521,12 @@ function buildMessageEl(m, opts = {}) {
   wrap.className = "msg";
   const bubble = document.createElement("div");
   bubble.className = "bubble" + (m.kind === "file" ? " file-card" : "") + (m.kind === "imagegroup" ? " group-card" : "");
+  // #8：文件/图组气泡预备外挂圆环与状态小字行（组气泡构建函数与各
+  // 绘制函数都经 bubble._txRing/_txNote 找它们，须先于 kind 分支备好）
+  if (m.kind === "file" || m.kind === "imagegroup") {
+    bubble._txRing = makeTxRing();
+    bubble._txNote = makeTxNote();
+  }
   if (m.reply_to && m.kind === "text" && !opts.ai) {
     const q = document.createElement("div");
     q.className = "quote-block";
@@ -440,14 +539,27 @@ function buildMessageEl(m, opts = {}) {
     row.classList.add("img-row");
     buildGroupBubble(bubble, m, row);
   } else if (m.kind === "file") {
-    bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div><div class="progress hidden"><div></div></div><div class="progress-meta hidden"></div><button class="progress-cancel hidden">取消</button><button class="transfer-retry hidden">重试</button>`;
+    bubble.innerHTML = `<div class="file-card-inner"><span class="file-ico">${iconUse("i-file", "ico ico-20")}</span><span class="file-main"><span class="file-name">${esc(m.body)}</span><span class="file-meta">文件</span></span></div>`;
     // ㉑ 单张图片在气泡里直接出预览（详见 attachImagePreview）
     if (isImageExt(fileExt(m.body))) attachImagePhoto(bubble, m.id);
     bubble.addEventListener("click", (e) => {
       if (e.target.closest("button")) return;
       openFileSmart(m, e.clientX, e.clientY);
     });
-    bubble.querySelector(".progress-cancel").addEventListener("click", async () => {
+    // #8 重发（失败环点击与小字行重试按钮共用一条路径）
+    const doResend = async () => {
+      try {
+        await invoke("resend_message", { messageId: m.id });
+        row.remove();
+        state.renderedChat.delete(m.id);
+      } catch (err) { showToast("重发失败：" + err); }
+    };
+    if (bubble._txNote) bubble._txNote._retryBtn.addEventListener("click", doResend);
+    // #8 圆环点击：传输/排队/校验中 = 取消传输；失败 = 重发
+    if (bubble._txRing) bubble._txRing.addEventListener("click", async () => {
+      const mode = bubble._txRing.dataset.mode;
+      if (mode === "failed") { await doResend(); return; }
+      if (mode !== "progress" && mode !== "queue" && mode !== "verify") return;
       // #2：对已终态的传输点取消 = 就地落定气泡（旧版把取消发给
       // 早已结束的传输、界面纹丝不动，用户以为取消失效）
       const rec = transferRecordOf(m.id);
@@ -465,13 +577,6 @@ function buildMessageEl(m, opts = {}) {
       if (trec.total && !TRANSFER_TERMINAL.includes(trec.state)) paintTransferProgress(bubble, trec);
       if (trec.state) paintTransferState(bubble, trec, true);
     }
-    bubble.querySelector(".transfer-retry").addEventListener("click", async () => {
-      try {
-        await invoke("resend_message", { messageId: m.id });
-        row.remove();
-        state.renderedChat.delete(m.id);
-      } catch (err) { showToast("重发失败：" + err); }
-    });
   } else if (m.sender === "ai") {
     bubble.innerHTML = md(m.body);
   } else if (m.body.length > 20000) {
@@ -544,7 +649,19 @@ function buildMessageEl(m, opts = {}) {
     badge.textContent = "AI 回答";
     wrap.appendChild(badge);
   }
-  wrap.appendChild(bubble); wrap.appendChild(meta);
+  // #8：文件/图组气泡与圆环并排成一行（环与气泡本体垂直居中、不含
+  // 下方 meta 行——用户点验口径），状态小字行挂在行下方、气泡之外
+  if (bubble._txRing) {
+    const line = document.createElement("div");
+    line.className = "bubble-line";
+    line.appendChild(bubble);
+    line.appendChild(bubble._txRing);
+    wrap.appendChild(line);
+    wrap.appendChild(bubble._txNote);
+  } else {
+    wrap.appendChild(bubble);
+  }
+  wrap.appendChild(meta);
   row.appendChild(wrap);
   row.addEventListener("contextmenu", (e) => { e.preventDefault(); openMsgMenu(m, e.clientX, e.clientY, !!opts.ai); });
   refreshMessageCategory(m.id, tagsSpan);
@@ -1555,18 +1672,32 @@ async function sendCurrent() {
       state.pendingFiles = [];
       renderAttachBar();
       let groupSent = false;
+      // #8：普通文件攒批整批交给后端（send_files_batch）——后端先把
+      // 整批落库上屏、未轮到的标「排队」，再逐个真传；图片组在队列
+      // 中的位置语义不变：攒批在组位置前后各 flush 一次。
+      let batch = [];
+      const flushBatch = async () => {
+        if (!batch.length) return;
+        const paths = batch;
+        batch = [];
+        try {
+          const fails = await invoke("send_files_batch", { paths });
+          for (const msg of fails || []) showToast(msg);
+        } catch (e) { showToast(`文件发送失败：${e}`); }
+      };
       for (const f of queue) {
         if (groupOn && isImageExt(fileExt(f.name))) {
           if (groupSent) continue;
           groupSent = true;
+          await flushBatch();
           const paths = queue.filter((q) => isImageExt(fileExt(q.name))).map((q) => q.path);
           try { await invoke("send_image_group", { paths }); }
           catch (e) { showToast(`图片组发送失败：${e}`); }
           continue;
         }
-        try { await invoke("send_file_path", { path: f.path }); }
-        catch (e) { showToast(`文件「${f.name}」发送失败：${e}`); }
+        batch.push(f.path);
       }
+      await flushBatch();
     }
     if (!text) {
       $("input").value = ""; autoGrow($("input"));
@@ -3140,6 +3271,32 @@ function watchScrollDiscipline(el, key) {
 }
 watchScrollDiscipline($("messages"), "chat");
 watchScrollDiscipline($("ai-messages"), "ai");
+/** 窗口恢复/重新获焦时把跟随中的容器重贴底（v1.0.4 验后 #7）：后台
+ * 收到消息时追加只做一次同步贴底，可窗口隐藏/最小化期间 WebView2
+ * 挂起布局、scrollHeight 停在旧值，图片等元素恢复后才定型变高，
+ * 底就贴不住、看着像没跟随。恢复时按即时+rAF+180ms 三拍补贴；
+ * 跟随已关（用户手势停过）绝不贴——滚动定版不破。容器内图片迟
+ * 加载定型同理：load 后跟随开着就补一拍。 */
+function resnapIfFollowing() {
+  for (const [c, key] of [[$("messages"), "chat"], [$("ai-messages"), "ai"]]) {
+    if (!c || c.offsetParent === null || !state.follow[key]) continue;
+    const snap = () => { if (state.follow[key]) c.scrollTop = c.scrollHeight; };
+    snap();
+    requestAnimationFrame(snap);
+    setTimeout(snap, 180);
+  }
+}
+window.addEventListener("focus", () => resnapIfFollowing());
+listen("window-restored", () => resnapIfFollowing()).catch(() => {});
+document.addEventListener("visibilitychange", () => { if (!document.hidden) resnapIfFollowing(); });
+for (const [c, key] of [[$("messages"), "chat"], [$("ai-messages"), "ai"]]) {
+  if (!c) continue;
+  c.addEventListener("load", (e) => {
+    if (e.target && e.target.tagName === "IMG" && state.follow[key]) {
+      requestAnimationFrame(() => { if (state.follow[key]) c.scrollTop = c.scrollHeight; });
+    }
+  }, true);
+}
 function syncAiBottomBtn() {
   const c = $("ai-messages");
   $("btn-ai-bottom").classList.toggle("hidden", nearBottomEl(c, 80));
@@ -3771,11 +3928,12 @@ document.addEventListener("focusin", (e) => {
 // WebView2 做一次真实重聚焦。守卫口径与旧实现一致（对话框/菜单/
 // 查看器打开不抢、失焦前停在别处控件不抢、焦点真在别处输入控件不抢）。
 let lastFocusDoneAt = 0; // 上次真正执行还焦点的时刻（双路同轮去重）
+const FOCUS_BLOCKER_SEL = "#modal:not(.hidden), #clear-modal:not(.hidden), #update-modal:not(.hidden), #viewer:not(.hidden), #file-menu:not(.hidden), #viewer-fmt-menu:not(.hidden), #ai-source-menu:not(.hidden), #clip-mode-menu:not(.hidden), #clip-count-menu:not(.hidden)";
 function restoreComposerFocus(source, force) {
   const note = (msg) => {
     if (source === "backend") invoke("log_frontend", { msg }).catch(() => {});
   };
-  if (document.querySelector("#modal:not(.hidden), #clear-modal:not(.hidden), #update-modal:not(.hidden), #viewer:not(.hidden), #file-menu:not(.hidden), #viewer-fmt-menu:not(.hidden), #ai-source-menu:not(.hidden), #clip-mode-menu:not(.hidden), #clip-count-menu:not(.hidden)")) {
+  if (document.querySelector(FOCUS_BLOCKER_SEL)) {
     note("窗口恢复还焦点：有对话框/菜单/查看器打开，跳过");
     return;
   }
@@ -3804,6 +3962,39 @@ function restoreComposerFocus(source, force) {
   if (active === el) el.blur(); // 残留焦点先摘再重落，逼 WebView2 真正重聚焦
   el.focus();
   invoke("log_frontend", { msg: `窗口恢复还焦点（${source}）：恢复前 activeElement=${activeDesc}，已还给 #${el.id}` }).catch(() => {});
+  verifyComposerFocus(el);
+}
+// v1.0.4 验后 #5：还焦点后的延时复核。旧版在 el.focus() 后同步写下
+// 「已还焦点」就收工，可 WebView2 在窗口恢复后会异步把键盘焦点重置
+// 回 BODY/发送按钮——日志全绿、人却打不了字（双机日志定案）。改成
+// 120ms/400ms 两档复核：焦点被抢到非输入元素就再聚焦一次；被用户
+// 点到别处输入控件则尊重用户、不抢；对话框打开则收手。400ms 档落
+// 一条「最终状态」日志，成功失败都如实记，下次真机一眼定案。
+let focusVerifySeq = 0;
+function verifyComposerFocus(el) {
+  const seq = ++focusVerifySeq;
+  const check = (final) => {
+    if (seq !== focusVerifySeq) return; // 已有更新一轮还焦点接管
+    if (document.querySelector(FOCUS_BLOCKER_SEL)) return; // 对话框接管，收手
+    const ae = document.activeElement;
+    const desc = (n) => (n ? n.tagName + (n.id ? "#" + n.id : "") : "无");
+    if (ae === el) {
+      if (final) invoke("log_frontend", { msg: `窗口恢复还焦点：最终确认焦点在 #${el.id}（已恢复）` }).catch(() => {});
+      return;
+    }
+    if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) {
+      if (final) invoke("log_frontend", { msg: `窗口恢复还焦点：最终焦点在别处输入控件 ${desc(ae)}（用户已自行切换，不再抢）` }).catch(() => {});
+      return;
+    }
+    // 焦点落在 BODY/按钮等非输入元素：被异步重置抢走了，再聚焦一次
+    el.focus();
+    if (final) {
+      const ae2 = document.activeElement;
+      invoke("log_frontend", { msg: `窗口恢复还焦点：最终确认焦点在 ${desc(ae2)}（${ae2 === el ? "已恢复" : "仍未恢复"}）` }).catch(() => {});
+    }
+  };
+  setTimeout(() => check(false), 120);
+  setTimeout(() => check(true), 400);
 }
 window.addEventListener("focus", () => restoreComposerFocus("page", false));
 listen("window-restored", () => restoreComposerFocus("backend", true)).catch(() => {});
@@ -4211,6 +4402,7 @@ function clipManualResultToast(v) {
   else if (v.kind === "local_off") showToast("本机剪贴板同步还没开启");
   else if (v.kind === "peer_off") showToast("对方还没开启剪贴板同步");
   else if (v.kind === "empty") showToast("还没有可同步的内容，先复制点东西");
+  else if (v.kind === "occupied") showToast("剪贴板正被其他程序占用，这次没读到新内容，稍后再试");
 }
 $("btn-clip-sync-now").addEventListener("click", async () => {
   try { clipManualResultToast(await invoke("sync_clipboard_now")); }
@@ -5037,10 +5229,7 @@ function buildGroupBubble(bubble, m, row) {
       <button class="gstack-nav prev" title="上一张"><svg class="ico ico-16"><use href="#i-chevron-left"/></svg></button>
       <button class="gstack-nav next" title="下一张"><svg class="ico ico-16"><use href="#i-chevron-right"/></svg></button>
     </div>
-    <div class="progress hidden"><div></div></div>
-    <div class="progress-meta hidden"></div>
-    <button class="progress-cancel hidden">取消</button>
-    <button class="transfer-retry hidden">重试</button>`;
+    `;
   bubble._gidx = 0;
   if (items.length < 2) {
     bubble.querySelectorAll(".gstack-nav").forEach((b) => b.classList.add("hidden"));
@@ -5148,7 +5337,20 @@ function buildGroupBubble(bubble, m, row) {
     }));
     openImageViewer(view, bubble._gidx);
   });
-  bubble.querySelector(".progress-cancel").addEventListener("click", async () => {
+  // #8 重发（失败环点击与小字行重试按钮共用一条路径）
+  const doResend = async () => {
+    try {
+      await invoke("resend_message", { messageId: m.id });
+      row.remove();
+      state.renderedChat.delete(m.id);
+    } catch (err) { showToast("重发失败：" + err); }
+  };
+  if (bubble._txNote) bubble._txNote._retryBtn.addEventListener("click", doResend);
+  // #8 圆环点击：传输/校验中 = 取消；失败 = 重发整组
+  if (bubble._txRing) bubble._txRing.addEventListener("click", async () => {
+    const mode = bubble._txRing.dataset.mode;
+    if (mode === "failed") { await doResend(); return; }
+    if (mode !== "progress" && mode !== "verify" && mode !== "queue") return;
     // #2：全员已终态时点取消 = 就地落定，不再对结束的传输发取消
     const gp = state.groupProgress[m.id];
     if (items.length && items.every((it) => {
@@ -5170,23 +5372,13 @@ function buildGroupBubble(bubble, m, row) {
   // 画聚合进度（终态成员的已传字节已在账里，合计口径不变）。
   const gp0 = state.groupProgress[m.id];
   if (gp0) {
-    // 全员已终态才跳过聚合进度：须 states 与 members 一一对应（第三方
-    // 评审：旧版只看 states 全终态，某成员有进度、无状态事件时会被漏画）。
-    const allTerminal = gp0.members.size > 0
-      && gp0.states.size === gp0.members.size
-      && [...gp0.states.values()].every((s) => TRANSFER_TERMINAL.includes(s));
+    // 气泡尚在构建（未进文档），逐个补画不可见；最终形态由状态回放
+    // （replay 口径）落定：已完成的环直接收起、失败/取消静态呈现
     for (const [mid2, v] of gp0.members) {
-      if (!allTerminal) updateGroupProgress(m.id, mid2, v.received, v.total, bubble);
+      updateGroupProgress(m.id, mid2, v.received, v.total, bubble);
     }
     for (const [mid2, st] of gp0.states) updateGroupTransferState(m.id, mid2, st, bubble, true);
   }
-  bubble.querySelector(".transfer-retry").addEventListener("click", async () => {
-    try {
-      await invoke("resend_message", { messageId: m.id });
-      row.remove();
-      state.renderedChat.delete(m.id);
-    } catch (err) { showToast("重发失败：" + err); }
-  });
 }
 
 function groupProg(gid) {
@@ -5204,64 +5396,63 @@ function updateGroupProgress(gid, memberMsgId, received, total, bEl) {
   gp.members.set(memberMsgId, { received, total });
   const b = bEl || groupBubbleOf(gid);
   if (!b) return;
-  let r = 0, t = 0;
-  for (const v of gp.members.values()) { r += v.received; t += v.total; }
-  const bar = b.querySelector(".progress");
-  const fill = b.querySelector(".progress > div");
-  const meta = b.querySelector(".progress-meta");
-  if (bar && fill) {
-    bar.classList.remove("hidden");
-    const pct = t ? Math.floor((r / t) * 100) : 0;
-    fill.style.width = pct + "%";
-    if (meta) {
-      meta.classList.remove("hidden");
-      meta.textContent = `${pct}% · ${fmtSize(r)} / ${fmtSize(t)}`;
-    }
-  }
-  const cancel = b.querySelector(".progress-cancel");
-  if (cancel && r < t) cancel.classList.remove("hidden");
+  paintGroupRing(b, gid, false);
 }
 function updateGroupTransferState(gid, memberMsgId, tstate, bEl, replay) {
   const gp = groupProg(gid);
   gp.states.set(memberMsgId, tstate);
   const b = bEl || groupBubbleOf(gid);
   if (!b) return;
-  const meta = b.querySelector(".progress-meta");
-  const bar = b.querySelector(".progress");
-  const cancel = b.querySelector(".progress-cancel");
-  const retry = b.querySelector(".transfer-retry");
-  if (cancel) cancel.classList.add("hidden");
   if (tstate === "done") {
+    // 任一成员完成即刷新组气泡（封面/已收图可能要换）
     if (b._showGroupCard) b._showGroupCard();
-    const total = b._gcount || gp.states.size;
-    let done = 0;
-    for (const s of gp.states.values()) if (s === "done") done++;
-    if (done >= total) {
-      // ⑥ v1.0.2：回放时同步落定（不闪「已完成」、不等 400ms）；
-      // 实时事件路径保留「已完成」一闪而过的反馈。
-      if (replay) {
-        if (bar) bar.classList.add("hidden");
-        if (meta) meta.classList.add("hidden");
-      } else {
-        if (meta) { meta.classList.remove("hidden"); meta.textContent = "已完成"; }
-        setTimeout(() => {
-          if (bar) bar.classList.add("hidden");
-          if (meta) meta.classList.add("hidden");
-        }, 400);
-      }
-    } else if (meta) {
-      meta.classList.remove("hidden");
-      meta.textContent = `已完成 ${done} / ${total} 张`;
-    }
-  } else if (tstate === "verifying") {
-    if (meta) { meta.classList.remove("hidden"); meta.textContent = "正在校验…"; }
-  } else if (tstate === "verify_failed") {
-    if (meta) { meta.classList.remove("hidden"); meta.textContent = "有图片校验失败，文件不完整"; }
-    if (retry) retry.classList.remove("hidden");
-  } else if (tstate === "cancelled") {
-    if (meta) { meta.classList.remove("hidden"); meta.textContent = "已取消"; }
-    if (retry) retry.classList.remove("hidden");
   }
+  paintGroupRing(b, gid, replay);
+}
+/** 组圆环聚合绘制（#8）：进度按全组总字节；全员落定后按结果落环——
+ * 全成=完成动效、有败=红环+小字说明、部分取消=环收起+小字计数+重试；
+ * 有人校验且无人还在传=校验环；其余=总进度环（附已完成张数小字）。 */
+function paintGroupRing(b, gid, replay) {
+  const gp = groupProg(gid);
+  let r = 0, t = 0;
+  for (const v of gp.members.values()) { r += v.received; t += v.total; }
+  // 总数以组内成员数为准（_gcount 为构建时定值；回退取 states 数，
+  // 两者取大防个别成员只有进度没状态时被当不存在、提前误判落定）
+  const total = Math.max(b._gcount || 0, gp.states.size);
+  let done = 0, failed = 0, cancelled = 0, verifying = 0;
+  for (const s of gp.states.values()) {
+    if (s === "done") done++;
+    else if (s === "verify_failed") failed++;
+    else if (s === "cancelled") cancelled++;
+    else if (s === "verifying") verifying++;
+  }
+  const settled = done + failed + cancelled;
+  if (total > 0 && settled >= total) {
+    if (failed > 0) {
+      paintTxRing(b, "failed");
+      paintTxNote(b, "有图片校验失败，文件不完整", true);
+    } else if (done === total) {
+      completeTxRing(b, replay);
+      paintTxNote(b, "", false);
+    } else {
+      hideTxRing(b);
+      paintTxNote(b, `已完成 ${done} / ${total} 张，其余已取消`, true);
+    }
+    return;
+  }
+  // 还在传 = 字节未满且状态没进校验/终态（queued 是已记账状态，
+  // 别被它骗成「没在传」——有人排队时不许亮校验环，第三方评审采纳）
+  const anyTransferring = [...gp.members.entries()].some(([mid, v]) => {
+    if (v.received >= v.total) return false;
+    const s = gp.states.get(mid);
+    return s === undefined || s === "queued";
+  });
+  if (verifying > 0 && !anyTransferring) {
+    paintTxRing(b, "verify");
+  } else {
+    paintTxRing(b, "progress", t ? Math.floor((r / t) * 100) : 0);
+  }
+  paintTxNote(b, done > 0 ? `已完成 ${done} / ${total} 张` : "", false);
 }
 
 /** 图片组右键菜单：查看、保存全部（按序 1、2、3…落到所选文件夹）、
@@ -5331,20 +5522,15 @@ async function attachImagePhoto(bubble, messageId) {
   if (row) row.classList.add("img-row");
   const inner = bubble.querySelector(".file-card-inner");
   if (inner) inner.classList.add("hidden");
-  const legacyBar = bubble.querySelector(".progress");
-  if (legacyBar) legacyBar.classList.add("hidden");
-  const legacyMeta = bubble.querySelector(".progress-meta");
-  if (legacyMeta) legacyMeta.classList.add("hidden");
-  const cancel = bubble.querySelector(".progress-cancel");
-  if (cancel) cancel.classList.add("hidden");
+  // #8：气泡变图片本体后圆环退场（进度走贴底细条+胶囊，定版设计）；
+  // 重试按钮留在气泡外小字行，失败时由 paintTransferState 亮出
+  hideTxRing(bubble);
   const wrap = document.createElement("div");
   wrap.className = "img-wrap";
   wrap.innerHTML = `<img class="img-photo" alt="" draggable="false">
     <div class="img-strip hidden"><div></div></div>
     <span class="img-cap hidden"></span>
     <div class="img-fail hidden"><span class="img-fail-name"></span><span class="img-fail-text">校验失败，文件不完整</span></div>`;
-  const retry = bubble.querySelector(".transfer-retry");
-  if (retry) wrap.appendChild(retry);
   bubble.insertBefore(wrap, bubble.firstChild);
   bubble._imgWrap = wrap;
   wrap.querySelector(".img-fail-name").textContent = info.name || "";

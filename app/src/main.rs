@@ -6,6 +6,7 @@ mod local_api;
 mod win_clipboard;
 #[cfg(windows)]
 mod win_notify;
+mod win_v_hotkey;
 
 use bluelink_ai::{AiClient, AiConfig, ChatMessage};
 use bluelink_domain::{
@@ -903,6 +904,18 @@ async fn send_file_path(state: State<'_, AppState>, path: String) -> Result<Stri
         .send_file(std::path::Path::new(&path))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// 批量发送文件（v1.0.4 #8）：待发队列里的普通文件整批下发——整批
+/// 消息先全部上屏并标「排队中」，再由服务层逐个真传；返回逐个的
+/// 失败说明（空数组 = 全部发出），前端逐条 toast。
+#[tauri::command]
+async fn send_files_batch(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    Ok(state.node.send_files_batch(&paths).await)
 }
 
 /// 发送图片组（v2.6.0）：多张图片合并为一条消息发送，返回组消息 ID。
@@ -2158,6 +2171,7 @@ async fn set_clipboard_sync(
         .map_err(|e| e.to_string())?;
     // 开关影响快捷键注册条件（同步开 + 手动方式才注册）
     refresh_clipboard_hotkey(&app, &state.node);
+    refresh_win_v_hotkey(&app, &state.node);
     Ok(())
 }
 
@@ -2173,6 +2187,7 @@ async fn set_clipboard_sync_mode(
         .set_clipboard_sync_mode(&mode)
         .map_err(|e| e.to_string())?;
     refresh_clipboard_hotkey(&app, &state.node);
+    refresh_win_v_hotkey(&app, &state.node);
     Ok(())
 }
 
@@ -2222,6 +2237,7 @@ fn manual_sync_view(outcome: bluelink_services::ManualSyncOutcome) -> ManualSync
         O::LocalOff => ("local_off", 0),
         O::PeerOff => ("peer_off", 0),
         O::Empty => ("empty", 0),
+        O::Occupied => ("occupied", 0),
     };
     ManualSyncView {
         kind: kind.to_string(),
@@ -2238,6 +2254,12 @@ async fn sync_clipboard_now(state: State<'_, AppState>) -> Result<ManualSyncView
 /// 当前实际注册中的手动同步快捷键（用户设置的字符串）：注册/注销
 /// 只走 refresh_clipboard_hotkey，设置页据此显示是否真生效。
 static CLIP_HOTKEY_ACTIVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 窗口曾被隐藏到托盘（v1.0.4 #5）：关闭拦截 hide 时置位，窗口重新
+/// 获得焦点时由 setup 的窗口事件处理器消费并补发 window-restored——
+/// v1.0.3 的后端信号只认「曾最小化」，关到托盘再打开这条最高频路径
+/// 没信号、前端只剩不可靠的页面 focus 路径，托盘恢复后焦点仍丢。
+static WINDOW_WAS_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 按当前设置刷新全局快捷键注册：仅在「同步开 + 手动方式」时注册
 /// 存储的组合键；切回自动/关同步/改组合键时先注销旧的。注册失败
@@ -2276,6 +2298,18 @@ fn refresh_clipboard_hotkey(app: &AppHandle, node: &Arc<Node>) {
             );
         }
     }
+}
+
+/// Win+V 观察触发（v1.0.4 #4，用户拍板「打开剪贴板的同时就是想同步
+/// 一下」）：与全局快捷键同一生效条件（本机同步开 + 手动方式）。
+/// 实现在 win_v_hotkey 模块：Windows 低级键盘钩子只观察不拦截——
+/// Win+V 是系统保留组合、RegisterHotKey 注册不上；按键放行、系统
+/// 剪贴板历史面板照常弹出，本机同时触发一次手动同步。红线：只认
+/// Win+V，绝不记录任何其他按键。非 Windows 平台为空实现。
+fn refresh_win_v_hotkey(app: &AppHandle, node: &Arc<Node>) {
+    let _ = app;
+    let want = node.clipboard_local_on() && node.clipboard_sync_mode() == "manual";
+    win_v_hotkey::set_active(want);
 }
 
 #[tauri::command]
@@ -2651,9 +2685,11 @@ fn main() {
                 // 「已在输入处」跳过还焦点，人却打不了字）——被动路径
                 // （托盘 show+unminimize+set_focus）则正常。故后端记下
                 // 「曾最小化」，窗口重新获得焦点时 emit window-restored，
-                // 前端收到后走带真实重聚焦的还焦点。托盘恢复同样会触发
-                // Focused(true)，靠 was_minimized 一次性标记去重：只有真从
-                // 最小化回来才发，普通切窗口不发。
+                // 前端收到后走带真实重聚焦的还焦点。
+                // v1.0.4 验后 #5 补盲区：关到托盘再打开同样要发信号——
+                // 关闭拦截 hide 时置 WINDOW_WAS_HIDDEN，Focused(true) 时
+                // 与 was_minimized 一并消费；只有真从最小化/托盘回来才
+                // 发，普通切窗口不发（一次性标记去重）。
                 {
                     use std::sync::atomic::{AtomicBool, Ordering};
                     use tauri::Emitter as _;
@@ -2671,11 +2707,12 @@ fn main() {
                                 }
                             }
                             tauri::WindowEvent::Focused(true)
-                                if flag.swap(false, Ordering::SeqCst) =>
+                                if flag.swap(false, Ordering::SeqCst)
+                                    || WINDOW_WAS_HIDDEN.swap(false, Ordering::SeqCst) =>
                             {
                                 bluelink_services::log_line(
                                     "app",
-                                    "窗口恢复：从最小化恢复并获得焦点，已通知前端还焦点（window-restored）",
+                                    "窗口恢复：从最小化/托盘恢复并获得焦点，已通知前端还焦点（window-restored）",
                                 );
                                 let _ = win2.emit("window-restored", ());
                             }
@@ -2977,6 +3014,24 @@ fn main() {
             {
                 let st = app.state::<AppState>();
                 refresh_clipboard_hotkey(app.handle(), &st.node);
+                // Win+V 观察触发（#4）：先登记触发回调（与全局快捷键
+                // 同一条手动同步路径），再按已存设置决定是否启用钩子
+                {
+                    use tauri::Emitter as _;
+                    use tauri::Manager as _;
+                    let handle = app.handle().clone();
+                    win_v_hotkey::init(Box::new(move || {
+                        let app = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                let view =
+                                    manual_sync_view(state.node.sync_clipboard_now().await);
+                                let _ = app.emit("clipboard_manual_result", view);
+                            }
+                        });
+                    }));
+                }
+                refresh_win_v_hotkey(app.handle(), &st.node);
             }
             // 系统托盘：聊天软件的标准行为——关窗口只隐藏到托盘，蓝牙与连接不断；
             // 真正退出走托盘菜单「退出」。左键点托盘图标重新打开窗口。
@@ -3072,7 +3127,15 @@ fn main() {
                         window.on_window_event(move |event| {
                             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                                 api.prevent_close();
-                                let _ = win.hide();
+                                // #5：hide 成功才记「曾隐藏到托盘」（失败还
+                                // 置位会让下次普通获焦误发 window-restored，
+                                // 第三方评审采纳）；恢复获焦时补发该信号
+                                if win.hide().is_ok() {
+                                    WINDOW_WAS_HIDDEN.store(
+                                        true,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    );
+                                }
                                 bluelink_services::log_line(
                                     "app",
                                     "窗口关闭：已隐藏到系统托盘（应用继续运行）",
@@ -3102,6 +3165,7 @@ fn main() {
             disconnect,
             send_text,
             send_file_path,
+            send_files_batch,
             send_image_group,
             send_document,
             send_typing,
