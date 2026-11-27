@@ -353,15 +353,18 @@
         <div class="setting-row">
           <span>发送键</span>
           <span class="row-gap">
-            <input id="send-key-input" type="text" readonly value="Enter" title="点一下，再按下想用的组合键">
+            <input id="send-key-input" class="key-rec" type="text" readonly value="Enter" title="点一下，再按下想用的组合键">
           </span>
         </div>
         <div class="setting-row">
           <span>换行键</span>
           <span class="row-gap">
-            <input id="newline-key-input" type="text" readonly value="Shift+Enter" title="点一下，再按下想用的组合键">
-            <button id="composer-keys-reset" class="btn small-btn" type="button">恢复默认</button>
+            <input id="newline-key-input" class="key-rec" type="text" readonly value="Shift+Enter" title="点一下，再按下想用的组合键">
           </span>
+        </div>
+        <div class="setting-row">
+          <span>恢复默认</span>
+          <button id="composer-keys-reset" class="btn small-btn" type="button">恢复默认</button>
         </div>
         <p class="muted small">在聊天和 AI 输入框里生效。只能设回车键的组合（如 Enter、Shift+Enter、Ctrl+Enter），发送键和换行键不能相同。</p>
         <h3>本机</h3>

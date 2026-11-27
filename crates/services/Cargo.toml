@@ -19,7 +19,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # rustls-tls-native-roots：让中继代取的 HTTPS 除内置根证书外还能用
 # 系统证书库（企业代理签发的证书只在系统库里）；与工作区已启用的
 # webpki 根证书并存，取并集
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+# system-proxy：让中继代下认 Windows 系统代理（Clash 等系统代理模式
+# 下与浏览器同路）；注意 update_http_client 里显式 .proxy() 只在有
+# HTTPS_PROXY 环境变量时才调——reqwest 一旦显式加代理就会关掉自动
+# 系统代理，两条路互斥、环境变量优先，桌面常态走系统代理
+reqwest = { workspace = true, features = ["rustls-tls-native-roots", "system-proxy"] }
 bluelink-domain = { path = "../domain" }
 bluelink-protocol = { path = "../protocol" }
 bluelink-storage = { path = "../storage" }

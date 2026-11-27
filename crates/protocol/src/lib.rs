@@ -116,6 +116,12 @@ pub enum Control {
         /// 能力位而非版本号推断：同版本号的不同构建（如同号换包）靠它区分。
         #[serde(default)]
         relay_update: bool,
+        /// 本机是否支持中继流水线（边下边传）：要约先行、校验和随
+        /// FileDone 迟到。代下方的发送侧只对自报此位的接收方启用
+        /// 流水线；旧接收方不见此位，代下方自动回退串行（先下完、
+        /// 要约带真校验和），混版不破。
+        #[serde(default)]
+        relay_update_v2: bool,
     },
     HelloAck {
         device_id: String,
@@ -127,6 +133,8 @@ pub enum Control {
         app_version: String,
         #[serde(default)]
         relay_update: bool,
+        #[serde(default)]
+        relay_update_v2: bool,
     },
     ChatText {
         msg_id: String,
@@ -145,6 +153,9 @@ pub enum Control {
         msg_id: String,
         name: String,
         size: u64,
+        /// 整包校验和。唯一例外：中继流水线（边下边传）开传时包还
+        /// 在下载、校验和不存在，此处为空串表示「待定」，真值随
+        /// FileDone.sha256 迟到交付；普通文件恒为真值。
         sha256: String,
         mime: Option<String>,
         /// 图片组归属（v2.6.0）：Some 时表示本文件是某图片组的一员。
@@ -165,6 +176,11 @@ pub enum Control {
     },
     FileDone {
         transfer_id: String,
+        /// 中继流水线专用：要约时校验和尚未算出（包还在下载），随
+        /// FileDone 迟到交付，接收方据此校验。普通文件恒 None（要约
+        /// 已带校验和）；旧帧无此字段、按 None 解析，混版不破。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
     },
     FileVerify {
         transfer_id: String,
@@ -624,6 +640,7 @@ mod tests {
                 code: "123456".into(),
                 app_version: "1.0.4".into(),
                 relay_update: true,
+                relay_update_v2: true,
             }),
             Frame::Control(Control::ChatText {
                 msg_id: "m1".into(),
@@ -1021,10 +1038,12 @@ mod tests {
             Control::Hello {
                 app_version,
                 relay_update,
+                relay_update_v2,
                 ..
             } => {
                 assert_eq!(app_version, "");
                 assert!(!relay_update);
+                assert!(!relay_update_v2);
             }
             _ => panic!("解析出的不是 Hello"),
         }
@@ -1040,13 +1059,29 @@ mod tests {
             Control::HelloAck {
                 app_version,
                 relay_update,
+                relay_update_v2,
                 ..
             } => {
                 assert_eq!(app_version, "");
                 assert!(!relay_update);
+                assert!(!relay_update_v2);
             }
             _ => panic!("解析出的不是 HelloAck"),
         }
+        // FileDone 老形态（无 sha256 字段）解析得 None；带迟到校验和
+        // 的新形态往返一致（中继流水线专用字段）
+        let old_done = serde_json::json!({ "t": "file_done", "transfer_id": "t1" });
+        match serde_json::from_value::<Control>(old_done).unwrap() {
+            Control::FileDone { sha256, .. } => assert_eq!(sha256, None),
+            _ => panic!("解析出的不是 FileDone"),
+        }
+        let new_done = Control::FileDone {
+            transfer_id: "t1".into(),
+            sha256: Some("ab12".into()),
+        };
+        let back: Control =
+            serde_json::from_slice(&serde_json::to_vec(&new_done).unwrap()).unwrap();
+        assert_eq!(back, new_done);
     }
 
     /// 更新包要约标记往返：update_pkg=true 必须原样到达；老形态要约

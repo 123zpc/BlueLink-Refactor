@@ -1905,6 +1905,7 @@ $("btn-disconnect").addEventListener("click", async () => {
   // 时无会话可断、令牌不失效，进行中的尝试可能随后接管成已连接
   await invoke("cancel_connect").catch(() => {});
   await invoke("disconnect");
+  $("reconnect-banner").classList.add("hidden");
 });
 // 重连横幅的「停止重连」：走断开命令——无会话时后端同样会作废
 // 重连代号并清目标（见 services disconnect 的无会话分支）。
@@ -1912,7 +1913,7 @@ $("reconnect-stop").addEventListener("click", async () => {
   await invoke("disconnect");
   $("reconnect-banner").classList.add("hidden");
 });
-$("btn-connected-disconnect").addEventListener("click", async () => { await invoke("disconnect"); });
+$("btn-connected-disconnect").addEventListener("click", async () => { await invoke("disconnect"); $("reconnect-banner").classList.add("hidden"); });
 $("btn-goto-chat").addEventListener("click", () => goChat());
 
 // ---------- 连接（蓝牙） ----------
@@ -4920,6 +4921,17 @@ async function wireEvents() {
     const wasConnected = state.connected;
     state.connected = e.payload.connected;
     if (state.connected) state.linkState = "on";
+    // 横幅与连接状态不许打架（v1.0.5 装版实报）：连上即收横幅——
+    // 对端反向拨入等路径恢复连接时，重连状态的收尾事件可能缺失，
+    // 顶栏已显示「已连接」而横幅还停在「正在自动重连」。断开事件
+    // 同理收横幅：自然掉线时横幅尚未弹出（重连尝试在数秒后），
+    // 此处收起是空操作。例外（评审补强）：断开事件到达时重连横幅
+    // 已在岗（linkState=reconnecting），横幅归重连事件与「停止
+    // 重连」按钮管，这里不抢收，防迟到的断开事件把重连中的横幅
+    // 误收；手动断开的几个按钮各自在点击时收横幅，不靠这里收尾。
+    if (state.connected || state.linkState !== "reconnecting") {
+      $("reconnect-banner").classList.add("hidden");
+    }
     $("nav-logo").classList.toggle("linked", state.connected);
     if (!state.connected) ringClearAll();
     state.peerName = e.payload.peer_name;

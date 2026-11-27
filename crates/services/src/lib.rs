@@ -131,6 +131,82 @@ pub struct RelayUpdateInfo {
 /// 中继取包等待者的应答：（对端本次取包实际所据的版本, 签名）。
 type UpdateFetchReply = Result<(Option<String>, Option<String>), String>;
 
+/// 边下边传的水位快照：流水线下载任务持续推进，发送侧据此等数据。
+#[derive(Clone, Default)]
+struct GateSnap {
+    /// 已落盘、可发送的字节数（水位）
+    ready: u64,
+    /// 下载流已结束（成败看 error）
+    done: bool,
+    /// 下载失败原因
+    error: Option<String>,
+    /// 下载任务边下边算出的整包校验和（收尾成功时才有）：发送侧在
+    /// 发 FileDone 前取回、随帧迟到交付给接收方（要约时它还不存在）
+    sha256: Option<String>,
+}
+
+/// 边下边传的水位门：发送每一片前先等水位越过该片末尾，下载与
+/// 蓝牙回传由此重叠。用 watch 通道承载快照——changed() 自带「先
+/// 登记再等待」语义，不会丢唤醒；发送侧同一时刻只有一个等待者
+/// （run_file_transfer 的发送循环是串行的），Mutex 只是借用通道。
+/// 契约（评审注记）：wait_ready 与 wait_done 靠这把锁串行化，只许
+/// 同一时刻一个等待者——当前调用方（发送循环收尾后才 wait_done）
+/// 天然满足；将来若改成并发等待，必须先换通知机制再动。
+struct FetchGate {
+    rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<GateSnap>>,
+}
+
+impl FetchGate {
+    /// 等水位越过 upto（即 [0, upto) 全部落盘可读）；下载失败或
+    /// 提前结束（落盘数到不了 upto）返回 Err，发送侧据此停发收尾。
+    async fn wait_ready(&self, upto: u64) -> Result<(), String> {
+        let mut rx = self.rx.lock().await;
+        loop {
+            {
+                let s = rx.borrow();
+                if let Some(e) = &s.error {
+                    return Err(format!("下载更新包失败：{e}"));
+                }
+                if s.ready >= upto {
+                    return Ok(());
+                }
+                if s.done {
+                    return Err(format!(
+                        "下载更新包提前结束（已下 {} 字节，未及所需 {upto} 字节）",
+                        s.ready
+                    ));
+                }
+            }
+            if rx.changed().await.is_err() {
+                return Err("下载更新包已中止".into());
+            }
+        }
+    }
+
+    /// 等下载收尾并取回整包校验和；下载失败/中止返回 Err（发送侧
+    /// 据此不带校验和发 FileDone，接收方待定校验和等不到值、判失败）。
+    async fn wait_done(&self) -> Result<String, String> {
+        let mut rx = self.rx.lock().await;
+        loop {
+            {
+                let s = rx.borrow();
+                if let Some(e) = &s.error {
+                    return Err(format!("下载更新包失败：{e}"));
+                }
+                if s.done {
+                    return s
+                        .sha256
+                        .clone()
+                        .ok_or_else(|| "下载已结束但无校验和".to_string());
+                }
+            }
+            if rx.changed().await.is_err() {
+                return Err("下载更新包已中止".into());
+            }
+        }
+    }
+}
+
 /// 自动重连目标：一次成功出站连接留下的回拨信息（route 是应用层
 /// 的拨号路线，如 "bt:ble:<扫描id>" 或 "tcp:<addr>"，服务层不解读、
 /// 只原样交给注册进来的拨号器；code 为对端连接码，由设备 ID 派生）。
@@ -1386,6 +1462,8 @@ struct PeerSession {
     peer_app_version: String,
     /// 握手时对端自报的中继更新能力位（旧版本恒 false）。
     peer_relay_update: bool,
+    /// 对端是否支持中继流水线（边下边传、校验和随 FileDone 迟到）
+    peer_relay_update_v2: bool,
 }
 
 /// 心跳节奏：每 5 秒发一帧 Ping（协议控制帧，对端现成回 Pong，任何
@@ -1712,8 +1790,8 @@ impl Node {
         conn: &Conn,
         host: bool,
         code_from_peer_or_target: &str,
-    ) -> Result<(Device, String, bool), ServiceError> {
-        let (peer, peer_app_version, peer_relay_update) = if host {
+    ) -> Result<(Device, String, bool, bool), ServiceError> {
+        let (peer, peer_app_version, peer_relay_update, peer_relay_update_v2) = if host {
             // 宿主侧：等对方 Hello，校验连接码
             log::log_verbose("conn", "握手步骤5/6：等待对方 Hello");
             match conn.recv().await? {
@@ -1723,6 +1801,7 @@ impl Node {
                     code,
                     app_version,
                     relay_update,
+                    relay_update_v2,
                     ..
                 }) => {
                     log::log_verbose(
@@ -1765,6 +1844,7 @@ impl Node {
                                 reason: Some("连接码不正确".into()),
                                 app_version: env!("CARGO_PKG_VERSION").to_string(),
                                 relay_update: true,
+                                relay_update_v2: true,
                             }))
                             .await;
                         return Err(ServiceError::BadCode);
@@ -1776,6 +1856,7 @@ impl Node {
                         reason: None,
                         app_version: env!("CARGO_PKG_VERSION").to_string(),
                         relay_update: true,
+                        relay_update_v2: true,
                     }))
                     .await?;
                     log::log_verbose(
@@ -1791,6 +1872,7 @@ impl Node {
                         },
                         app_version,
                         relay_update,
+                        relay_update_v2,
                     )
                 }
                 _ => return Err(ServiceError::Other("握手失败：未收到 Hello".into())),
@@ -1808,6 +1890,7 @@ impl Node {
                 code: code_from_peer_or_target.to_string(),
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
                 relay_update: true,
+                relay_update_v2: true,
             }))
             .await?;
             // 双边同连仲裁：登记过出站尝试时，让行裁决与等 Ack 赛跑——
@@ -1834,6 +1917,7 @@ impl Node {
                     accepted,
                     app_version,
                     relay_update,
+                    relay_update_v2,
                     ..
                 }) => {
                     if !accepted {
@@ -1853,12 +1937,18 @@ impl Node {
                         },
                         app_version,
                         relay_update,
+                        relay_update_v2,
                     )
                 }
                 _ => return Err(ServiceError::Other("握手失败：未收到 HelloAck".into())),
             }
         };
-        Ok((peer, peer_app_version, peer_relay_update))
+        Ok((
+            peer,
+            peer_app_version,
+            peer_relay_update,
+            peer_relay_update_v2,
+        ))
     }
 
     /// 在已建立的字节流上完成握手并接管连接（宿主侧 host=true 时校验对方给出的连接码）。
@@ -1871,21 +1961,22 @@ impl Node {
         let conn = Arc::new(conn);
         // 握手限时：连上不应答的端点（接受连接但不说协议）时 recv 会无限等，
         // 20 秒未完成握手即判失败（连接侧的取消也依赖尝试能自己收尾）。
-        let (peer, peer_app_version, peer_relay_update) = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            self.handshake(&conn, host, code_from_peer_or_target),
-        )
-        .await
-        .map_err(|_| {
-            // 超时定案行必须落日志（essential）：2026-11-20 真机实证——对端
-            // HelloAck 没送达时发起侧干等到超时，旧版只把错误回给界面，
-            // 日志里无声无息，排查无从下手。
-            log::log_line(
-                "conn",
-                "连接失败于步骤5/6：握手超时（20 秒内未完成 Hello/HelloAck 往返）",
-            );
-            ServiceError::Other("握手超时：对方未在 20 秒内响应".into())
-        })??;
+        let (peer, peer_app_version, peer_relay_update, peer_relay_update_v2) =
+            tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                self.handshake(&conn, host, code_from_peer_or_target),
+            )
+            .await
+            .map_err(|_| {
+                // 超时定案行必须落日志（essential）：2026-11-20 真机实证——对端
+                // HelloAck 没送达时发起侧干等到超时，旧版只把错误回给界面，
+                // 日志里无声无息，排查无从下手。
+                log::log_line(
+                    "conn",
+                    "连接失败于步骤5/6：握手超时（20 秒内未完成 Hello/HelloAck 往返）",
+                );
+                ServiceError::Other("握手超时：对方未在 20 秒内响应".into())
+            })??;
 
         // 落库设备与会话（会话 ID 以对端设备 ID 派生，稳定唯一）
         let mut peer_dev = peer.clone();
@@ -1910,6 +2001,7 @@ impl Node {
             peer_goodbye: AtomicBool::new(false),
             peer_app_version,
             peer_relay_update,
+            peer_relay_update_v2,
         });
         // #17：手动/自动连上即解除该对端的重连抑制（抑制只管自动重连）
         self.reconnect_suppress
@@ -2229,8 +2321,24 @@ impl Node {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            if !self.reconnect_should_continue(gen) || self.is_connected().await {
-                break false; // 被取消或已（被别的路径）连上，不算放弃
+            if !self.reconnect_should_continue(gen) {
+                break false; // 被取消（用户主动停手），不算放弃
+            }
+            if self.is_connected().await {
+                // 已被别的路径连上（多为等待退避期间对端反向拨入）：
+                // 必须补发 connected 收尾——重连横幅只认重连状态事件
+                // 隐藏，不补发它会与顶栏「已连接」永久打架（v1.0.5
+                // 装版实报：横幅停在「正在自动重连」、顶栏已绿）。
+                log::log_line(
+                    "conn",
+                    &format!("自动重连停手：{} 已由其他路径恢复连接", target.name),
+                );
+                self.emit(Event::ReconnectState {
+                    peer_name: target.name.clone(),
+                    attempt,
+                    state: "connected".into(),
+                });
+                break false;
             }
             if tokio::time::Instant::now() >= deadline {
                 break true;
@@ -2498,8 +2606,11 @@ impl Node {
             Frame::Chunk(chunk) => {
                 self.on_file_chunk(session, chunk).await?;
             }
-            Frame::Control(Control::FileDone { transfer_id }) => {
-                self.on_file_done(session, transfer_id).await?;
+            Frame::Control(Control::FileDone {
+                transfer_id,
+                sha256,
+            }) => {
+                self.on_file_done(session, transfer_id, sha256).await?;
             }
             Frame::Control(Control::FileVerify { transfer_id, ok }) => {
                 if let Some(tx) = self.verify_waiters.lock().await.remove(&transfer_id) {
@@ -3639,6 +3750,7 @@ impl Node {
                 prep.msg_id.clone(),
                 None,
                 false,
+                None,
             )
             .await?;
         let tid = prep.transfer_id.clone();
@@ -3704,6 +3816,7 @@ impl Node {
                     prep.msg_id.clone(),
                     None,
                     false,
+                    None,
                 )
                 .await
             {
@@ -3849,6 +3962,7 @@ impl Node {
         msg_id: String,
         group: Option<GroupRef>,
         update_pkg: bool,
+        gate: Option<Arc<FetchGate>>,
     ) -> Result<TransferRun, ServiceError> {
         // 等待对方的已收区间（续传）
         let (tx, rx) = oneshot::channel();
@@ -3950,7 +4064,11 @@ impl Node {
                 }
             });
         }
-        for (start, end) in missing {
+        // 流水线水位门（中继边下边传专用，普通发送为 None）：每片先等
+        // 下载水位越过本片末尾再读盘；下载失败/提前结束则停发，之后
+        // 照常发 FileDone，让接收端以校验失败定案收尾（不留悬挂传输）。
+        let mut producer_err: Option<String> = None;
+        'ranges: for (start, end) in missing {
             let mut offset = start;
             file.seek(SeekFrom::Start(start))?;
             while offset < end {
@@ -3959,6 +4077,12 @@ impl Node {
                     return Ok(TransferRun::Cancelled);
                 }
                 let want = ((end - offset) as usize).min(CHUNK_SIZE);
+                if let Some(g) = &gate {
+                    if let Err(e) = g.wait_ready(offset + want as u64).await {
+                        producer_err = Some(e);
+                        break 'ranges;
+                    }
+                }
                 let mut buf = vec![0u8; want];
                 file.read_exact(&mut buf)?;
                 let (compression, data) = match try_compress(&buf, &name) {
@@ -3984,6 +4108,20 @@ impl Node {
                 prog_wire.store(wire_bytes, Ordering::Relaxed);
             }
         }
+        if let Some(e) = &producer_err {
+            log::log_line(
+                "update",
+                &format!("中继流水线未发完（{e}），照常发 FileDone 让接收端校验收尾"),
+            );
+        }
+        // 中继流水线：校验和由下载任务边下边算，此刻（全部片已发完、
+        // 下载必然已追平）取回随 FileDone 迟到交付；下载失败则不带
+        // 值，接收方待定校验和等不到值、必然判失败，收尾干净。
+        // 普通发送 gate 为 None，恒不带值（要约已带校验和）。
+        let done_sha = match &gate {
+            Some(g) => g.wait_done().await.ok(),
+            None => None,
+        };
         // 等校验结果
         let (vtx, vrx) = oneshot::channel();
         self.verify_waiters
@@ -3994,6 +4132,7 @@ impl Node {
             .conn
             .send(&Frame::Control(Control::FileDone {
                 transfer_id: transfer_id.clone(),
+                sha256: done_sha,
             }))
             .await?;
         // #12 状态语义（v2.6.5，日志定案）：conn.send 返回只代表字节进了
@@ -4162,6 +4301,7 @@ impl Node {
                         total,
                     }),
                     false,
+                    None,
                 )
                 .await;
             match run {
@@ -4561,6 +4701,7 @@ impl Node {
         &self,
         session: &Arc<PeerSession>,
         transfer_id: String,
+        done_sha: Option<String>,
     ) -> Result<(), ServiceError> {
         let done_t0 = std::time::Instant::now(); // ⑳ 「收完→发出确认」计时
                                                  // 先给本方界面一个「校验中」状态，别让进度条在 100% 干挂着
@@ -4631,7 +4772,14 @@ impl Node {
             }
         };
         let verify_ms = verify_t0.elapsed().as_secs_f64() * 1000.0;
-        let ok = actual == st.sha256;
+        // 中继流水线的要约校验和是待定的（st.sha256 为空）：以随
+        // FileDone 迟到的值为准；待定又没等到值，一律判失败不放行。
+        // 普通文件要约已带校验和，迟到值不参与（恒以要约的为准）。
+        let ok = if st.sha256.is_empty() {
+            done_sha.as_deref() == Some(actual.as_str())
+        } else {
+            actual == st.sha256
+        };
         // 先放掉常驻 .part 句柄再 rename：Windows 上句柄开着改名靠
         // 共享标志兜底，显式释放把这条风险摘掉（flush 已在写片时完成）。
         drop(st.file.take());
@@ -4761,11 +4909,212 @@ impl Node {
 
     // ---------- 中继更新（内网机经外网机代下安装包） ----------
 
+    /// 流水线取包：下载与蓝牙回传重叠进行（边下边传，总耗时取两段
+    /// 的大者而非相加——v1.0.5 装版实报中继更新慢，定案优化）。
+    /// 要约（FileOffer）要赶在下载完成前发出：总长取下载响应头；
+    /// 校验和那时还没算出，要约先空着、由下载任务边下边算、随
+    /// FileDone 迟到交付（接收方待定校验和、等到值才验）。这套只
+    /// 对自报 relay_update_v2 的接收方启用（握手能力位把关）：旧版
+    /// 接收方看不懂空校验和，返回 Err 让调用方回退串行老路。回执
+    /// （版本+签名）在开传前就发给请求方，与串行路同一份 latest
+    /// 快照，不存在版本/签名错位。
+    async fn serve_update_fetch_pipelined(
+        &self,
+        session: &Arc<PeerSession>,
+        req_id: &str,
+        platform: &str,
+    ) -> Result<(), ServiceError> {
+        if !session.peer_relay_update_v2 {
+            return Err(ServiceError::Other(
+                "对端不支持中继流水线（版本较旧）".into(),
+            ));
+        }
+        let t0 = std::time::Instant::now();
+        let (info, dl) = Self::fetch_latest_update(platform)
+            .await
+            .map_err(ServiceError::Other)?;
+        let fname = dl
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("update-package.bin")
+            .to_string();
+        std::fs::create_dir_all(&self.updates_dir)
+            .map_err(|e| ServiceError::Other(format!("建更新暂存目录失败：{e}")))?;
+        let tmp = self.updates_dir.join(format!(".relay-{req_id}.tmp"));
+        let (gate, dl_handle, total) = self
+            .start_update_download(&dl, &tmp)
+            .await
+            .map_err(ServiceError::Other)?;
+        if let Err(e) = session
+            .conn
+            .send(&Frame::Control(Control::UpdateFetchResult {
+                req_id: req_id.to_string(),
+                ok: true,
+                error: None,
+                version: Some(info.version.clone()),
+                signature: Some(info.signature.clone()),
+            }))
+            .await
+        {
+            dl_handle.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), dl_handle).await;
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ServiceError::Other(format!("回取包应答失败：{e}")));
+        }
+        // 传输 ID 由「版本+签名」派生（要约时校验和还不存在）：签名
+        // 覆盖包内容，同版本同签名必是同一个包，接收方已有的 .part
+        // 续传才接得上；同号换包签名必变、ID 跟着变，不会拼错包
+        let transfer_id = derive_transfer_id(
+            &format!("{}:{}", info.version, info.signature),
+            &session.peer.device_id,
+        );
+        let msg_id = format!("update:{req_id}");
+        let run = self
+            .run_file_transfer(
+                session,
+                &tmp,
+                fname,
+                total,
+                String::new(), // 校验和待定：随 FileDone 迟到交付
+                transfer_id,
+                msg_id,
+                None,
+                true,
+                Some(gate),
+            )
+            .await;
+        // 下载任务此时应已收尾；传输先失败时靠 abort 停下未完的下载。
+        // abort 只是标记取消，须等任务真结束再删文件：Windows 上句柄
+        // 未释放时删不掉、会留残包（评审整改）；等满 5 秒仍未结束就
+        // 先删，删不掉记日志留痕，不无声吞掉。
+        dl_handle.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), dl_handle).await;
+        // 传完即删（与串行路同口径）：无论成败都不在本机留缓存包
+        if let Err(e) = std::fs::remove_file(&tmp) {
+            log::log_line(
+                "update",
+                &format!("中继暂存包删除失败（可能残留 {}）：{e}", tmp.display()),
+            );
+        }
+        match run {
+            Ok(TransferRun::Done { ok: true, .. }) => log::log_line(
+                "update",
+                &format!(
+                    "essential: 中继取包完成（流水线）：{}，全程 {:.1} 秒",
+                    info.version,
+                    t0.elapsed().as_secs_f64()
+                ),
+            ),
+            Ok(_) => log::log_line("update", "中继回传更新包未成功收尾（流水线）"),
+            Err(e) => log::log_line("update", &format!("中继回传更新包失败（流水线）：{e}")),
+        }
+        Ok(())
+    }
+
+    /// 流水线下载：起一个后台任务把更新包流式落盘并推进水位门，
+    /// 立即返回（水位门、任务句柄、总字节数）。拿不到可靠总长
+    /// （无 Content-Length 或超上限）直接报错，调用方回退串行。
+    async fn start_update_download(
+        &self,
+        url: &str,
+        tmp_path: &Path,
+    ) -> Result<(Arc<FetchGate>, tokio::task::JoinHandle<()>, u64), String> {
+        const MAX_PKG_BYTES: u64 = 200 * 1024 * 1024;
+        let client = Self::update_http_client();
+        let mut resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("下载更新包失败：{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("下载更新包失败：服务器返回 {}", resp.status()));
+        }
+        let total = resp
+            .content_length()
+            .filter(|n| *n > 0 && *n <= MAX_PKG_BYTES)
+            .ok_or_else(|| "更新包缺少可靠总长，无法流水线".to_string())?;
+        let (tx, rx) = tokio::sync::watch::channel(GateSnap::default());
+        let gate = Arc::new(FetchGate {
+            rx: tokio::sync::Mutex::new(rx),
+        });
+        let tmp = tmp_path.to_path_buf();
+        let handle = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let t0 = std::time::Instant::now();
+            let mut snap = GateSnap::default();
+            let run = async {
+                let mut file = tokio::fs::File::create(&tmp)
+                    .await
+                    .map_err(|e| format!("建更新暂存文件失败：{e}"))?;
+                let mut got: u64 = 0;
+                let mut hasher = Sha256::new();
+                while let Some(chunk) = resp
+                    .chunk()
+                    .await
+                    .map_err(|e| format!("下载更新包中断：{e}"))?
+                {
+                    got += chunk.len() as u64;
+                    if got > MAX_PKG_BYTES {
+                        return Err("更新包大小异常（超过 200 MB），已中止".to_string());
+                    }
+                    hasher.update(&chunk);
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|e| format!("写更新包失败：{e}"))?;
+                    // 必须逐片 flush 再推进水位：tokio 的 File 内部带
+                    // 写缓冲，不冲刷字节可能还停在缓冲里、没落到 OS，
+                    // 发送侧按水位读盘会读到文件尾之外（实测教训）
+                    file.flush()
+                        .await
+                        .map_err(|e| format!("写更新包失败：{e}"))?;
+                    snap.ready = got;
+                    let _ = tx.send(snap.clone());
+                }
+                file.flush()
+                    .await
+                    .map_err(|e| format!("写更新包失败：{e}"))?;
+                // 流提前结束（已下字节 ≠ 响应头总长）按失败处理：不许
+                // 带着半包校验和收尾，发送侧据此不带值发 FileDone，
+                // 接收方待定校验和等不到值、干净判失败（评审整改）
+                if got != total {
+                    return Err(format!("下载更新包不完整：已下 {got} / 共 {total} 字节"));
+                }
+                Ok::<(u64, String), String>((got, format!("{:x}", hasher.finalize())))
+            }
+            .await;
+            match run {
+                Ok((got, sha_hex)) => {
+                    let secs = t0.elapsed().as_secs_f64();
+                    log::log_line(
+                        "update",
+                        &format!(
+                            "essential: 中继代下完成（流水线）：{got} 字节，耗时 {secs:.1} 秒，均速 {:.0} KB/s",
+                            if secs > 0.0 { got as f64 / secs / 1024.0 } else { 0.0 }
+                        ),
+                    );
+                    snap.ready = snap.ready.max(got);
+                    snap.done = true;
+                    snap.sha256 = Some(sha_hex);
+                    let _ = tx.send(snap);
+                }
+                Err(e) => {
+                    log::log_line("update", &format!("中继代下失败（流水线）：{e}"));
+                    snap.done = true;
+                    snap.error = Some(e);
+                    let _ = tx.send(snap);
+                }
+            }
+        });
+        Ok((gate, handle, total))
+    }
+
     /// 中继代取/代下用的 HTTP 客户端：若环境里设了 HTTPS_PROXY 则
-    /// 显式沿用（部分网络环境只能经代理出网，reqwest 默认构建不读
-    /// 环境变量）；没设则直连，与普通机器上的行为一致。根证书除
-    /// 内置集外再并入系统证书库——经企业代理出网时对端证书常由
-    /// 企业 CA 签发，只认内置集会误判连不上。
+    /// 显式沿用（部分网络环境只能经代理出网）；没设时 reqwest 默认
+    /// 认系统代理（system-proxy 特性，读 Windows 系统代理设置——
+    /// 只开系统代理模式的 Clash 也能同路）。根证书除内置集外再并
+    /// 入系统证书库——经企业代理出网时对端证书常由企业 CA 签发，
+    /// 只认内置集会误判连不上。
     fn update_http_client() -> reqwest::Client {
         let mut builder = reqwest::Client::builder()
             .tls_built_in_native_certs(true)
@@ -4862,6 +5211,8 @@ impl Node {
             .filter(|s| !s.is_empty())
             .unwrap_or("update-package.bin")
             .to_string();
+        // 计时只算包体下载本身（不含前面的 latest.json 请求，均速才准）
+        let dl_t0 = std::time::Instant::now();
         let client = Self::update_http_client();
         let resp = client
             .get(&dl)
@@ -4889,6 +5240,19 @@ impl Node {
         let tmp = self.updates_dir.join(format!(".relay-{req_id}.tmp"));
         std::fs::write(&tmp, &bytes).map_err(|e| format!("写更新包失败：{e}"))?;
         std::fs::rename(&tmp, &path).map_err(|e| format!("落更新包失败：{e}"))?;
+        let secs = dl_t0.elapsed().as_secs_f64();
+        log::log_line(
+            "update",
+            &format!(
+                "essential: 中继代下完成（串行）：{} 字节，耗时 {secs:.1} 秒，均速 {:.0} KB/s",
+                bytes.len(),
+                if secs > 0.0 {
+                    bytes.len() as f64 / secs / 1024.0
+                } else {
+                    0.0
+                }
+            ),
+        );
         Ok((path, info))
     }
 
@@ -4934,6 +5298,17 @@ impl Node {
         req_id: String,
         platform: String,
     ) -> Result<(), ServiceError> {
+        // 先走流水线（边下边传）；前置条件备不齐（对端能力位/总长）
+        // 才回退下面的串行老路。流水线一旦开传就不再回退（回执已发、
+        // 传输已起），成败都由它自己的日志与传输事件收尾。
+        match self
+            .serve_update_fetch_pipelined(&session, &req_id, &platform)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => log::log_line("update", &format!("中继流水线不可用（{e}），回退串行下载")),
+        }
+        let serial_t0 = std::time::Instant::now();
         let (tmp, info) = match self.download_update_package(&platform, &req_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -4991,12 +5366,22 @@ impl Node {
                 msg_id,
                 None,
                 true,
+                None,
             )
             .await;
         // 传完即删：成功、失败、被取消都删，不在本机留缓存包
         let _ = std::fs::remove_file(&tmp);
-        if let Err(e) = run {
-            log::log_line("update", &format!("中继回传更新包失败：{e}"));
+        match run {
+            Ok(TransferRun::Done { ok: true, .. }) => log::log_line(
+                "update",
+                &format!(
+                    "essential: 中继取包完成（串行）：{}，全程 {:.1} 秒",
+                    info.version,
+                    serial_t0.elapsed().as_secs_f64()
+                ),
+            ),
+            Ok(_) => log::log_line("update", "中继回传更新包未成功收尾（串行）"),
+            Err(e) => log::log_line("update", &format!("中继回传更新包失败：{e}")),
         }
         Ok(())
     }
