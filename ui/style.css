@@ -328,7 +328,7 @@ section { display: flex; flex-direction: column; height: 100%; }
 #clip-hotkey-input { width: 170px; padding: 7px 10px; border: 1px solid var(--border);
   border-radius: 8px; background: var(--panel); color: var(--text); font-size: 13px; cursor: pointer; }
 #clip-hotkey-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: none; }
-#clip-hotkey-input.recording { border-color: var(--accent); color: var(--text-2); }
+#clip-hotkey-input.recording, #send-key-input.recording, #newline-key-input.recording { border-color: var(--accent); color: var(--text-2); }
 .chat-title { font-size: 15.5px; font-weight: 600; line-height: 1.3; }
 #pin-bar, #ai-pin-bar { background: var(--panel); border-bottom: 1px solid var(--border); padding: 7px 16px;
   font-size: 12.5px; color: var(--text-2); cursor: pointer; display: flex; gap: 7px; align-items: center; }
@@ -482,11 +482,26 @@ section { display: flex; flex-direction: column; height: 100%; }
 .palette-item { padding: 9px 10px; cursor: pointer; font-size: 13px; border-radius: 6px; display: flex; justify-content: space-between; }
 .palette-item.sel { background: var(--accent-soft); color: var(--accent); }
 
-/* 日期锚点栏 */
-#date-rail { position: absolute; right: 8px; top: 120px; display: flex; flex-direction: column; gap: 4px; z-index: 5; }
-#date-rail button { border: 1px solid var(--border); background: var(--panel); color: var(--muted); border-radius: 6px;
-  font-size: 11px; padding: 3px 7px; cursor: pointer; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05); }
-#date-rail button:hover { color: var(--accent); border-color: var(--accent); }
+/* 日期锚点栏（v1.0.4 复测 #2 改版，用户定方向）：常态只是一列
+   小点贴右缘（整颗日期签逐日排会越来越长、还压自方气泡），鼠标
+   悬浮整列才展开成日期签、点哪颗跳哪天。纵向排在彩签条下方分
+   段（top 由 layoutDateRail 按彩签条实测高度动态给），高度封顶
+   到输入框上沿，展开后放不下则列内滚动。 */
+#date-rail { position: absolute; right: 10px; top: 120px; display: flex; flex-direction: column;
+  gap: 9px; z-index: 5; align-items: flex-end; overflow-y: hidden; padding: 2px; }
+#date-rail:hover { overflow-y: auto; }
+#date-rail .rail-item { display: flex; align-items: center; border: none; background: none;
+  padding: 3px; cursor: pointer; }
+#date-rail .rail-dot { width: 7px; height: 7px; border-radius: 50%; flex: none;
+  background: var(--muted); opacity: 0.55; }
+#date-rail .rail-item:hover .rail-dot { background: var(--accent); opacity: 1; }
+#date-rail .rail-label { display: none; font-size: 11px; color: var(--muted); white-space: nowrap; }
+#date-rail:hover .rail-item { border: 1px solid var(--border); background: var(--panel);
+  border-radius: 6px; padding: 3px 7px; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05); }
+#date-rail:hover .rail-dot { display: none; }
+#date-rail:hover .rail-label { display: inline; }
+#date-rail:hover .rail-item:hover { border-color: var(--accent); }
+#date-rail:hover .rail-item:hover .rail-label { color: var(--accent); }
 #chat-view { position: relative; overflow-x: clip; }
 /* ㉛ 未连接提示带：占输入框的位置（未连接时与输入行互斥显示） */
 #offline-band { display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -1208,12 +1223,20 @@ section { display: flex; flex-direction: column; height: 100%; }
 .ai-att-chip { cursor: pointer; color: var(--text); }
 .ai-att-chip:hover { border-color: var(--accent); }
 
-/* 自动重连横幅（v2.6.2）：固定在窗口顶部中央，任何视图都可见 */
+/* 自动重连横幅（v2.6.2；v1.0.4 复测 #1 改版）：固定在窗口顶部
+   中央，任何视图都可见。单行锁定——文案不带次数（数字变化会让
+   胶囊宽度变、居中定位下圆点与按钮跟着左右跳），超长省略，高度
+   恒定；停止钮改轻文字钮，与左圆点左右对称。 */
 #reconnect-banner { position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
   z-index: 300; display: flex; align-items: center; gap: 10px; padding: 7px 12px;
+  max-width: min(560px, calc(100vw - 32px));
   background: var(--panel); border: 1px solid var(--warn); border-radius: 999px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22); font-size: 12.5px; color: var(--text); }
 #reconnect-banner.hidden { display: none; }
+#reconnect-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+#reconnect-stop { flex: none; background: none; border: none; padding: 2px 4px;
+  color: var(--accent); font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+#reconnect-stop:hover { text-decoration: underline; }
 #reconnect-banner .rb-dot { width: 8px; height: 8px; border-radius: 50%;
   background: var(--warn); animation: rbPulse 1.1s ease-in-out infinite; flex: none; }
 @keyframes rbPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }

@@ -63,7 +63,7 @@
   </defs>
 </svg>
 
-<div id="reconnect-banner" class="hidden"><span class="rb-dot"></span><span id="reconnect-text">连接中断，正在重连…</span><button id="reconnect-stop" class="btn small-btn">停止重连</button></div>
+<div id="reconnect-banner" class="hidden"><span class="rb-dot"></span><span id="reconnect-text">连接中断，正在重连…</span><button id="reconnect-stop">停止重连</button></div>
 <div id="app">
   <!-- 一级导航 -->
   <nav id="nav">
@@ -349,6 +349,21 @@
             <button type="button" data-theme-set="system">跟随系统</button>
           </div>
         </div>
+        <h3>输入框</h3>
+        <div class="setting-row">
+          <span>发送键</span>
+          <span class="row-gap">
+            <input id="send-key-input" type="text" readonly value="Enter" title="点一下，再按下想用的组合键">
+          </span>
+        </div>
+        <div class="setting-row">
+          <span>换行键</span>
+          <span class="row-gap">
+            <input id="newline-key-input" type="text" readonly value="Shift+Enter" title="点一下，再按下想用的组合键">
+            <button id="composer-keys-reset" class="btn small-btn" type="button">恢复默认</button>
+          </span>
+        </div>
+        <p class="muted small">在聊天和 AI 输入框里生效。只能设回车键的组合（如 Enter、Shift+Enter、Ctrl+Enter），发送键和换行键不能相同。</p>
         <h3>本机</h3>
         <div class="setting-row"><span>设备名称</span><b id="set-name">-</b></div>
         <div class="setting-row"><span>连接码</span><b id="set-code">-</b></div>

@@ -711,17 +711,33 @@ fn clip_image_digest(width: u32, height: u32, rgba: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// 系统剪贴板序号（仅 Windows）：每次有人往剪贴板放东西就 +1，
+/// 同一份内容重新复制也会变——靠它区分「内容没变」与「用户又复制
+/// 了一遍」（复测 #7：A→A 第二份要算新复制）。非 Windows 平台没有
+/// 等价接口，返回 None、沿用纯内容口径。
+#[cfg(windows)]
+fn clipboard_seq() -> Option<u32> {
+    Some(unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() })
+}
+#[cfg(not(windows))]
+fn clipboard_seq() -> Option<u32> {
+    None
+}
+
 /// 一次剪贴板读取的结果：内容（可能为空）+ 是否因「被其他程序占用」读不到。
 /// 「剪贴板里没东西」与「被占用读不了」必须分开——前者是常态、后者是
 /// 故障信号（v2.6.1 前两者都静默成 None，出问题无据可查）。
 struct ClipRead {
     content: Option<ClipContent>,
     occupied: bool,
+    /// 读取时刻的系统剪贴板序号（见 clipboard_seq）。
+    seq: Option<u32>,
 }
 
 /// 读系统剪贴板：与粘贴规则同口径——先文字，纯图片才取图片；空剪贴板返回 None。
 /// 句柄由 Node 长驻持有（见 clip_handle 字段注释），不要在这里新建临时句柄。
 fn clip_read_with(cb: &mut arboard::Clipboard) -> ClipRead {
+    let seq = clipboard_seq();
     let mut occupied = false;
     match cb.get_text() {
         Ok(t) => {
@@ -729,6 +745,7 @@ fn clip_read_with(cb: &mut arboard::Clipboard) -> ClipRead {
                 return ClipRead {
                     content: Some(ClipContent::Text(t)),
                     occupied: false,
+                    seq,
                 };
             }
         }
@@ -744,6 +761,7 @@ fn clip_read_with(cb: &mut arboard::Clipboard) -> ClipRead {
                     rgba: img.bytes.into_owned(),
                 }),
                 occupied: false,
+                seq,
             };
         }
         Err(arboard::Error::ClipboardOccupied) => occupied = true,
@@ -752,6 +770,7 @@ fn clip_read_with(cb: &mut arboard::Clipboard) -> ClipRead {
     ClipRead {
         content: None,
         occupied,
+        seq,
     }
 }
 
@@ -1061,6 +1080,13 @@ enum ClipApplyDecision {
 #[derive(Default)]
 struct ClipGuard {
     local_seen: Option<String>,
+    /// 与 local_seen 配套的系统剪贴板序号（复测 #7）：基线内容上次
+    /// 被裁决/发送/观察时剪贴板的序号。内容哈希没变但序号变了 =
+    /// 用户把同一份内容又复制了一遍，按新复制处理（它就是现在的
+    /// 最新一条）。只由 poll 裁决的回声/无变化分支、prime 与发送
+    /// 成功后的 note_seq 推进；裁决判 Send 时不推进——发送失败或
+    /// 图片延后时下一拍凭序号差继续判 Send，不丢重试。
+    local_seq: Option<u32>,
     sent: std::collections::VecDeque<String>,
     applied: Option<AppliedClip>,
     /// 写剪贴板失败后的退让截止时刻：此前到达的远端内容直接丢弃不再尝试写。
@@ -1083,7 +1109,8 @@ struct ClipGuard {
     history: std::collections::VecDeque<ClipContent>,
     /// 最近应用过的远端内容哈希账（线缆哈希与回读哈希都记）：多条
     /// 依次写入时单槽 applied 只记得住最后一条，这本账覆盖整批——
-    /// poll/apply 命中即认回声/本机已有，绝不回发整批中的任何一条。
+    /// poll 侧命中即认回声、绝不回发整批中的任何一条（apply 侧自
+    /// 复测 #6 起退出这本账：剪贴板已换内容时对方重发旧内容要写）。
     applied_recent: std::collections::VecDeque<String>,
 }
 
@@ -1097,33 +1124,59 @@ const CLIP_HISTORY_CAP: usize = 10;
 const CLIP_APPLIED_CAP: usize = 16;
 
 impl ClipGuard {
+    /// 发送/观察落实后推进序号基线（与 note_sent/note_observed 分开
+    /// 记：序号的推进点是「这份内容已经处理完」，不是裁决时刻）。
+    fn note_seq(&mut self, seq: Option<u32>) {
+        if seq.is_some() {
+            self.local_seq = seq;
+        }
+    }
+
     /// poll 裁决：读到的内容是没变、同步回声、还是用户新复制。
     /// SyncEcho 时顺手把基线推进到读到的哈希（格式转换形态从此成本机基线）。
-    fn poll_decide(&mut self, content: &ClipContent) -> ClipPollDecision {
+    /// seq 为系统剪贴板序号（非 Windows 为 None）：内容与基线同哈希
+    /// 但序号变了，是用户把同一份内容重新复制了一遍（复测 #7），
+    /// 判 Send 让它重新成为最新一条；回声判定排在它前面——同步写
+    /// 入同样会顶高序号，绝不能把回声误判成重复制。
+    fn poll_decide(&mut self, content: &ClipContent, seq: Option<u32>) -> ClipPollDecision {
         let hash = content.hash();
-        // 回声判定优先于基线判定：应用登记在册的内容（含格式转换
-        // 形态）无论基线在哪，都认作同步来的——基线可能已被 prime
-        // 或后续轮询推进过，不能让它把回声身份冲掉（#16 定案）。
+        // 回声判定优先于一切（含下面的重复制判定）：经同步到达本
+        // 机的内容，无论序号怎么变、中间复制过什么，都绝不回发
+        // ——用户定案的方向规矩：机器1 复制 A 同步到机器2，机器2
+        // 上的 A 永远不许回到机器1（账本有界：超容被挤出的老条目
+        // 靠对方 sent 账的 EchoDrop 兜底，最坏是一次同内容重写、
+        // 不成环）。原机 A→B→A 第三份发不出去的真因不在这里，
+        // 在接收侧 apply_decide 的应用账（见彼处）。
         if let Some(ap) = &self.applied {
             if ap.wire_hash == hash
                 || ap.readback_hash.as_deref() == Some(hash.as_str())
                 || clip_equiv(content, &ap.content)
             {
                 self.local_seen = Some(hash);
+                self.note_seq(seq);
                 return ClipPollDecision::SyncEcho;
             }
         }
         // 整批应用账：多条同步依次写入时，早期条目可能已被单槽
         // applied 挤掉，但只要还在账里就仍是同步来的，绝不回发。
-        // 与单槽 applied 同口径的已知取舍：刚被同步过的内容短时间
-        // 内在本机再复制同份，会先被认作回声（等它被后续应用挤出
-        // 账本、或进程重启后恢复）——防回环优先于这一 corner。
         if self.applied_recent.contains(&hash) {
             self.local_seen = Some(hash);
+            self.note_seq(seq);
             return ClipPollDecision::SyncEcho;
         }
         if self.local_seen.as_deref() == Some(hash.as_str()) {
-            return ClipPollDecision::Unchanged;
+            // 内容与基线同哈希，但系统序号变了 = 用户把同一份内容
+            // 又复制了一遍（复测 #7）：它就是现在的最新一条，按新
+            // 复制判 Send（对方已有同份时接收侧会判已有、不重写）。
+            // 序号基线还没立（None）时先立基线，不误发。
+            match (seq, self.local_seq) {
+                (Some(s), Some(prev)) if s != prev => return ClipPollDecision::Send,
+                (Some(_), None) => {
+                    self.note_seq(seq);
+                    return ClipPollDecision::Unchanged;
+                }
+                _ => return ClipPollDecision::Unchanged,
+            }
         }
         ClipPollDecision::Send
     }
@@ -1168,19 +1221,25 @@ impl ClipGuard {
     /// apply 裁决：回声/本机已有/真新内容。
     fn apply_decide(&self, content: &ClipContent) -> ClipApplyDecision {
         let hash = content.hash();
+        // 本机发出去过的内容被回传：无条件丢弃——这是接收侧的
+        // 防回环墙（与 poll 侧回声抑制配套，用户定案的方向规矩）。
         if self.sent.contains(&hash) {
             return ClipApplyDecision::EchoDrop;
         }
-        // 整批应用账：本机刚按批写入过的内容被对方回传时，单槽
-        // applied 可能已被后一条挤掉，账里命中同样判本机已有。
-        if self.applied_recent.contains(&hash) {
-            return ClipApplyDecision::AlreadyLocal;
-        }
+        // 剪贴板此刻正装着这份内容：真已有，不重写。
         if self.local_seen.as_deref() == Some(hash.as_str()) {
             return ClipApplyDecision::AlreadyLocal;
         }
+        // 应用登记只在本机剪贴板还停在那份应用内容上时才算已有：
+        // 基线已被新内容推进过，对方重发旧内容是真更新（复测 #6
+        // 真因：原机 A→B→A，第三份 A 到达时接收机停在 B，旧口径
+        // 凭「应用账里有 A」判已有丢弃，B 永远变不回 A）。整批账
+        // 同理退出 apply 裁决——剪贴板装着同哈希已被上一条覆盖，
+        // 其余情形一律照常写入（重写同份内容无害、终点状态正确）。
         if let Some(ap) = &self.applied {
-            if ap.wire_hash == hash || clip_equiv(content, &ap.content) {
+            let baseline_on_applied = self.local_seen.as_deref() == Some(ap.wire_hash.as_str())
+                || self.local_seen.as_deref() == ap.readback_hash.as_deref();
+            if baseline_on_applied && (ap.wire_hash == hash || clip_equiv(content, &ap.content)) {
                 return ClipApplyDecision::AlreadyLocal;
             }
         }
@@ -3063,8 +3122,9 @@ impl Node {
                     return ManualSyncOutcome::Occupied;
                 }
                 if let Some(content) = read.content {
+                    let seq = read.seq;
                     let mut g = self.clip_guard.lock().await;
-                    if matches!(g.poll_decide(&content), ClipPollDecision::Send) {
+                    if matches!(g.poll_decide(&content, seq), ClipPollDecision::Send) {
                         g.note_history(content);
                     }
                 }
@@ -3139,11 +3199,13 @@ impl Node {
             .flatten();
         if let Some(ClipRead {
             content: Some(content),
+            seq,
             ..
         }) = read
         {
             let mut g = self.clip_guard.lock().await;
             g.local_seen = Some(content.hash());
+            g.note_seq(seq);
             // 手动模式例外（用户裁定）：基线内容只登记、绝不自动发，
             // 但要进历史缓冲——用户连上之后按快捷键主动发它，正是
             // 手动模式的意义。自动模式不种：基线之前的旧内容不许
@@ -3187,11 +3249,12 @@ impl Node {
             }
             return;
         }
+        let seq = read.seq;
         let Some(content) = read.content else { return };
         let hash = content.hash();
         let decision = {
             let mut g = self.clip_guard.lock().await;
-            let d = g.poll_decide(&content);
+            let d = g.poll_decide(&content, seq);
             if matches!(d, ClipPollDecision::Send) {
                 // 本机新复制：先记进历史缓冲（自动多条与手动触发共用，
                 // 只存内存、退出即清，绝不落盘）
@@ -3214,6 +3277,7 @@ impl Node {
         if self.clipboard_sync_mode() == "manual" {
             let mut g = self.clip_guard.lock().await;
             g.note_observed(hash);
+            g.note_seq(seq);
             drop(g);
             log::log_verbose(
                 "clipboard",
@@ -3231,6 +3295,9 @@ impl Node {
             };
             let sent = self.send_clip_contents(session, items).await;
             if sent > 0 {
+                let mut g = self.clip_guard.lock().await;
+                g.note_seq(seq);
+                drop(g);
                 log::log_line("clipboard", &format!("剪贴板同步：已发送最新 {sent} 条"));
             }
             return;
@@ -3263,6 +3330,7 @@ impl Node {
                 {
                     let mut g = self.clip_guard.lock().await;
                     g.note_sent(hash);
+                    g.note_seq(seq);
                     log::log_verbose("clipboard", &format!("剪贴板同步：已发送文字（{n} 字节）"));
                 }
             }
@@ -3330,6 +3398,7 @@ impl Node {
                 if session.conn.send(&frame).await.is_ok() {
                     let mut g = self.clip_guard.lock().await;
                     g.note_sent(hash);
+                    g.note_seq(seq);
                     log::log_line(
                         "clipboard",
                         &format!("剪贴板同步：已发送图片（{width}x{height}，{n} 字节）"),
@@ -7360,10 +7429,13 @@ mod clip_state_tests {
         // A：用户复制文字 → 裁决发送 → 登记
         let mut a = ClipGuard::default();
         let text = ClipContent::Text("第一行\n第二行".into());
-        assert!(matches!(a.poll_decide(&text), ClipPollDecision::Send));
+        assert!(matches!(a.poll_decide(&text, None), ClipPollDecision::Send));
         a.note_sent(text.hash());
         // A 再读到同一内容：无变化
-        assert!(matches!(a.poll_decide(&text), ClipPollDecision::Unchanged));
+        assert!(matches!(
+            a.poll_decide(&text, None),
+            ClipPollDecision::Unchanged
+        ));
 
         // B：收到 → 裁决写入 → 登记（回读哈希 = 转换形态的哈希）
         let mut b = ClipGuard::default();
@@ -7372,11 +7444,14 @@ mod clip_state_tests {
         b.note_applied(text.clone(), Some(readback.hash()));
         // B 监视读到转换形态：同步回声，不发送
         assert!(matches!(
-            b.poll_decide(&readback),
+            b.poll_decide(&readback, None),
             ClipPollDecision::SyncEcho
         ));
         // B 监视读到原形态：同样认得出
-        assert!(matches!(b.poll_decide(&text), ClipPollDecision::SyncEcho));
+        assert!(matches!(
+            b.poll_decide(&text, None),
+            ClipPollDecision::SyncEcho
+        ));
 
         // 假设回声仍漏回 A：A 按发送登记丢弃，绝不写入（历史不重复）
         assert!(matches!(a.apply_decide(&text), ClipApplyDecision::EchoDrop));
@@ -7405,7 +7480,7 @@ mod clip_state_tests {
         let mut b = ClipGuard::default();
         b.note_applied(orig.clone(), Some(converted.hash()));
         assert!(matches!(
-            b.poll_decide(&converted),
+            b.poll_decide(&converted, None),
             ClipPollDecision::SyncEcho
         ));
 
@@ -7453,7 +7528,10 @@ mod clip_state_tests {
             ClipApplyDecision::EchoDrop
         ));
         let fresh = ClipContent::Text("全新内容".into());
-        assert!(matches!(g.poll_decide(&fresh), ClipPollDecision::Send));
+        assert!(matches!(
+            g.poll_decide(&fresh, None),
+            ClipPollDecision::Send
+        ));
         assert!(matches!(g.apply_decide(&fresh), ClipApplyDecision::Proceed));
     }
 }
@@ -7515,8 +7593,11 @@ mod clip_bounded_and_batch_tests {
         assert_eq!(g.history_latest(99).len(), CLIP_HISTORY_CAP);
     }
 
-    /// 多条整批回声抑制：对方按序应用 3 条后，单槽 applied 只剩
-    /// 最后一条——整批账必须让前两条在 poll 与 apply 两侧都被认出。
+    /// 多条整批：对方按序应用 3 条后，单槽 applied 只剩最后一条。
+    /// poll 侧整批账覆盖全部——读到整批中任何一条都是同步回声，
+    /// 绝不回发（方向规矩）。apply 侧自复测 #6 起改口径：只有剪
+    /// 贴板正装着的那一条（最后一条）判已有，前两条重发到达判
+    /// 真更新照常写入——否则原机 A→B→A 时接收机变不回 A。
     #[test]
     fn 整批应用后每条都被回声抑制覆盖() {
         let mut b = ClipGuard::default();
@@ -7527,23 +7608,114 @@ mod clip_bounded_and_batch_tests {
             assert!(matches!(b.apply_decide(it), ClipApplyDecision::Proceed));
             b.note_applied(it.clone(), Some(it.hash()));
         }
-        // poll 侧：剪贴板若停在整批中任何一条（含已被挤出单槽的），
-        // 都必须判同步回声、绝不回发
+        // apply 侧（先查，apply_decide 不改状态）：剪贴板停在最后
+        // 一条上，它判已有；前两条判真更新
+        assert!(
+            matches!(b.apply_decide(&items[2]), ClipApplyDecision::AlreadyLocal),
+            "剪贴板正装着的整批最后一条应判本机已有"
+        );
+        for it in &items[..2] {
+            assert!(
+                matches!(b.apply_decide(it), ClipApplyDecision::Proceed),
+                "剪贴板已换内容时整批旧条目 {} 重发到达应照常写入（#6）",
+                it.hash()
+            );
+        }
+        // poll 侧：整批中任何一条被读到都是同步回声，绝不回发
         for it in &items {
             assert!(
-                matches!(b.poll_decide(it), ClipPollDecision::SyncEcho),
+                matches!(b.poll_decide(it, None), ClipPollDecision::SyncEcho),
                 "整批中的 {} 未被 poll 侧回声抑制覆盖",
                 it.hash()
             );
         }
-        // apply 侧：整批中任何一条被回传，都判本机已有、不重复写
-        for it in &items {
-            assert!(
-                matches!(b.apply_decide(it), ClipApplyDecision::AlreadyLocal),
-                "整批中的 {} 未被 apply 侧覆盖",
-                it.hash()
-            );
-        }
+    }
+
+    /// 复测 #6+#8 回归（用户定案的方向规矩）：机器1 复制 A、B、A，
+    /// 机器2 依次接收——第三份 A 到达时机器2 剪贴板停在 B，必须
+    /// 照常写入变回 A；而机器2 上的 A、B 永远不许回发到机器1。
+    #[test]
+    fn 接收机不回发且原机重发旧内容照常写入() {
+        let a = ClipContent::Text("内容A".into());
+        let b_content = ClipContent::Text("内容B".into());
+        let mut rx = ClipGuard::default();
+        // A、B 先后同步到达并写入
+        assert!(matches!(rx.apply_decide(&a), ClipApplyDecision::Proceed));
+        rx.note_applied(a.clone(), Some(a.hash()));
+        assert!(matches!(
+            rx.apply_decide(&b_content),
+            ClipApplyDecision::Proceed
+        ));
+        rx.note_applied(b_content.clone(), Some(b_content.hash()));
+        // 第三份 A 到达：剪贴板停在 B，判真更新（旧口径凭应用账
+        // 里有 A 判已有丢弃——这就是 A→B→A 第三份同步不了的真因）
+        assert!(
+            matches!(rx.apply_decide(&a), ClipApplyDecision::Proceed),
+            "原机重发的 A 被接收侧应用账误吞（#6）"
+        );
+        rx.note_applied(a.clone(), Some(a.hash()));
+        // 写入后剪贴板停在 A：再来一份 A 判已有，不重写
+        assert!(matches!(
+            rx.apply_decide(&a),
+            ClipApplyDecision::AlreadyLocal
+        ));
+        // 接收机 poll 侧：读到 A、B 都是同步回声，永不回发
+        assert!(matches!(
+            rx.poll_decide(&a, None),
+            ClipPollDecision::SyncEcho
+        ));
+        assert!(matches!(
+            rx.poll_decide(&b_content, None),
+            ClipPollDecision::SyncEcho
+        ));
+    }
+
+    /// 复测 #7 回归：同一份内容被用户重新复制（内容没变、系统序
+    /// 号变了）要判新复制——它就是现在的最新一条；序号没变则仍
+    /// 是无变化，不许每拍重发；发送没落实前序号不推进、重试不丢；
+    /// 同步回声排在重复制前面（接收机上序号怎么变都不回发）。
+    #[test]
+    fn 同内容重新复制判新复制() {
+        let a = ClipContent::Text("内容A".into());
+        let mut g = ClipGuard::default();
+        // 原机：复制 A 并发送成功，序号基线立在 10
+        assert!(matches!(
+            g.poll_decide(&a, Some(10)),
+            ClipPollDecision::Send
+        ));
+        g.note_sent(a.hash());
+        g.note_seq(Some(10));
+        // 没再复制：序号不变，无变化
+        assert!(matches!(
+            g.poll_decide(&a, Some(10)),
+            ClipPollDecision::Unchanged
+        ));
+        // 重新复制 A：序号变 11，判新复制；没落实前再读仍判 Send（重试不丢）
+        assert!(matches!(
+            g.poll_decide(&a, Some(11)),
+            ClipPollDecision::Send
+        ));
+        assert!(matches!(
+            g.poll_decide(&a, Some(11)),
+            ClipPollDecision::Send
+        ));
+        g.note_sent(a.hash());
+        g.note_seq(Some(11));
+        assert!(matches!(
+            g.poll_decide(&a, Some(11)),
+            ClipPollDecision::Unchanged
+        ));
+        // 接收机：A 是同步写入的，序号再变也判回声，绝不回发
+        let mut rx = ClipGuard::default();
+        rx.note_applied(a.clone(), Some(a.hash()));
+        assert!(matches!(
+            rx.poll_decide(&a, Some(42)),
+            ClipPollDecision::SyncEcho
+        ));
+        assert!(matches!(
+            rx.poll_decide(&a, Some(43)),
+            ClipPollDecision::SyncEcho
+        ));
     }
 
     /// 手动模式观察登记：推进基线（再读判无变化）但绝不进发送
@@ -7552,9 +7724,12 @@ mod clip_bounded_and_batch_tests {
     fn 手动观察只推进基线不冒充已发送() {
         let mut g = ClipGuard::default();
         let c = ClipContent::Text("手动攒着的内容".into());
-        assert!(matches!(g.poll_decide(&c), ClipPollDecision::Send));
+        assert!(matches!(g.poll_decide(&c, None), ClipPollDecision::Send));
         g.note_observed(c.hash());
-        assert!(matches!(g.poll_decide(&c), ClipPollDecision::Unchanged));
+        assert!(matches!(
+            g.poll_decide(&c, None),
+            ClipPollDecision::Unchanged
+        ));
         assert!(g.sent.is_empty(), "没发出去不许进发送登记");
         // 对方若传回同一内容：因基线相同判「本机已有」（不重复写），
         // 但绝不能是 EchoDrop——那是发送登记命中，观察登记不许冒充。

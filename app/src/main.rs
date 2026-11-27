@@ -2942,6 +2942,17 @@ fn main() {
                                     "窗口恢复：从最小化/托盘恢复并获得焦点，已通知前端还焦点（window-restored）",
                                 );
                                 let _ = win2.emit("window-restored", ());
+                                // v1.0.4 复测 #3 二重保险：恢复瞬间的那次
+                                // set_focus 偶尔接不住 WebView2 的键盘焦点
+                                // （页面蓝圈在、人打不了字），隔一拍再补一
+                                // 次窗口聚焦，与前端的异步重抢错峰配合。
+                                let win3 = win2.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(
+                                        std::time::Duration::from_millis(150),
+                                    );
+                                    let _ = win3.set_focus();
+                                });
                             }
                             _ => {}
                         }

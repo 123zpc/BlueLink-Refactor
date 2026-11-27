@@ -1288,7 +1288,22 @@ $("btn-bottom").addEventListener("click", () => {
   c.scrollTo({ top: c.scrollHeight, behavior: "smooth" });
 });
 
-/** 日期锚点栏：列出当前会话出现过的日期，点击滚到当天第一条消息。 */
+/** 日期点列定位（复测 #2）：排在彩签条下方分段——起点按彩签条
+ * 实测高度动态算（彩签有几行就让几行），高度封顶到输入框上沿；
+ * 彩签条与日期点任一重画、窗口尺寸变化都要重对一次位置。 */
+function layoutDateRail() {
+  const rail = $("date-rail");
+  const view = $("chat-view");
+  if (!rail || !view) return;
+  const ribbon = $("tag-ribbon");
+  const ribbonH = ribbon ? ribbon.offsetHeight : 0;
+  const top = 76 + (ribbonH ? ribbonH + 10 : 44);
+  rail.style.top = `${top}px`;
+  rail.style.maxHeight = `${Math.max(60, view.clientHeight - top - 96)}px`;
+}
+
+/** 日期锚点栏：当前会话出现过的日期，常态小点、悬浮展开成签，
+ * 点击滚到当天第一条消息。 */
 function rebuildDateRail() {
   const rail = $("date-rail");
   if (!rail) return;
@@ -1300,17 +1315,26 @@ function rebuildDateRail() {
     if (!seen.has(key)) seen.set(key, { ts, mid: row.dataset.mid });
   }
   rail.innerHTML = "";
-  if (seen.size < 2) return;
-  for (const { ts, mid } of seen.values()) {
-    const b = document.createElement("button");
-    b.textContent = fmtDay(ts);
-    b.addEventListener("click", () => {
-      const el = document.querySelector(`#messages [data-mid="${mid}"]`);
-      if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
-    });
-    rail.appendChild(b);
+  if (seen.size >= 2) {
+    for (const { ts, mid } of seen.values()) {
+      const b = document.createElement("button");
+      b.className = "rail-item";
+      const dot = document.createElement("span");
+      dot.className = "rail-dot";
+      const label = document.createElement("span");
+      label.className = "rail-label";
+      label.textContent = fmtDay(ts);
+      b.append(dot, label);
+      b.addEventListener("click", () => {
+        const el = document.querySelector(`#messages [data-mid="${mid}"]`);
+        if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
+      });
+      rail.appendChild(b);
+    }
   }
+  layoutDateRail();
 }
+window.addEventListener("resize", () => layoutDateRail());
 
 /** 置顶钮的已置顶态绘制（与收藏同口径：文案 + 强调色，CSS .marked）。 */
 function paintPinBtn(b, on) {
@@ -1841,7 +1865,7 @@ async function sendCurrent() {
 $("btn-send").addEventListener("click", sendCurrent);
 $("input").addEventListener("keydown", (e) => {
   if (e.isComposing || e.keyCode === 229) return; // 输入法组字回车不发送（与 AI 页对齐，⑦）
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendCurrent(); }
+  handleComposerKey(e, $("input"), sendCurrent);
 });
 let typingTimer = null, draftTimer = null;
 $("input").addEventListener("input", () => {
@@ -2890,7 +2914,7 @@ async function refreshRibbon() {
   if (!ribbon) return;
   ribbon.innerHTML = "";
   state.ribbonMsgs = {};
-  if (!state.peerConvId) return;
+  if (!state.peerConvId) { layoutDateRail(); return; }
   await loadCategories();
   for (const c of state.categories) {
     if (!c.count) continue;
@@ -2923,6 +2947,7 @@ async function refreshRibbon() {
     tab.addEventListener("contextmenu", (e) => { e.preventDefault(); openRenamePop(c.color, tab); });
     ribbon.appendChild(tab);
   }
+  layoutDateRail(); // 彩签条高度变了，日期点列跟着重对位置（复测 #2）
 }
 
 let ribbonHideTimer = null;
@@ -3336,24 +3361,46 @@ async function loadAiMessages() {
 function nearBottomEl(el, px = 80) {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= px;
 }
-/** 滚动定版的手势侧（v2.6.2）：手势一出立即停跟随；自滚回底
- * （距底 ≤4px）恢复跟随。程序滚动不经过手势事件，不会误停。 */
+/** 跟随容差（v1.0.4 复测 #5，用户拍板）：距底未超过最后 4 条消息
+ * 行的总高不算停跟随（封顶一屏高、最少 120px、无消息行兜底
+ * 320px）——手滑上滑一点点不再误停；超过才停，滑回容差内恢复。 */
+function followTolerancePx(el) {
+  const rows = el.querySelectorAll(".msg-row");
+  if (!rows.length) return 320;
+  const last = rows[rows.length - 1];
+  const from = rows[Math.max(0, rows.length - 4)];
+  const px = last.offsetTop + last.offsetHeight - from.offsetTop;
+  return Math.min(Math.max(px, 120), el.clientHeight || px);
+}
+/** 滚动跟随的判定侧：距离说了算，但只有用户手势在场时才许停
+ * 跟随——图片迟加载、程序定位等非手势变高/滚动同样触发 scroll
+ * 事件，不能误停（代价模型：手势+超容差才停，任一 scroll 落进
+ * 容差内即恢复跟随）。 */
 function watchScrollDiscipline(el, key) {
   if (!el) return;
-  const off = () => { state.follow[key] = false; };
-  el.addEventListener("wheel", off, { passive: true });
-  el.addEventListener("touchmove", off, { passive: true });
+  let lastGestureAt = 0;
+  let barDragging = false;
+  const gesture = () => { lastGestureAt = Date.now(); };
+  el.addEventListener("wheel", gesture, { passive: true });
+  el.addEventListener("touchmove", gesture, { passive: true });
+  el.addEventListener("keydown", (e) => {
+    if (["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End", " "].includes(e.key)) gesture();
+  });
   el.addEventListener("pointerdown", (e) => {
     // 拖滚动条：指针落在容器右缘滚动条区域（clientWidth 之外）
     const r = el.getBoundingClientRect();
-    if (e.clientX >= r.left + el.clientWidth) off();
+    if (e.clientX >= r.left + el.clientWidth) { barDragging = true; gesture(); }
   });
-  el.addEventListener("keydown", (e) => {
-    if (["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End", " "].includes(e.key)) off();
-  });
+  window.addEventListener("pointerup", () => { barDragging = false; });
+  window.addEventListener("pointercancel", () => { barDragging = false; }); // 评审整改：指针被系统取消也要复位，否则 barDragging 永真、程序性变高会误停跟随
   el.addEventListener("scroll", () => {
-    if (!state.follow[key] && nearBottomEl(el, 4)) state.follow[key] = true;
-  });
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (dist <= followTolerancePx(el)) {
+      state.follow[key] = true;
+    } else if (barDragging || Date.now() - lastGestureAt < 500) {
+      state.follow[key] = false;
+    }
+  }, { passive: true });
 }
 watchScrollDiscipline($("messages"), "chat");
 watchScrollDiscipline($("ai-messages"), "ai");
@@ -3927,13 +3974,14 @@ function clearAskRef() {
 }
 $("ai-quote-x").addEventListener("click", clearAskRef);
 $("btn-ai-send").addEventListener("click", sendAi);
-// ⑦ AI 页输入框与聊天框对齐：Enter 发送、Shift+Enter 换行（textarea
-// 默认行为，不拦截即可）、高度自适应（wireAutoGrow 已接，上限同为
-// COMPOSER_MAX_H）。补输入法守卫：中文输入法组字中的回车是确认候选
-// 词，绝不能当发送——聊天框同病，一并对齐。
+// ⑦ AI 页输入框与聊天框对齐：发送/换行键走同一套可设置组合键
+// （handleComposerKey，默认 Enter 发送、Shift+Enter 换行）、高度
+// 自适应（wireAutoGrow 已接，上限同为 COMPOSER_MAX_H）。补输入法
+// 守卫：中文输入法组字中的回车是确认候选词，绝不能当发送——聊天
+// 框同病，一并对齐。
 $("ai-input").addEventListener("keydown", (e) => {
   if (e.isComposing || e.keyCode === 229) return;
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendAi(); }
+  handleComposerKey(e, $("ai-input"), sendAi);
 });
 // ① AI 输入框 Ctrl+V 粘贴文件（v1.0.2）：接聊天框同条剪贴板读取链
 // （clipboard_file_list 优先——资源管理器里复制的文件只有这条路能拿到）。
@@ -4014,6 +4062,12 @@ document.addEventListener("focusin", (e) => {
 // WebView2 做一次真实重聚焦。守卫口径与旧实现一致（对话框/菜单/
 // 查看器打开不抢、失焦前停在别处控件不抢、焦点真在别处输入控件不抢）。
 let lastFocusDoneAt = 0; // 上次真正执行还焦点的时刻（双路同轮去重）
+// 页面曾被隐藏过（关到托盘 hide / 最小化都会让 document.hidden 转真）：
+// 页面路径据此也走强制重抢，兜后端 window-restored 信号漏发的场合。
+let pageWasHidden = false;
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) pageWasHidden = true;
+});
 const FOCUS_BLOCKER_SEL = "#modal:not(.hidden), #clear-modal:not(.hidden), #update-modal:not(.hidden), #viewer:not(.hidden), #file-menu:not(.hidden), #viewer-fmt-menu:not(.hidden), #ai-source-menu:not(.hidden), #clip-mode-menu:not(.hidden), #clip-count-menu:not(.hidden)";
 function restoreComposerFocus(source, force) {
   const note = (msg) => {
@@ -4041,14 +4095,28 @@ function restoreComposerFocus(source, force) {
     note(`窗口恢复还焦点：焦点在别处输入控件（${activeDesc}），跳过`);
     return;
   }
-  if (active === el && !force) return; // 页面路径旧口径：已在输入框就不动
+  if (active === el && !force && !pageWasHidden) return; // 页面路径旧口径：已在输入框就不动
   const now = Date.now();
   if (now - lastFocusDoneAt < 300) return; // 页面事件与后端事件同轮先后到，只执行一次
   lastFocusDoneAt = now;
-  if (active === el) el.blur(); // 残留焦点先摘再重落，逼 WebView2 真正重聚焦
-  el.focus();
+  pageWasHidden = false;
+  // v1.0.4 复测 #3：旧写法同步 blur→focus 被 WebView2 合并成空操作
+  // ——焦点没真正离开过，DOM 焦点看着在输入框（蓝圈在）、键盘焦点
+  // 却没回来，照样打不了字。改成先摘、隔一拍再落：blur 后等 60ms
+  // 让引擎真正处理完失焦，再 focus 并走原两档复核。
+  if (active === el) el.blur(); // 残留焦点先摘
   invoke("log_frontend", { msg: `窗口恢复还焦点（${source}）：恢复前 activeElement=${activeDesc}，已还给 #${el.id}` }).catch(() => {});
-  verifyComposerFocus(el);
+  setTimeout(() => {
+    // 这 60ms 里对话框打开了、或窗口又被藏起来了：这次没真正执行
+    // 聚焦，收手并把「曾隐藏」标记还回去，下次恢复时页面路径仍走
+    // 强制重抢（评审整改）
+    if (document.hidden || document.querySelector(FOCUS_BLOCKER_SEL)) {
+      pageWasHidden = true;
+      return;
+    }
+    el.focus();
+    verifyComposerFocus(el);
+  }, 60);
 }
 // v1.0.4 验后 #5：还焦点后的延时复核。旧版在 el.focus() 后同步写下
 // 「已还焦点」就收工，可 WebView2 在窗口恢复后会异步把键盘焦点重置
@@ -4433,6 +4501,132 @@ setupMenuDropdown("clip-count-btn", "clip-count-menu",
     showToast(`每次同步条数已设为：最新 ${v} 条`);
     loadClipboardSync();
   });
+// ---------- 输入框发送/换行键（v1.0.4 复测 #4，用户拍板自由录制）
+// 口径：只能设回车键的组合（裸 Enter 或带 Ctrl/Alt/Shift/Super 的
+// Enter），发送键与换行键不得相同；默认 Enter 发送、Shift+Enter
+// 换行。存 localStorage（本机界面偏好，与 AI 思考开关同口径），聊天
+// 与 AI 两个输入框共用，输入框占位提示随设置同步。 ----------
+/** 把一次 keydown 归一成组合键字符串（如 "Enter"、"Ctrl+Enter"）。 */
+function keyEventCombo(e) {
+  const parts = [];
+  if (e.ctrlKey) parts.push("Ctrl");
+  if (e.altKey) parts.push("Alt");
+  if (e.shiftKey) parts.push("Shift");
+  if (e.metaKey) parts.push("Super");
+  let k = e.key;
+  if (k === " ") k = "Space";
+  else if (k.length === 1) k = k.toUpperCase();
+  parts.push(k);
+  return parts.join("+");
+}
+function isEnterCombo(combo) {
+  return typeof combo === "string" && combo.split("+").pop() === "Enter";
+}
+const COMPOSER_KEY_DEFAULTS = { send: "Enter", newline: "Shift+Enter" };
+let composerKeys = (() => {
+  let send = localStorage.getItem("composer_send_key");
+  let newline = localStorage.getItem("composer_newline_key");
+  if (!isEnterCombo(send) || !isEnterCombo(newline) || send === newline) {
+    send = COMPOSER_KEY_DEFAULTS.send;
+    newline = COMPOSER_KEY_DEFAULTS.newline;
+  }
+  return { send, newline };
+})();
+/** 在光标处插入一个换行（带修饰键的组合默认不换行，手动补上）。 */
+function insertComposerNewline(el) {
+  el.focus();
+  let inserted = false;
+  try {
+    inserted = document.execCommand("insertText", false, "\n");
+  } catch (_) {
+    inserted = false; // 个别内核没实现 execCommand，走下面的手动拼接
+  }
+  if (!inserted) {
+    const s = el.selectionStart ?? el.value.length;
+    const en = el.selectionEnd ?? el.value.length;
+    el.value = el.value.slice(0, s) + "\n" + el.value.slice(en);
+    el.selectionStart = el.selectionEnd = s + 1;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+}
+/** 输入框回车类按键分流：命中发送键→发送；命中换行键→换行（裸
+ * Enter/Shift+Enter 是 textarea 默认换行、不拦；带 Ctrl/Alt/Super 的
+ * 组合默认不换行，手动插入）；都没命中不干预（默认行为）。 */
+function handleComposerKey(e, el, sendFn) {
+  if (e.key !== "Enter") return;
+  const combo = keyEventCombo(e);
+  if (combo === composerKeys.send) {
+    e.preventDefault();
+    sendFn();
+  } else if (combo === composerKeys.newline) {
+    if (e.ctrlKey || e.altKey || e.metaKey) {
+      e.preventDefault();
+      insertComposerNewline(el);
+    }
+  }
+}
+/** 占位提示与设置页录制框回显，跟当前设置保持一致。 */
+function paintComposerKeyHints() {
+  const ci = $("input");
+  if (ci) ci.placeholder = `输入消息，${composerKeys.send} 发送，${composerKeys.newline} 换行`;
+  const ai = $("ai-input");
+  if (ai) ai.placeholder = `向 AI 提问，${composerKeys.send} 发送，${composerKeys.newline} 换行`;
+  const sk = $("send-key-input");
+  if (sk && document.activeElement !== sk) sk.value = composerKeys.send;
+  const nk = $("newline-key-input");
+  if (nk && document.activeElement !== nk) nk.value = composerKeys.newline;
+}
+function saveComposerKeys() {
+  localStorage.setItem("composer_send_key", composerKeys.send);
+  localStorage.setItem("composer_newline_key", composerKeys.newline);
+  paintComposerKeyHints();
+}
+/** 录制框接线：点中后按下组合键即录入（同剪贴板快捷键录制口径，
+ * 但这里只收回车键组合）；Esc 取消；与另一键相同则拦下不存。 */
+function wireComposerKeyRecorder(input, which) {
+  if (!input) return;
+  let recording = false;
+  input.addEventListener("focus", () => {
+    recording = true;
+    input.classList.add("recording");
+    input.value = "请按下组合键…";
+  });
+  input.addEventListener("blur", () => {
+    recording = false;
+    input.classList.remove("recording");
+    paintComposerKeyHints();
+  });
+  input.addEventListener("keydown", (e) => {
+    if (!recording) return;
+    if (e.key === "Tab") return; // 放行 Tab 移焦（评审整改）：录制靠 blur 收尾，吞了 Tab 用户会被困在框里
+    e.preventDefault();
+    if (e.key === "Escape") { input.blur(); return; }
+    if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) return; // 只按了修饰键，等主键
+    if (e.key !== "Enter") {
+      showToast("只能设回车键的组合（如 Enter、Shift+Enter、Ctrl+Enter）");
+      return;
+    }
+    const combo = keyEventCombo(e);
+    const other = which === "send" ? composerKeys.newline : composerKeys.send;
+    if (combo === other) {
+      showToast("发送键和换行键不能相同");
+      return;
+    }
+    composerKeys[which] = combo;
+    saveComposerKeys();
+    showToast(which === "send" ? `发送键已设为 ${combo}` : `换行键已设为 ${combo}`);
+    input.blur();
+  });
+}
+wireComposerKeyRecorder($("send-key-input"), "send");
+wireComposerKeyRecorder($("newline-key-input"), "newline");
+$("composer-keys-reset")?.addEventListener("click", () => {
+  composerKeys = { ...COMPOSER_KEY_DEFAULTS };
+  saveComposerKeys();
+  showToast("发送/换行键已恢复默认：Enter 发送、Shift+Enter 换行");
+});
+paintComposerKeyHints();
+
 // ---------- 手动同步快捷键录制：点中输入框后按下组合键即录入
 // （必须带 Ctrl/Alt/Super 至少一个，不然会跟平时打字冲突）；
 // Esc 取消，录完即保存，后端随即重新注册。 ----------
@@ -4862,7 +5056,7 @@ async function wireEvents() {
       state.linkState = "reconnecting"; // #17：重连中顶栏断开钮保留（可取消）
       syncOfflineUI();
       banner.classList.remove("hidden");
-      $("reconnect-text").textContent = `与 ${v.peer_name || "对方"} 的连接中断，正在自动重连（第 ${v.attempt || 1} 次）…`;
+      $("reconnect-text").textContent = `与 ${v.peer_name || "对方"} 的连接中断，正在自动重连…`;
     } else if (v.state === "connected") {
       banner.classList.add("hidden");
       showToast(`已自动重连到 ${v.peer_name || "对方"}`);
